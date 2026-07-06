@@ -1,0 +1,74 @@
+// forge/lumen_colors.sg — the Lumen design tokens (sigil-os cc0/tokens.sg,
+// docs/DESIGN_LANGUAGE.md), ported for Forge's native GUI backends. These are
+// the REAL tokens sigilOS's own compositor/libwin use — not an invented
+// palette — so Forge looks like Lumen today on macOS and matches exactly
+// once it runs on Lumen itself.
+//
+// Each channel is precomputed as its IEEE-754 double bit pattern for
+// channel/255.0 (0.0-1.0), since wm_pal_macos.sg feeds these straight into
+// NSColor colorWithRed:green:blue:alpha: via dyld_call_rect (verified against
+// a small C reference: memcpy(&bits, &(double){N}, 8) — see sigil#188).
+//
+// Dark theme only for now (Lumen's canonical theme, tokens.sg role 0).
+// Light-mode/night-mode swap is a real Lumen feature (sigil-os#10) not yet
+// ported here.
+
+// surface/base #0B0D15 — deepest background (the window body)
+fn lc_surface_base_r() -> Int { return 4586377554639066646; }
+fn lc_surface_base_g() -> Int { return 4587507869839661594; }
+fn lc_surface_base_b() -> Int { return 4590598575466288405; }
+
+// surface/raised #15122B — windows, cards
+fn lc_surface_raised_r() -> Int { return 4590598575466288405; }
+fn lc_surface_raised_g() -> Int { return 4589750839065842194; }
+fn lc_surface_raised_b() -> Int { return 4595243464493733270; }
+
+// surface/overlay #1E1B36 — menus, popovers, fields
+fn lc_surface_overlay_r() -> Int { return 4593141784667627038; }
+fn lc_surface_overlay_g() -> Int { return 4592294048267180827; }
+fn lc_surface_overlay_b() -> Int { return 4596797647894551323; }
+
+// accent #8B7BF0 — the Lumen violet: focus, selection, primary action
+fn lc_accent_r() -> Int { return 4603085026197860721; }
+fn lc_accent_g() -> Int { return 4602360918022479583; }
+fn lc_accent_b() -> Int { return 4606652583549738526; }
+
+// accent/strong #A99BF5 — hover/active accent
+fn lc_accent_strong_r() -> Int { return 4604144696698418485; }
+fn lc_accent_strong_g() -> Int { return 4603650183798158195; }
+fn lc_accent_strong_b() -> Int { return 4606829195299831487; }
+
+// text/primary #ECEDF6 — titles, body
+fn lc_text_primary_r() -> Int { return 4606511294149664158; }
+fn lc_text_primary_g() -> Int { return 4606546616499682750; }
+fn lc_text_primary_b() -> Int { return 4606864517649850079; }
+
+// text/secondary #878BA6 — labels, captions
+fn lc_text_secondary_r() -> Int { return 4602943736797786353; }
+fn lc_text_secondary_g() -> Int { return 4603085026197860721; }
+fn lc_text_secondary_b() -> Int { return 4604038729648362709; }
+
+// text/tertiary #5B5E78 — hints, disabled
+fn lc_text_tertiary_r() -> Int { return 4600100287621289687; }
+fn lc_text_tertiary_g() -> Int { return 4600312221721401240; }
+fn lc_text_tertiary_b() -> Int { return 4602148983922368030; }
+
+// line #2A2C44 — hairlines, tracks
+fn lc_line_r() -> Int { return 4595102175093658901; }
+fn lc_line_g() -> Int { return 4595384753893807638; }
+fn lc_line_b() -> Int { return 4598475459520434449; }
+
+fn lc_alpha_1() -> Int { return 4607182418800017408; }   // 1.0
+
+// Shape tokens (docs/DESIGN_LANGUAGE.md §5) — corner radii in points.
+fn lc_rad_ctl() -> Int { return 8; }      // buttons, fields, pills
+fn lc_rad_card() -> Int { return 12; }    // cards, panels
+fn lc_rad_window() -> Int { return 16; }  // windows
+
+// Spacing tokens (§4) — 8px base grid.
+fn lc_sp_xs() -> Int { return 4; }
+fn lc_sp_sm() -> Int { return 8; }
+fn lc_sp_md() -> Int { return 12; }
+fn lc_sp_lg() -> Int { return 16; }
+fn lc_sp_xl() -> Int { return 24; }
+fn lc_sp_xxl() -> Int { return 32; }

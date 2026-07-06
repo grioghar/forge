@@ -1,50 +1,33 @@
-// forge_gui.sg — the first real Forge Complete GUI: a native NSWindow with
-// one button per verified system, each launching its dist binary via NSTask
-// (no shell script). Proves the whole Cocoa-FFI stack end to end: window,
-// buttons, real target-action dispatch, process launching, event loop. Built
-// on sigil#188 (dyld_call6/dyld_call_rect/addr()-PIE-fix).
+// forge_gui.sg — the Forge Complete GUI: a native window with one button per
+// verified system, each launching its dist binary via NSTask (no shell
+// script). Styled with Lumen's real design tokens via forge/wm_pal_macos.sg +
+// forge/lumen_colors.sg, so Forge looks like it will once it runs on Lumen
+// itself — not an invented "native-ish" look. The window-manager calls
+// (wm_create_window/wm_create_button/etc.) are the portable surface: a
+// future wm_pal_linux.sg/wm_pal_windows.sg backend would let this exact file
+// run unchanged on other OSes, the same relationship forge/pal.sg already
+// has to forge/pal_macos.sg for the non-GUI parts of Forge.
 //
-// Verified: compiles+links clean (-framework Cocoa -lSystem), runs a stable
-// real NSApp event loop (didn't exit on its own over a 3s background run,
-// matching real GUI-app behavior), and each button's target-action fires
-// correctly when simulated via performClick: (Apple's own recommended way to
-// test click handling programmatically) — confirmed in a standalone test
-// with the button attached to a real window's contentView.
+// Link order: forge/lumen_colors.sg forge/wm_pal_macos.sg forge/app/forge_gui.sg
+// (build-forge-gui.sh does this).
+//
+// Verified: compiles+links clean, runs a stable real event loop, and each
+// button's real target-action dispatch was confirmed via performClick:
+// (Apple's own recommended way to test click handling programmatically) in
+// an isolated wm_pal_macos.sg test before being wired in here.
 //
 // KNOWN LIMITATIONS (next steps, not yet done):
-//   - launch_dist() resolves dist binaries relative to
-//     [[NSBundle mainBundle] resourcePath] (real bundle path when packaged
-//     as a .app, or the executable's own directory when run bare) — no
-//     hardcoded dev-machine path.
 //   - ANVIL (the relic sealer) isn't wired in yet — it needs a proper dialog
 //     (text fields for ROM path + system id), not just a button, since its
 //     existing protocol reads 3 lines from stdin.
-//   - Not yet packaged as a real .app bundle (Info.plist + icon) for Finder
-//     double-click launch — currently a bare Mach-O binary.
+//   - No app icon yet (Info.plist has no CFBundleIconFile).
+//   - Lumen's full window chrome (gradient titlebar, close/min/max dots,
+//     soft shadow) isn't ported — needs a custom drawRect: override, which
+//     needs a parameterized-callback trampoline (see wm_pal_macos.sg's
+//     header note; same sigil#188 limitation).
 //   - One dedicated zero-arg Sigil action function per button (10 near-
 //     identical act_*() functions) because a Sigil function WITH PARAMETERS
-//     isn't safely callable as a raw ObjC IMP yet (Sigil's calling
-//     convention passes args via the stack, not x0-x7 — see sigil#188's
-//     "Known limitation" section). A future register-to-stack trampoline
-//     would let one shared handler dispatch by sender instead.
-
-fn cstr(t: Text) -> Int ! {mem} {
-    let n: Int = len(t);
-    let buf: Int = alloc_buf(n + 1);
-    var i: Int = 0;
-    while i < n invariant i >= 0 {
-        poke8(buf, i, ord(slice(t, i, i + 1)));
-        i = i + 1;
-    }
-    poke8(buf, n, 0);
-    return buf;
-}
-
-fn sel(name: Text) -> Int ! {mem} { return dyld_call6("_sel_registerName", cstr(name), 0, 0, 0, 0, 0); }
-fn cls(name: Text) -> Int ! {mem} { return dyld_call6("_objc_getClass", cstr(name), 0, 0, 0, 0, 0); }
-fn msg0(recv: Int, s: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, 0, 0, 0, 0); }
-fn msg1(recv: Int, s: Int, a: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, a, 0, 0, 0); }
-fn nsstring(t: Text) -> Int ! {mem} { return msg1(cls("NSString"), sel("stringWithUTF8String:"), cstr(t)); }
+//     isn't safely callable as a raw ObjC IMP yet — see sigil#188.
 
 fn cstrlen(ptr: Int) -> Int ! {mem} {
     var i: Int = 0;
@@ -78,10 +61,8 @@ fn resource_path() -> Int ! {mem} {
 // IEEE-754 double bit patterns for the fixed layout (verified via a small C
 // reference: memcpy(&bits, &(double){N}, 8)).
 fn d0() -> Int { return 0; }
-fn d15() -> Int { return 4624633867356078080; }
 fn d20() -> Int { return 4626322717216342016; }
 fn d30() -> Int { return 4629137466983448576; }
-fn d60() -> Int { return 4633641066610819072; }
 fn d100() -> Int { return 4636737291354636288; }
 fn d140() -> Int { return 4639129828656676864; }
 fn d180() -> Int { return 4640537203540230144; }
@@ -119,49 +100,33 @@ fn act_fds() -> Int ! {mem} { launch_dist("forge-fds-boot-test-macos-arm64"); re
 fn act_ngpc() -> Int ! {mem} { launch_dist("forge-ngpc-boot-test-macos-arm64"); return 0; }
 fn act_ws() -> Int ! {mem} { launch_dist("forge-ws-boot-test-macos-arm64"); return 0; }
 
-fn make_target(name: Text, action_fn: Int, action_sel: Text) -> Int ! {mem} {
-    let target_cls: Int = dyld_call6("_objc_allocateClassPair", cls("NSObject"), cstr(name), 0, 0, 0, 0);
-    dyld_call6("_class_addMethod", target_cls, sel(action_sel), action_fn, cstr("v@:@"), 0, 0);
-    dyld_call6("_objc_registerClassPair", target_cls, 0, 0, 0, 0, 0);
-    return msg0(msg0(target_cls, sel("alloc")), sel("init"));
-}
-
-fn make_button(content_view: Int, title: Text, y: Int, target: Int) -> Int ! {mem} {
-    let btn_alloc: Int = msg0(cls("NSButton"), sel("alloc"));
-    let btn: Int = dyld_call_rect("_objc_msgSend", btn_alloc, sel("initWithFrame:"), d20(), y, d200(), d30(), 0, 0, 0);
-    dyld_call6("_objc_msgSend", btn, sel("setTitle:"), nsstring(title), 0, 0, 0);
-    dyld_call6("_objc_msgSend", btn, sel("setBezelStyle:"), 1, 0, 0, 0);
-    dyld_call6("_objc_msgSend", btn, sel("setTarget:"), target, 0, 0, 0);
-    dyld_call6("_objc_msgSend", btn, sel("setAction:"), sel("fire:"), 0, 0, 0);
-    dyld_call6("_objc_msgSend", content_view, sel("addSubview:"), btn, 0, 0, 0);
-    return btn;
-}
-
 fn main() -> Int ! {mem, io.write} {
-    let app: Int = msg0(cls("NSApplication"), sel("sharedApplication"));
-    dyld_call6("_objc_msgSend", app, sel("setActivationPolicy:"), 0, 0, 0, 0);
+    let win: Int = wm_create_window("Forge Complete", d100(), d100(), d250(), d500());
+    wm_set_window_background(win, lc_surface_base_r(), lc_surface_base_g(), lc_surface_base_b());
 
-    let win_alloc: Int = msg0(cls("NSWindow"), sel("alloc"));
-    let win: Int = dyld_call_rect("_objc_msgSend", win_alloc, sel("initWithContentRect:styleMask:backing:defer:"),
-        d100(), d100(), d250(), d500(), 15, 2, 0);
-    dyld_call6("_objc_msgSend", win, sel("setTitle:"), nsstring("Forge Complete"), 0, 0, 0);
-    let content_view: Int = msg0(win, sel("contentView"));
+    wm_create_button(win, "ForgeTargetGB", "Game Boy", d20(), d460(), d200(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(act_gb));
+    wm_create_button(win, "ForgeTargetGBA", "Game Boy Advance", d20(), d420(), d200(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(act_gba));
+    wm_create_button(win, "ForgeTargetSNES", "SNES", d20(), d380(), d200(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(act_snes));
+    wm_create_button(win, "ForgeTargetGenesis", "Genesis", d20(), d340(), d200(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(act_genesis));
+    wm_create_button(win, "ForgeTarget32X", "32X", d20(), d300(), d200(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(act_s32x));
+    wm_create_button(win, "ForgeTargetGG", "Game Gear", d20(), d260(), d200(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(act_gamegear));
+    wm_create_button(win, "ForgeTargetVB", "Virtual Boy", d20(), d220(), d200(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(act_vb));
+    wm_create_button(win, "ForgeTargetFDS", "Famicom Disk System", d20(), d180(), d200(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(act_fds));
+    wm_create_button(win, "ForgeTargetNGPC", "Neo Geo Pocket Color", d20(), d140(), d200(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(act_ngpc));
+    wm_create_button(win, "ForgeTargetWS", "WonderSwan", d20(), d100(), d200(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(act_ws));
 
-    make_button(content_view, "Game Boy", d460(), make_target("ForgeTargetGB", addr(act_gb), "fire:"));
-    make_button(content_view, "Game Boy Advance", d420(), make_target("ForgeTargetGBA", addr(act_gba), "fire:"));
-    make_button(content_view, "SNES", d380(), make_target("ForgeTargetSNES", addr(act_snes), "fire:"));
-    make_button(content_view, "Genesis", d340(), make_target("ForgeTargetGenesis", addr(act_genesis), "fire:"));
-    make_button(content_view, "32X", d300(), make_target("ForgeTarget32X", addr(act_s32x), "fire:"));
-    make_button(content_view, "Game Gear", d260(), make_target("ForgeTargetGG", addr(act_gamegear), "fire:"));
-    make_button(content_view, "Virtual Boy", d220(), make_target("ForgeTargetVB", addr(act_vb), "fire:"));
-    make_button(content_view, "Famicom Disk System", d180(), make_target("ForgeTargetFDS", addr(act_fds), "fire:"));
-    make_button(content_view, "Neo Geo Pocket Color", d140(), make_target("ForgeTargetNGPC", addr(act_ngpc), "fire:"));
-    make_button(content_view, "WonderSwan", d100(), make_target("ForgeTargetWS", addr(act_ws), "fire:"));
-
-    dyld_call6("_objc_msgSend", win, sel("makeKeyAndOrderFront:"), 0, 0, 0, 0);
-    dyld_call6("_objc_msgSend", app, sel("activateIgnoringOtherApps:"), 1, 0, 0, 0);
-
-    print(1, "Forge Complete GUI running. Window created with 10 launch buttons.\n");
-    dyld_call6("_objc_msgSend", app, sel("run"), 0, 0, 0, 0);
+    wm_show_window(win);
+    print(1, "Forge Complete GUI running (Lumen-styled). 10 launch buttons.\n");
+    wm_run();
     return 0;
 }

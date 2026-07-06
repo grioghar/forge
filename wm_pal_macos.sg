@@ -1,0 +1,108 @@
+// forge/wm_pal_macos.sg — macOS (Cocoa/AppKit) backend for forge/wm_pal.sg,
+// styled with Lumen's real design tokens (forge/lumen_colors.sg) so Forge
+// looks like it will once it runs on Lumen itself. Fully self-sufficient
+// (defines every wm_pal_* name) — link this file alone, never together with
+// wm_pal.sg (cc0 has no first-def-wins; same relationship pal_macos.sg has
+// to pal.sg).
+//
+// Built on sigil#188's Cocoa FFI (dyld_call6/dyld_call_rect/dyld_call_f1) —
+// no non-Sigil code, per "always build in Sigil".
+//
+// Coverage: window creation + background color, flat colored+rounded
+// buttons with a dedicated zero-arg click callback (see the "callers must
+// supply a globally-unique class_name" note on wm_create_button — a native
+// requirement, not a Forge one).
+//
+// Not yet ported: Lumen's full window chrome (gradient titlebar clipped to
+// rounded top, close/min/max dots tinted by the window's accent, soft
+// shadow) — that needs a custom NSView subclass with a real drawRect:
+// override, which needs a parameterized-callback trampoline Sigil doesn't
+// have yet (sigil#188's documented "known limitation": a Sigil function
+// with parameters isn't ABI-safe as a raw callback). Tracked as the natural
+// next step once that trampoline exists. Button label text color also isn't
+// set yet (needs NSAttributedString, not wired up) — default AppKit label
+// color is used for now, which reads fine against Lumen's accent colors but
+// isn't pulled from lc_text_primary().
+
+fn cstr(t: Text) -> Int ! {mem} {
+    let n: Int = len(t);
+    let buf: Int = alloc_buf(n + 1);
+    var i: Int = 0;
+    while i < n invariant i >= 0 {
+        poke8(buf, i, ord(slice(t, i, i + 1)));
+        i = i + 1;
+    }
+    poke8(buf, n, 0);
+    return buf;
+}
+
+fn sel(name: Text) -> Int ! {mem} { return dyld_call6("_sel_registerName", cstr(name), 0, 0, 0, 0, 0); }
+fn cls(name: Text) -> Int ! {mem} { return dyld_call6("_objc_getClass", cstr(name), 0, 0, 0, 0, 0); }
+fn msg0(recv: Int, s: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, 0, 0, 0, 0); }
+fn msg1(recv: Int, s: Int, a: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, a, 0, 0, 0); }
+fn nsstring(t: Text) -> Int ! {mem} { return msg1(cls("NSString"), sel("stringWithUTF8String:"), cstr(t)); }
+
+fn nscolor(r_bits: Int, g_bits: Int, b_bits: Int) -> Int ! {mem} {
+    return dyld_call_rect("_objc_msgSend", cls("NSColor"), sel("colorWithRed:green:blue:alpha:"), r_bits, g_bits, b_bits, lc_alpha_1(), 0, 0, 0);
+}
+
+fn wm_create_window(title: Text, x: Int, y: Int, w: Int, h: Int) -> Int ! {mem} {
+    let app: Int = msg0(cls("NSApplication"), sel("sharedApplication"));
+    dyld_call6("_objc_msgSend", app, sel("setActivationPolicy:"), 0, 0, 0, 0);
+    let win_alloc: Int = msg0(cls("NSWindow"), sel("alloc"));
+    // styleMask 15 = Titled|Closable|Resizable|Miniaturizable; backing 2 = Buffered.
+    let win: Int = dyld_call_rect("_objc_msgSend", win_alloc, sel("initWithContentRect:styleMask:backing:defer:"), x, y, w, h, 15, 2, 0);
+    dyld_call6("_objc_msgSend", win, sel("setTitle:"), nsstring(title), 0, 0, 0);
+    return win;
+}
+
+fn wm_set_window_background(win: Int, r_bits: Int, g_bits: Int, b_bits: Int) -> Int ! {mem} {
+    dyld_call6("_objc_msgSend", win, sel("setBackgroundColor:"), nscolor(r_bits, g_bits, b_bits), 0, 0, 0);
+    return 0;
+}
+
+fn wm_create_button(win: Int, class_name: Text, title: Text, x: Int, y: Int, w: Int, h: Int, r_bits: Int, g_bits: Int, b_bits: Int, action_fn: Int) -> Int ! {mem} {
+    let target_cls: Int = dyld_call6("_objc_allocateClassPair", cls("NSObject"), cstr(class_name), 0, 0, 0, 0);
+    dyld_call6("_class_addMethod", target_cls, sel("fire:"), action_fn, cstr("v@:@"), 0, 0);
+    dyld_call6("_objc_registerClassPair", target_cls, 0, 0, 0, 0, 0);
+    let target: Int = msg0(msg0(target_cls, sel("alloc")), sel("init"));
+
+    let btn_alloc: Int = msg0(cls("NSButton"), sel("alloc"));
+    let btn: Int = dyld_call_rect("_objc_msgSend", btn_alloc, sel("initWithFrame:"), x, y, w, h, 0, 0, 0);
+    dyld_call6("_objc_msgSend", btn, sel("setTitle:"), nsstring(title), 0, 0, 0);
+    dyld_call6("_objc_msgSend", btn, sel("setBordered:"), 0, 0, 0, 0);
+    dyld_call6("_objc_msgSend", btn, sel("setTarget:"), target, 0, 0, 0);
+    dyld_call6("_objc_msgSend", btn, sel("setAction:"), sel("fire:"), 0, 0, 0);
+
+    // Flat Lumen-colored, rounded button: a real CALayer fill + corner
+    // radius (lc_rad_ctl(), Lumen's control radius token), since NSButton
+    // has no plain "background color" API without a custom cell/drawRect:.
+    dyld_call6("_objc_msgSend", btn, sel("setWantsLayer:"), 1, 0, 0, 0);
+    let layer: Int = msg0(btn, sel("layer"));
+    let color: Int = nscolor(r_bits, g_bits, b_bits);
+    let cgcolor: Int = msg0(color, sel("CGColor"));
+    dyld_call6("_objc_msgSend", layer, sel("setBackgroundColor:"), cgcolor, 0, 0, 0);
+    dyld_call_f1("_objc_msgSend", layer, sel("setCornerRadius:"), lc_rad_ctl_bits());
+
+    dyld_call6("_objc_msgSend", msg0(win, sel("contentView")), sel("addSubview:"), btn, 0, 0, 0);
+    return btn;
+}
+
+fn wm_show_window(win: Int) -> Int ! {mem} {
+    let app: Int = msg0(cls("NSApplication"), sel("sharedApplication"));
+    dyld_call6("_objc_msgSend", win, sel("makeKeyAndOrderFront:"), 0, 0, 0, 0);
+    dyld_call6("_objc_msgSend", app, sel("activateIgnoringOtherApps:"), 1, 0, 0, 0);
+    return 0;
+}
+
+fn wm_run() -> Int ! {mem} {
+    let app: Int = msg0(cls("NSApplication"), sel("sharedApplication"));
+    dyld_call6("_objc_msgSend", app, sel("run"), 0, 0, 0, 0);
+    return 0;
+}
+
+fn wm_host() -> Int { return 1; }   // macOS
+
+// lc_rad_ctl() (lumen_colors.sg) is an Int point-count (8); dyld_call_f1
+// needs its IEEE-754 double bit pattern for setCornerRadius:.
+fn lc_rad_ctl_bits() -> Int { return 4620693217682128896; }   // 8.0

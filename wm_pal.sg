@@ -1,0 +1,45 @@
+// forge/wm_pal.sg — Window-Manager Portable Abstraction Layer for Forge's
+// native GUI, styled with Lumen's real design tokens (forge/lumen_colors.sg)
+// so Forge looks like it will once it runs on Lumen itself, not an invented
+// "native-ish" look.
+//
+// Mirrors forge/pal.sg's shape exactly: this file is the interface contract
+// + a no-op default; each platform ships its own FULLY SELF-SUFFICIENT
+// backend (wm_pal_macos.sg today; wm_pal_linux.sg / wm_pal_windows.sg are
+// stubs for later). Per forge/wm_pal_macos.sg's header note (and pal.sg's
+// own precedent): cc0 has no first-def-wins, so a build links exactly ONE
+// backend file, never this file + a backend together — this file exists as
+// the documented interface + a truly standalone (sigil-os/no-op) build, the
+// same relationship pal.sg has to pal_macos.sg.
+//
+// Coverage today: window creation + solid-color-filled buttons with a
+// dedicated zero-arg click callback (Sigil functions with parameters aren't
+// ABI-safe as raw ObjC/Win32/GTK callbacks yet — sigil#188's documented
+// limitation applies here too). No custom-drawn chrome (gradient titlebar,
+// rounded corners via a real draw callback) yet — that needs a
+// register-to-stack trampoline for parameterized callbacks, tracked as the
+// same follow-up sigil#188 already flags.
+
+// Create a window. Returns an opaque window handle (0 = failure).
+fn wm_create_window(title: Text, x: Int, y: Int, w: Int, h: Int) -> Int { return 0; }
+
+// Fill the window's content background with a Lumen color token (pass
+// lc_surface_base_r()/_g()/_b() etc. from lumen_colors.sg).
+fn wm_set_window_background(win: Int, r_bits: Int, g_bits: Int, b_bits: Int) -> Int { return 0; }
+
+// Create a button inside `win` at (x,y,w,h), tinted with the given Lumen
+// color token, calling `action_fn` (a zero-arg Sigil function's addr()) when
+// clicked. `class_name` must be a globally-unique ObjC/native-widget class
+// name per button (native widget systems require this; see wm_pal_macos.sg).
+// Returns an opaque button handle (0 = failure).
+fn wm_create_button(win: Int, class_name: Text, title: Text, x: Int, y: Int, w: Int, h: Int, r_bits: Int, g_bits: Int, b_bits: Int, action_fn: Int) -> Int { return 0; }
+
+fn wm_show_window(win: Int) -> Int { return 0; }
+
+// Enter the real event loop. Blocks until the app quits (native GUI
+// backends); returns immediately on backends with no event loop (sigil-os,
+// where the OS drives it — matches pal.sg's pal_frame_yield/pal_should_quit
+// no-op convention).
+fn wm_run() -> Int { return 0; }
+
+fn wm_host() -> Int { return 0; }   // 0=sigil-os/none, 1=macOS, 2=Linux, 3=Windows
