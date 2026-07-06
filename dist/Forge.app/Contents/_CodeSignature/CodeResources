@@ -20,6 +20,10 @@
 		<data>
 		hqrj3kkTG3DUAxaeQTdv5VvXQ/E=
 		</data>
+		<key>Resources/dist/forge-gb-view-macos-arm64</key>
+		<data>
+		1xZ4DPQKrdcqO9UGncaOYttib6k=
+		</data>
 		<key>Resources/dist/forge-gba-boot-test-macos-arm64</key>
 		<data>
 		NBpXmmUCgxWwaTm4bnU2KAFL4ZM=
@@ -81,6 +85,13 @@
 			<key>hash2</key>
 			<data>
 			/+4IC6eJgiDiq5+aAw2XELBoOngiR9LrByr7jlJb974=
+			</data>
+		</dict>
+		<key>Resources/dist/forge-gb-view-macos-arm64</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			EV09lfxVrZ+M2DlG49jJi9N8hdT9TICg2Y1rS9nTFMY=
 			</data>
 		</dict>
 		<key>Resources/dist/forge-gba-boot-test-macos-arm64</key>

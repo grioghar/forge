@@ -7,7 +7,7 @@
 set -e
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 APP="$REPO/forge/dist/Forge.app"
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 sh "$REPO/forge/app/build-forge-gui.sh"
 
@@ -23,7 +23,7 @@ for bin in forge-gb-boot-test-macos-arm64 forge-gba-boot-test-macos-arm64 \
            forge-s32x-boot-test-macos-arm64 forge-gamegear-boot-test-macos-arm64 \
            forge-vb-boot-test-macos-arm64 forge-fds-boot-test-macos-arm64 \
            forge-ngpc-boot-test-macos-arm64 forge-ws-boot-test-macos-arm64 \
-           forge-seal-mac-arm64; do
+           forge-seal-mac-arm64 forge-gb-view-macos-arm64; do
   cp "$REPO/forge/dist/$bin" "$APP/Contents/Resources/dist/$bin"
   chmod +x "$APP/Contents/Resources/dist/$bin"
 done

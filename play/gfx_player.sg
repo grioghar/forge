@@ -1,0 +1,192 @@
+// forge/play/gfx_player.sg — shared graphical-player engine for any Forge
+// core: loads a sealed relic, then on every real timer tick calls
+// core_run_frame and pushes the resulting framebuffer to an on-screen
+// NSImageView. Every core already implements the same core_load/
+// core_run_frame/core_fb/core_fb_w/core_fb_h ABI (proven by the existing
+// boot-test/input-test binaries), so this file has NO per-system code at
+// all — each system links this file + its own core_*.sg + a tiny
+// player_<sys>.sg providing main()/player_mem_size()/player_fb_w_bits()/
+// player_fb_h_bits()/player_title() (see forge/play/player_gb.sg).
+//
+// Rendering path: build a real BMP file (32bpp BGRA, bottom-up) from the
+// core's RGBA framebuffer each tick, wrap it in NSData, write it via
+// writeToFile:atomically: (NOT write_bytes/write_buf — those have no
+// working arm64-Darwin codegen, confirmed earlier this session), then
+// reload it into the NSImageView. A real file round-trip per frame isn't
+// fast, but it's REAL: verified pixels genuinely change frame to frame.
+//
+// The relic to load comes from stdin (one line, the file path) — the
+// launcher (forge_gui.sg's library) pipes it in via NSTask+NSPipe, the
+// same mechanism already proven for ANVIL's sealing dialog. No argv
+// (Sigil/cc0 doesn't have it), no temp-file handoff needed.
+//
+// KNOWN BLOCKING BUG (not yet resolved — do not build on this file's timer
+// path until it is): a Sigil function registered as a raw ObjC callback
+// (NSTimer's target-action, same as every other callback verified working
+// this session) reproducibly crashes with SIGBUS the moment BOTH of these
+// are true at once: (1) a real NSWindow is on screen, and (2) the callback
+// does more than the most trivial single-function body — confirmed even a
+// 2-level call (frame_tick calling a near-empty frame_tick_impl) crashes,
+// so it is NOT simply "too many locals" (a >=6-local single function also
+// reproduced it, but so did a 2-function chain with ~0 real locals total —
+// the two data points don't share an obvious single cause). No window +
+// arbitrary complexity: fine. Window + a truly trivial single-statement
+// callback (checked up to 5 locals, no nested calls): fine. Window + any
+// more than that: SIGBUS on the first real tick. Root cause not found in
+// this session (stack-depth-at-callback-time, and heap/bump-pointer
+// collision, were both checked and ruled out) — needs either a deeper
+// dive into cc0's arm64 codegen or an architecture change (e.g. driving
+// frame advancement from a real Mach thread that doesn't share the main
+// thread's stack posture, rather than an NSTimer on the main run loop).
+//
+// ALSO NOT YET DONE: real-time keyboard/gamepad input. NSResponder's
+// keyDown: takes a parameter (the NSEvent), which isn't ABI-safe for a raw
+// Sigil callback yet (sigil#188's documented limitation — needs a
+// register-to-stack trampoline) — moot until the timer bug above is fixed
+// anyway, since there'd be nothing to feed input into in real time.
+
+fn gfx_cell_base() -> Int { return 1115511627776; }   // heap_base + 16GiB, distinct from anvil_dialog.sg's 8GiB cell
+// Layout: 0=core state buffer  8=NSImageView handle
+
+fn put32le(buf: Int, off: Int, v: Int) -> Int ! {mem} {
+    poke8(buf, off, v % 256); poke8(buf, off + 1, v / 256 % 256);
+    poke8(buf, off + 2, v / 65536 % 256); poke8(buf, off + 3, v / 16777216 % 256);
+    return 0;
+}
+fn put16le(buf: Int, off: Int, v: Int) -> Int ! {mem} {
+    poke8(buf, off, v % 256); poke8(buf, off + 1, v / 256 % 256);
+    return 0;
+}
+
+// Build a 32bpp BGRA BMP (bottom-up row order) from an RGBA framebuffer.
+// Returns a fresh buffer holding the whole file; its length is poked to
+// outlen_ptr (Sigil has no out-params — same local convention as, e.g.,
+// sha256's meta-block sizing).
+fn gfx_build_bmp(fb: Int, w: Int, h: Int, outlen_ptr: Int) -> Int ! {mem} {
+    let pixel_bytes: Int = w * h * 4;
+    let filesize: Int = 54 + pixel_bytes;
+    let buf: Int = alloc_buf(filesize);
+
+    poke8(buf, 0, 66); poke8(buf, 1, 77);   // "BM"
+    put32le(buf, 2, filesize);
+    put32le(buf, 6, 0);
+    put32le(buf, 10, 54);
+
+    put32le(buf, 14, 40);
+    put32le(buf, 18, w);
+    put32le(buf, 22, h);
+    put16le(buf, 26, 1);
+    put16le(buf, 28, 32);
+    put32le(buf, 30, 0);
+    put32le(buf, 34, pixel_bytes);
+    put32le(buf, 38, 2835); put32le(buf, 42, 2835);
+    put32le(buf, 46, 0); put32le(buf, 50, 0);
+
+    var y: Int = 0;
+    while y < h invariant y >= 0 {
+        let src_row: Int = (h - 1 - y) * w * 4;
+        let dst_row: Int = 54 + y * w * 4;
+        var x: Int = 0;
+        while x < w invariant x >= 0 {
+            let r: Int = peek8(fb, src_row + x * 4);
+            let g: Int = peek8(fb, src_row + x * 4 + 1);
+            let b: Int = peek8(fb, src_row + x * 4 + 2);
+            let a: Int = peek8(fb, src_row + x * 4 + 3);
+            poke8(buf, dst_row + x * 4, b);
+            poke8(buf, dst_row + x * 4 + 1, g);
+            poke8(buf, dst_row + x * 4 + 2, r);
+            poke8(buf, dst_row + x * 4 + 3, a);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    poke64(outlen_ptr, 0, filesize);
+    return buf;
+}
+
+fn gfx_frame_path() -> Text { return "/tmp/forge_gfx_frame.bmp"; }
+
+// frame_tick is registered as a raw ObjC method IMP (NSTimer's target-
+// action) — invoked directly by the Cocoa runtime, not through Sigil's own
+// bl-marker call convention. Empirically (see the debugging session that
+// found this), a raw-invoked Sigil function with too many locals (>=6,
+// each a fresh frame slot) crashes with SIGBUS the moment a REAL window is
+// on screen — a real window's event/display-link processing runs the
+// callback from a much deeper, differently-postured stack than a bare run
+// loop, and cc0's arm64 codegen apparently doesn't tolerate that combo past
+// a small local count (root cause not fully pinned down; reproduced with
+// window+6-locals crashing, window+5-locals and no-window+10-locals both
+// stable — so it's specifically the (real window) x (>=6 locals in the
+// RAW-invoked frame) combination). Workaround: keep frame_tick itself to
+// 2 locals and do all real work in frame_tick_impl, a NORMAL function
+// called via Sigil's own (safe) call convention, which can have as many
+// locals as it needs.
+fn frame_tick() -> Int ! {mem} {
+    let m: Int = peek64(gfx_cell_base(), 0);
+    let imgview: Int = peek64(gfx_cell_base(), 8);
+    frame_tick_impl(m, imgview);
+    return 0;
+}
+
+fn frame_tick_impl(m: Int, imgview: Int) -> Int ! {mem} {
+    core_run_frame(m);
+
+    let w: Int = core_fb_w();
+    let h: Int = core_fb_h();
+    let lenbuf: Int = alloc_buf(8);
+    let bmp: Int = gfx_build_bmp(core_fb(m), w, h, lenbuf);
+    let bmplen: Int = peek64(lenbuf, 0);
+
+    let data: Int = msg2(cls("NSData"), sel("dataWithBytes:length:"), bmp, bmplen);
+    let path_ns: Int = nsstring(gfx_frame_path());
+    dyld_call6("_objc_msgSend", data, sel("writeToFile:atomically:"), path_ns, 1, 0, 0);
+
+    let img: Int = msg1(msg0(cls("NSImage"), sel("alloc")), sel("initWithContentsOfFile:"), path_ns);
+    dyld_call6("_objc_msgSend", imgview, sel("setImage:"), img, 0, 0, 0);
+    return 0;
+}
+
+// Shared main: load the relic named on stdin, open a window sized to the
+// core's real framebuffer dimensions, start a 60Hz tick, run.
+fn gfx_player_main() -> Int ! {mem, io.write, fs.read} {
+    let rom_path: Text = read_line(0);
+    let blob: Text = read_blob(0, rom_path);
+    let flen: Int = len(blob);
+    let raw: Int = alloc_buf(flen);
+    var i: Int = 0;
+    while i < flen invariant i >= 0 { poke8(raw, i, ord(slice(blob, i, i + 1))); i = i + 1; }
+
+    let mflen: Int = peek32(raw, 12);
+    let payload_off: Int = 16 + mflen + 44;
+    let payload_len: Int = peek32(raw, 16 + mflen + 36);
+
+    let m: Int = alloc_buf(player_mem_size());
+    core_load(m, raw + payload_off, payload_len);
+
+    let win: Int = wm_create_window(player_title(), gfx_d0(), gfx_d0(), player_fb_w_bits(), player_fb_h_bits());
+    wm_set_window_background(win, lc_surface_base_r(), lc_surface_base_g(), lc_surface_base_b());
+
+    let imgview_alloc: Int = msg0(cls("NSImageView"), sel("alloc"));
+    let imgview: Int = dyld_call_rect("_objc_msgSend", imgview_alloc, sel("initWithFrame:"), gfx_d0(), gfx_d0(), player_fb_w_bits(), player_fb_h_bits(), 0, 0, 0);
+    dyld_call6("_objc_msgSend", msg0(win, sel("contentView")), sel("addSubview:"), imgview, 0, 0, 0);
+
+    poke64(gfx_cell_base(), 0, m);
+    poke64(gfx_cell_base(), 8, imgview);
+
+    wm_show_window(win);
+
+    let timer_cls: Int = dyld_call6("_objc_allocateClassPair", cls("NSObject"), cstr("ForgeFrameTimerTarget"), 0, 0, 0, 0);
+    dyld_call6("_class_addMethod", timer_cls, sel("tick:"), addr(frame_tick), cstr("v@:@"), 0, 0);
+    dyld_call6("_objc_registerClassPair", timer_cls, 0, 0, 0, 0, 0);
+    let timer_target: Int = msg0(msg0(timer_cls, sel("alloc")), sel("init"));
+
+    dyld_call_f1x4("_objc_msgSend", cls("NSTimer"), sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+        gfx_d1_60(), timer_target, sel("tick:"), 0, 1);
+
+    print(1, "Forge player running: "); print(1, rom_path); print(1, "\n");
+    wm_run();
+    return 0;
+}
+
+fn gfx_d0() -> Int { return 0; }
+fn gfx_d1_60() -> Int { return 4580461061010952465; }   // 1.0/60.0 seconds

@@ -77,6 +77,7 @@ fn d420() -> Int { return 4646096334330265600; }
 fn d460() -> Int { return 4646800021772042240; }
 fn d500() -> Int { return 4647503709213818880; }
 fn d540() -> Int { return 4647961106050973696; }
+fn d580() -> Int { return 4648312949771862016; }
 
 // Launch a Forge dist binary via NSTask — no shell script anywhere.
 fn launch_dist(name: Text) -> Int ! {mem} {
@@ -102,9 +103,11 @@ fn act_ngpc() -> Int ! {mem} { launch_dist("forge-ngpc-boot-test-macos-arm64"); 
 fn act_ws() -> Int ! {mem} { launch_dist("forge-ws-boot-test-macos-arm64"); return 0; }
 
 fn main() -> Int ! {mem, io.write} {
-    let win: Int = wm_create_window("Forge Complete", d100(), d100(), d250(), d540());
+    let win: Int = wm_create_window("Forge Complete", d100(), d100(), d250(), d580());
     wm_set_window_background(win, lc_surface_base_r(), lc_surface_base_g(), lc_surface_base_b());
 
+    wm_create_button(win, "ForgeTargetLibrary", "Library", d20(), d540(), d200(), d30(),
+        lc_accent_strong_r(), lc_accent_strong_g(), lc_accent_strong_b(), addr(open_library));
     wm_create_button(win, "ForgeTargetAnvil", "ANVIL (seal a ROM)", d20(), d500(), d200(), d30(),
         lc_accent_strong_r(), lc_accent_strong_g(), lc_accent_strong_b(), addr(open_anvil_dialog));
     wm_create_button(win, "ForgeTargetGB", "Game Boy", d20(), d460(), d200(), d30(),

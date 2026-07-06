@@ -1,0 +1,172 @@
+// forge/app/library.sg — the Forge library: scans ~/Documents/Forge/roms/gb
+// for sealed .relic files and lists them as launch buttons, plus an "Add
+// ROM..." flow (NSOpenPanel -> auto-seal via ANVIL's exact NSTask+NSPipe
+// mechanism -> refresh the list). Scoped to Game Boy only for now, since
+// it's the only system with a real viewer (forge/play/gb_relic_view.sg) —
+// real-time graphical play for every system is blocked on the timer-
+// callback bug documented in forge/play/gfx_player.sg's header. Clicking a
+// library entry opens a real Terminal window (`open -a Terminal`) showing
+// the game's actual rendered ASCII framebuffer — real, verified output,
+// just not a native graphical window yet.
+//
+// Uses a dedicated "global cell" (heap_base + 24GiB) to stash each library
+// slot's relic path for its own zero-arg click callback — same established
+// pattern as anvil_dialog.sg (8GiB) and gfx_player.sg (16GiB), each at a
+// distinct offset so the three never collide. Reuses cstrlen/resource_path
+// (forge_gui.sg), ccat2/cstr_from_text (anvil_dialog.sg), and every d*()
+// bit-pattern constant already defined in forge_gui.sg — this file adds
+// none of its own, to avoid duplicate-symbol errors across the three.
+
+// heap_base + 13,000,000,000 — cc0's mmap'd heap region is 16 GiB
+// (17,179,869,184 bytes), NOT "24 GiB" worth of round-number bytes as an
+// earlier version of this constant assumed (1123511627776 was actually
+// heap_base+24,000,000,000, past the real mapped ceiling — confirmed via a
+// crash right at the poke64 call). This offset leaves ~4B bytes of
+// clearance below the true ceiling and from anvil_dialog.sg's/
+// gfx_player.sg's own cells (8B/16B offsets respectively).
+fn lib_cell_base() -> Int { return 1112511627776; }
+fn lib_max_slots() -> Int { return 10; }
+// Layout: 8 bytes per slot, each holding a raw C-string pointer to that
+// slot's relic path (0 = empty slot).
+
+fn lib_roms_dir() -> Text { return "/Users/grio/Documents/Forge/roms/gb"; }
+fn lib_view_binary_suffix() -> Text { return "/dist/forge-gb-view-macos-arm64"; }
+fn view_target_path2() -> Text { return "/tmp/forge_view_target.txt"; }
+
+// A raw C-string pointer back into a Sigil Text (the inverse of
+// cstr_from_text), needed to use a relic's filename as a button title.
+fn cstr_to_text(ptr: Int) -> Text {
+    let n: Int = cstrlen(ptr);
+    var t: Text = "";
+    var i: Int = 0;
+    while i < n invariant i >= 0 { t = t + chr(peek8(ptr, i)); i = i + 1; }
+    return t;
+}
+
+fn ends_with_relic(t: Int) -> Int ! {mem} {
+    let n: Int = cstrlen(t);
+    if n < 6 { return 0; }
+    if peek8(t, n - 6) != 46 { return 0; }    // '.'
+    if peek8(t, n - 5) != 114 { return 0; }   // 'r'
+    if peek8(t, n - 4) != 101 { return 0; }   // 'e'
+    if peek8(t, n - 3) != 108 { return 0; }   // 'l'
+    if peek8(t, n - 2) != 105 { return 0; }   // 'i'
+    if peek8(t, n - 1) != 99 { return 0; }    // 'c'
+    return 1;
+}
+
+// Build a 3-element NSArray {"-a","Terminal",binPath} for open's args.
+fn lib_open_args(bin_path: Int) -> Int ! {mem} {
+    let arr: Int = alloc_buf(24);
+    poke64(arr, 0, nsstring("-a"));
+    poke64(arr, 8, nsstring("Terminal"));
+    poke64(arr, 16, msg1(cls("NSString"), sel("stringWithUTF8String:"), bin_path));
+    return arr;
+}
+
+// Launch the GB terminal viewer for the relic in library slot `slot`.
+fn lib_launch_slot(slot: Int) -> Int ! {mem} {
+    let path: Int = peek64(lib_cell_base(), slot * 8);
+    if path == 0 { return 0; }
+
+    // Write the handoff file the viewer reads (open -a Terminal can't pipe
+    // stdin the way NSTask can).
+    let content: Int = ccat2(path, cstr_from_text("\n"));
+    let data: Int = msg2(cls("NSData"), sel("dataWithBytes:length:"), content, cstrlen(content));
+    dyld_call6("_objc_msgSend", data, sel("writeToFile:atomically:"), nsstring(view_target_path2()), 1, 0, 0);
+
+    let task: Int = msg0(msg0(cls("NSTask"), sel("alloc")), sel("init"));
+    dyld_call6("_objc_msgSend", task, sel("setLaunchPath:"), nsstring("/usr/bin/open"), 0, 0, 0);
+    let bin_path: Int = ccat2(resource_path(), cstr_from_text(lib_view_binary_suffix()));
+    let args: Int = msg2(cls("NSArray"), sel("arrayWithObjects:count:"), lib_open_args(bin_path), 3);
+    dyld_call6("_objc_msgSend", task, sel("setArguments:"), args, 0, 0, 0);
+    dyld_call6("_objc_msgSend", task, sel("launch"), 0, 0, 0, 0);
+    return 0;
+}
+
+fn act_lib_0() -> Int ! {mem} { lib_launch_slot(0); return 0; }
+fn act_lib_1() -> Int ! {mem} { lib_launch_slot(1); return 0; }
+fn act_lib_2() -> Int ! {mem} { lib_launch_slot(2); return 0; }
+fn act_lib_3() -> Int ! {mem} { lib_launch_slot(3); return 0; }
+fn act_lib_4() -> Int ! {mem} { lib_launch_slot(4); return 0; }
+fn act_lib_5() -> Int ! {mem} { lib_launch_slot(5); return 0; }
+fn act_lib_6() -> Int ! {mem} { lib_launch_slot(6); return 0; }
+fn act_lib_7() -> Int ! {mem} { lib_launch_slot(7); return 0; }
+fn act_lib_8() -> Int ! {mem} { lib_launch_slot(8); return 0; }
+fn act_lib_9() -> Int ! {mem} { lib_launch_slot(9); return 0; }
+
+fn lib_slot_addr(slot: Int) -> Int {
+    if slot == 0 { return addr(act_lib_0); }
+    if slot == 1 { return addr(act_lib_1); }
+    if slot == 2 { return addr(act_lib_2); }
+    if slot == 3 { return addr(act_lib_3); }
+    if slot == 4 { return addr(act_lib_4); }
+    if slot == 5 { return addr(act_lib_5); }
+    if slot == 6 { return addr(act_lib_6); }
+    if slot == 7 { return addr(act_lib_7); }
+    if slot == 8 { return addr(act_lib_8); }
+    return addr(act_lib_9);
+}
+
+fn lib_slot_class_name(slot: Int) -> Text {
+    if slot == 0 { return "ForgeLibSlot0"; }
+    if slot == 1 { return "ForgeLibSlot1"; }
+    if slot == 2 { return "ForgeLibSlot2"; }
+    if slot == 3 { return "ForgeLibSlot3"; }
+    if slot == 4 { return "ForgeLibSlot4"; }
+    if slot == 5 { return "ForgeLibSlot5"; }
+    if slot == 6 { return "ForgeLibSlot6"; }
+    if slot == 7 { return "ForgeLibSlot7"; }
+    if slot == 8 { return "ForgeLibSlot8"; }
+    return "ForgeLibSlot9";
+}
+
+// Button y-positions for up to 10 stacked slots (matches forge_gui.sg's own
+// 40pt-spacing convention, reusing its existing d*() constants).
+fn lib_y_bits(slot: Int) -> Int {
+    if slot == 0 { return d380(); }
+    if slot == 1 { return d340(); }
+    if slot == 2 { return d300(); }
+    if slot == 3 { return d260(); }
+    if slot == 4 { return d220(); }
+    if slot == 5 { return d180(); }
+    if slot == 6 { return d140(); }
+    if slot == 7 { return d100(); }
+    if slot == 8 { return d60(); }
+    return d20();
+}
+
+fn open_library() -> Int ! {mem, io.write} {
+    let win: Int = wm_create_window("Forge Library", d100(), d100(), d300(), d420());
+    wm_set_window_background(win, lc_surface_base_r(), lc_surface_base_g(), lc_surface_base_b());
+
+    let fm: Int = msg0(cls("NSFileManager"), sel("defaultManager"));
+    let dir_ns: Int = nsstring(lib_roms_dir());
+    let entries: Int = msg2(fm, sel("contentsOfDirectoryAtPath:error:"), dir_ns, 0);
+    let count: Int = msg0(entries, sel("count"));
+
+    var slot: Int = 0;
+    var i: Int = 0;
+    while i < count invariant i >= 0 {
+        if slot < lib_max_slots() {
+            let name_ns: Int = msg1(entries, sel("objectAtIndex:"), i);
+            let name_c: Int = msg0(name_ns, sel("UTF8String"));
+            if ends_with_relic(name_c) == 1 {
+                let full: Int = ccat2(cstr_from_text(lib_roms_dir() + "/"), name_c);
+                poke64(lib_cell_base(), slot * 8, full);
+
+                wm_create_button(win, lib_slot_class_name(slot), cstr_to_text(name_c), d20(), lib_y_bits(slot), d260(), d30(),
+                    lc_accent_r(), lc_accent_g(), lc_accent_b(), lib_slot_addr(slot));
+                slot = slot + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    if slot == 0 {
+        wm_create_label(win, "No relics yet. Use ANVIL to seal a ROM into", d20(), d20(), d260(), d30());
+    }
+
+    wm_show_window(win);
+    return 0;
+}

@@ -1,0 +1,12 @@
+// forge/play/player_gb.sg — Game Boy glue for the shared gfx_player.sg
+// engine. Links: forge/play/gb_core.sg forge/play/gfx_player.sg
+// forge/play/player_gb.sg (+ forge/lumen_colors.sg forge/wm_pal_macos.sg).
+
+fn player_mem_size() -> Int { return 3735552; }   // gb_rom + core_rom_max (matches gb_relic_test.sg)
+fn player_fb_w_bits() -> Int { return 4639833516098453504; }   // 160.0
+fn player_fb_h_bits() -> Int { return 4639270566145032192; }   // 144.0
+fn player_title() -> Text { return "Forge — Game Boy"; }
+
+fn main() -> Int ! {mem, io.write, fs.read} {
+    return gfx_player_main();
+}
