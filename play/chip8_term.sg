@@ -1,0 +1,15 @@
+// forge/play/chip8_term.sg — IBM-logo demo main (links forge/play/chip8_core.sg).
+// Build: forge/play/build-chip8-term.sh
+
+fn main() -> Int ! {mem, io.write} {
+    let b: Int = alloc_buf(6464);
+    let src: Int = alloc_buf(256);
+    let n: Int = load_ibm(src);
+    chip8_init(b);
+    chip8_load(b, src, n);
+    chip8_run(b, 300);
+    print(1, "  FORGE CHIP-8 - IBM logo ROM, native on macOS:\n");
+    render_term(b);
+    print(1, "\n  [OK] ROM executed + rendered native.\n");
+    return 0;
+}

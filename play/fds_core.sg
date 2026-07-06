@@ -1,0 +1,225 @@
+// fds.sg — Famicom Disk System: the NES + a disk drive + an extra sound channel. The FDS reuses the
+// ENTIRE NES core (cores/nes.sg — 2A03 6502 + PPU + APU); this file adds the FDS-specific hardware.
+// First increment: the FDS wavetable sound channel (the signature FDS audio) — a 64-step 6-bit
+// wavetable driven by a 20-bit phase accumulator + a volume gain, mixed to centred s16 stereo (the
+// same shape as the PSG/WSG/Paula audio). The disk RAM + .fds loader + the modulation unit follow.
+// (fds_ prefix; the FDS EL0 app links cores/nes.sg + this for the disk + sound additions.)
+//
+// Region block above the arcade (no overlap):
+fn fds_snd(m: Int) -> Int { return m + 1048576; }        // FDS zone+0: audio
+fn fds_st(m: Int) -> Int { return m + 1572864; }         // FDS zone+524288: wavetable+state
+
+// 64-step wavetable, 6-bit samples (0-63), one per byte.
+fn fds_set_wave(m: Int, i: Int, s: Int) -> Int ! {mem} { poke8(fds_st(m), i and 63, s and 63); return 0; }
+fn fds_wave(m: Int, i: Int) -> Int ! {mem} { return peek8(fds_st(m), i and 63) and 63; }
+// channel state: @64 frequency (16-bit), @66 volume gain (0-32), @68 phase accumulator (20-bit).
+fn fds_set_freq(m: Int, f: Int) -> Int ! {mem} { poke8(fds_st(m), 64, f and 255); poke8(fds_st(m), 65, (f / 256) and 255); return 0; }
+fn fds_freq(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 64) + peek8(fds_st(m), 65) * 256; }
+fn fds_set_vol(m: Int, v: Int) -> Int ! {mem} { poke8(fds_st(m), 66, v and 63); return 0; }
+fn fds_vol(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 66) and 63; }
+fn fds_acc(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 68) + peek8(fds_st(m), 69) * 256 + peek8(fds_st(m), 70) * 65536; }
+fn fds_set_acc(m: Int, a: Int) -> Int ! {mem} { poke8(fds_st(m), 68, a and 255); poke8(fds_st(m), 69, (a / 256) and 255); poke8(fds_st(m), 70, (a / 65536) and 255); return 0; }
+// synthesize `count` stereo s16 frames: the phase accumulator (20-bit) advances by frequency; its
+// top 6 bits index the 64-step wavetable; the 6-bit sample (centred at 32) x the volume gain.
+fn fds_fill(m: Int, count: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < count invariant i >= 0 {
+        fds_mod_step(m);                                              // advance the modulator
+        var s: Int = 0;
+        if fds_vol(m) > 0 {
+            let eff: Int = fds_freq(m) + fds_mod_bias(m, fds_freq(m));    // carrier pitch biased by the modulator
+            let acc: Int = (fds_acc(m) + eff) and 1048575;            // 20-bit wrap
+            fds_set_acc(m, acc);
+            s = (fds_wave(m, (acc / 16384) and 63) - 32) * fds_vol(m) * 32;
+        }
+        if s > 32767 { s = 32767; } if s < (0 - 32768) { s = 0 - 32768; }
+        let lo: Int = s and 255; let hi: Int = (s and 65535) / 256;
+        poke8(fds_snd(m), i * 4, lo); poke8(fds_snd(m), i * 4 + 1, hi);
+        poke8(fds_snd(m), i * 4 + 2, lo); poke8(fds_snd(m), i * 4 + 3, hi);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- FDS modulation unit: the signature FDS sound trick — a second 64-step table that bends the main
+// wave's pitch. Each mod-table entry is a 3-bit code mapping to a bias delta {0:+0 1:+1 2:+2 3:+4
+// 4:reset 5:-4 6:-2 7:-1}; a mod phase accumulator (mod frequency) walks the table, accumulating into
+// a signed mod counter (-64..63, code 4 resets it). The counter x the mod depth biases the carrier
+// pitch. State in fds_st: mod table @128..191, mod freq @192, mod depth @194, mod phase @196 (20-bit),
+// mod counter @200 (signed). (The exact nesdev rounding of the pitch blend is a refinement.)
+fn fds_mod_delta(v: Int) -> Int {
+    let m: Int = v and 7;
+    if m == 1 { return 1; }
+    if m == 2 { return 2; }
+    if m == 3 { return 4; }
+    if m == 5 { return 0 - 4; }
+    if m == 6 { return 0 - 2; }
+    if m == 7 { return 0 - 1; }
+    return 0;                                    // 0 and 4 (reset) contribute no delta here
+}
+fn fds_set_modtable(m: Int, i: Int, v: Int) -> Int ! {mem} { poke8(fds_st(m), 128 + (i and 63), v and 7); return 0; }
+fn fds_modtable(m: Int, i: Int) -> Int ! {mem} { return peek8(fds_st(m), 128 + (i and 63)) and 7; }
+fn fds_set_mod_freq(m: Int, f: Int) -> Int ! {mem} { poke8(fds_st(m), 192, f and 255); poke8(fds_st(m), 193, (f / 256) and 255); return 0; }
+fn fds_mod_freq(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 192) + peek8(fds_st(m), 193) * 256; }
+fn fds_set_mod_depth(m: Int, d: Int) -> Int ! {mem} { poke8(fds_st(m), 194, d and 63); return 0; }
+fn fds_mod_depth(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 194) and 63; }
+fn fds_mod_phase(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 196) + peek8(fds_st(m), 197) * 256 + peek8(fds_st(m), 198) * 65536; }
+fn fds_set_mod_phase(m: Int, p: Int) -> Int ! {mem} { poke8(fds_st(m), 196, p and 255); poke8(fds_st(m), 197, (p / 256) and 255); poke8(fds_st(m), 198, (p / 65536) and 255); return 0; }
+fn fds_mod_counter(m: Int) -> Int ! {mem} { let b: Int = peek8(fds_st(m), 200); if b >= 128 { return b - 256; } return b; }
+fn fds_set_mod_counter(m: Int, c: Int) -> Int ! {mem} { poke8(fds_st(m), 200, c and 255); return 0; }
+// advance the modulator one step: walk the table by the mod frequency, accumulate / reset the counter.
+fn fds_mod_step(m: Int) -> Int ! {mem} {
+    let ph: Int = (fds_mod_phase(m) + fds_mod_freq(m)) and 1048575;
+    fds_set_mod_phase(m, ph);
+    let v: Int = fds_modtable(m, (ph / 16384) and 63);
+    if (v and 7) == 4 { fds_set_mod_counter(m, 0); return 0; }   // code 4 = reset
+    var c: Int = fds_mod_counter(m) + fds_mod_delta(v);
+    if c > 63 { c = c - 128; }
+    if c < (0 - 64) { c = c + 128; }                          // wrap to the signed 7-bit counter
+    fds_set_mod_counter(m, c);
+    return 0;
+}
+// the pitch bias the modulator applies to the carrier (counter x depth, scaled). 0 when depth/counter 0.
+fn fds_mod_bias(m: Int, base_freq: Int) -> Int ! {mem} { return (base_freq * fds_mod_counter(m) * fds_mod_depth(m)) / 4096; }
+
+// --- FDS disk drive: FDS games load off a .fds disk image into the 32KB disk RAM and the BIOS streams
+// disk data through the drive registers. This increment lands the disk substrate: the .fds image
+// staging (header detect + side count), the sequential disk read (the BIOS reads bytes in order), the
+// read-pointer seek, and the drive-inserted status. Disk-state bytes live in fds_st @210+ (clear of
+// the audio state @0..200). The $4030-$4032 register decode + the BIOS + EL0 app follow.
+fn fds_ram(m: Int) -> Int { return m + 2097152; }        // FDS zone+1048576: 32KB disk RAM
+fn fds_disk(m: Int) -> Int { return m + 2621440; }       // FDS zone+1572864: staged disk image (256KB cap)
+fn fds_disk_max() -> Int { return 262144; }
+fn fds_diskpos(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 212) + peek8(fds_st(m), 213) * 256 + peek8(fds_st(m), 214) * 65536; }
+fn fds_set_diskpos(m: Int, p: Int) -> Int ! {mem} { poke8(fds_st(m), 212, p and 255); poke8(fds_st(m), 213, (p / 256) and 255); poke8(fds_st(m), 214, (p / 65536) and 255); return 0; }
+fn fds_disk_sides(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 210); }
+fn fds_drive_inserted(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 211) and 1; }
+// load a .fds image: detect the "FDS\x1a" header (skip the 16-byte header, side count @4), else treat
+// as raw (sides = len / 65500). Copy the disk data into fds_disk (clamped), reset the read pointer.
+fn fds_disk_load(m: Int, blob: Int, len: Int) -> Int ! {mem} {
+    var off: Int = 0; var sides: Int = 0;
+    var fds_hdr: Int = 0;
+    if peek8(blob, 0) == 70 { if peek8(blob, 1) == 68 { fds_hdr = 1; } }
+    if fds_hdr == 1 { if peek8(blob, 2) == 83 { if peek8(blob, 3) == 26 { sides = peek8(blob, 4); off = 16; } } }
+    if off == 0 { sides = len / 65500; }
+    var n: Int = len - off; if n > fds_disk_max() { n = fds_disk_max(); }
+    if n < 0 { n = 0; }
+    var i: Int = 0;
+    while i < n invariant i >= 0 { poke8(fds_disk(m), i, peek8(blob, off + i)); i = i + 1; }
+    fds_set_diskpos(m, 0);
+    poke8(fds_st(m), 210, sides and 255);         // side count
+    poke8(fds_st(m), 211, 1);                      // disk inserted
+    return sides;
+}
+// the BIOS reads disk data sequentially through $4031: byte at the read pointer, then advance.
+fn fds_disk_read(m: Int) -> Int ! {mem} {
+    let p: Int = fds_diskpos(m);
+    if p < 0 { return 0; }
+    if p >= fds_disk_max() { return 0; }          // bounds guard
+    let b: Int = peek8(fds_disk(m), p);
+    fds_set_diskpos(m, p + 1);
+    return b;
+}
+// drive status ($4032): bit0 = disk not inserted, bit1 = not ready (active-low style). Simplified.
+fn fds_drive_status(m: Int) -> Int ! {mem} { if fds_drive_inserted(m) == 1 { return 0; } return 1; }
+
+// --- FDS disk/control registers ($4020-$4033, beyond the APU's $4000-$4017): the CPU-visible seam
+// the BIOS drives. Reads: $4030 disk status (bit1 = byte-transfer ready when the motor's on), $4031
+// disk data (streams the next disk byte), $4032 drive status (bit0 = not inserted), $4033 ext (battery
+// good). Writes: $4023 master I/O enable, $4024 write-data latch, $4025 FDS control (motor/mode/IRQ),
+// $4020-$4022 IRQ timer. Control state in fds_st @216+. (Wiring these into the NES bus + IRQ timing +
+// the BIOS follow; this is the register dispatch the EL0 integration will route $402x reads/writes to.)
+fn fds_ctrl(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 216); }
+fn fds_master_enable(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 217) and 1; }
+fn fds_reg_write(m: Int, addr: Int, val: Int) -> Int ! {mem} {
+    let a: Int = addr and 65535;
+    if a == 16419 { poke8(fds_st(m), 217, val and 1); return 0; }      // $4023 master I/O enable
+    if a == 16420 { poke8(fds_st(m), 218, val and 255); return 0; }    // $4024 write-data latch
+    if a == 16421 { poke8(fds_st(m), 216, val and 255); return 0; }    // $4025 FDS control
+    if a == 16416 { poke8(fds_st(m), 220, val and 255); return 0; }    // $4020 IRQ timer low
+    if a == 16417 { poke8(fds_st(m), 221, val and 255); return 0; }    // $4021 IRQ timer high
+    if a == 16418 { poke8(fds_st(m), 222, val and 255); return 0; }    // $4022 IRQ timer control
+    return 0;
+}
+fn fds_reg_read(m: Int, addr: Int) -> Int ! {mem} {
+    let a: Int = addr and 65535;
+    if a == 16433 { return fds_disk_read(m); }                         // $4031 disk data
+    if a == 16434 { return fds_drive_status(m); }                      // $4032 drive status
+    if a == 16432 { if (fds_ctrl(m) and 1) == 1 { return 2; } return 0; }  // $4030 status: byte-ready when motor on
+    if a == 16435 { return 128; }                                    // $4033 ext connector: battery good
+    return 0;
+}
+
+// --- FDS core ABI (links fds.sg BEFORE nes.sg; first-def-wins overrides nes.sg stubs) ---
+// FDS mode flag at fds_st+208: 1 when FDS disk active, 0 otherwise.
+fn fds_mode(m: Int) -> Int ! {mem} { return peek8(fds_st(m), 208) and 1; }
+fn fds_mode_on(m: Int) -> Int ! {mem} { poke8(fds_st(m), 208, 1); return 0; }
+fn fds_mode_off(m: Int) -> Int ! {mem} { poke8(fds_st(m), 208, 0); return 0; }
+
+// Copy the FDS BIOS (8 KB) into n6_mem at $E000 (offset 57344). Call before core_load.
+fn fds_load_bios(m: Int, bios: Int, len: Int) -> Int ! {mem} {
+    var n: Int = len; if n > 8192 { n = 8192; }
+    var i: Int = 0;
+    while i < n invariant i >= 0 { poke8(n6_mem(m), 57344 + i, peek8(bios, i)); i = i + 1; }
+    return 0;
+}
+
+// core ABI — overrides nes.sg equivalents when fds.sg is linked first.
+fn core_id() -> Int { return 40; }
+fn core_fb(m: Int) -> Int { return n6_fb(m); }
+fn core_fb_w() -> Int { return 256; }
+fn core_fb_h() -> Int { return 240; }
+fn core_load(m: Int, rom: Int, len: Int) -> Int ! {mem} {
+    n6_pal_init(m);
+    // Clear RAM only (0x0000-0xDFFF), NOT the BIOS region (0xE000-0xFFFF, where
+    // the reset vector at $FFFC lives). The upstream core cleared all 64KB
+    // unconditionally, which wipes out fds_load_bios's write even though its own
+    // doc comment says "call before core_load" -- the two functions contradicted
+    // each other (native-port fix; real FDS/NES hardware maps $E000+ to
+    // persistent BIOS ROM, which a reset never clears).
+    var z: Int = 0;
+    while z < 57344 invariant z >= 0 { poke8(n6_mem(m), z, 0); z = z + 1; }
+    var s: Int = 0;
+    while s < 40 invariant s >= 0 { poke8(n6_st(m), s, 0); s = s + 1; }
+    fds_disk_load(m, rom, len);
+    fds_mode_on(m);
+    n6_set_sp(m, 253);
+    n6_set_p(m, 36);
+    n6_set_pc(m, n6_read16(m, 65532));   // BIOS reset vector at $FFFC
+    return 1;
+}
+// n6_st(m)+16 = P1 pad; n6_st(m)+20 = P2 pad (NES 2-player expansion port).
+fn core_set_input_port(m: Int, port: Int, buttons: Int) -> Int ! {mem} {
+    if port == 0 { poke32(n6_st(m), 16, buttons); return 0; }
+    if port == 1 { poke32(n6_st(m), 20, buttons); return 0; }
+    return 0;
+}
+fn core_set_input(m: Int, buttons: Int) -> Int ! {mem} { return core_set_input_port(m, 0, buttons); }
+fn core_run_frame(m: Int) -> Int ! {mem} {
+    poke32(n6_st(m), 32, peek32(n6_st(m), 32) and 127);      // clear vblank
+    var c: Int = 0;
+    while c < 29780 invariant c >= 0 { c = c + n6_step(m); }
+    poke32(n6_st(m), 32, peek32(n6_st(m), 32) or 128);       // set vblank
+    n6_render(m);
+    if (peek32(n6_st(m), 28) / 128) % 2 == 1 {
+        n6_push(m, (n6_pc(m) / 256) and 255);
+        n6_push(m, n6_pc(m) and 255);
+        n6_push(m, n6_p(m));
+        n6_setf(m, 2, 1);
+        n6_set_pc(m, n6_read16(m, 65530));                        // NMI vector at $FFFA
+    }
+    fds_fill(m, 800);
+    return 0;
+}
+
+fn core_savestate(m: Int, dst: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 512 invariant i >= 0 { poke8(dst, i, peek8(fds_st(m), i)); i = i + 1; }
+    return 0;
+}
+fn core_loadstate(m: Int, src: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 512 invariant i >= 0 { poke8(fds_st(m), i, peek8(src, i)); i = i + 1; }
+    return 0;
+}
+fn core_savestate_size() -> Int { return 512; }

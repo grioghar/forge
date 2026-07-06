@@ -1,0 +1,28 @@
+// forge/tools/crc32.sg — CRC-32/ISO-HDLC (IEEE 802.3, poly 0xEDB88320).
+// Links with forge/app/sha256.sg for sha_xor / sha_shr.
+// Used by ANVIL to produce the payload_crc32 field in RELIC-V2 containers.
+
+fn crc32_poly() -> Int { return 3988292384; }   // 0xEDB88320
+
+fn crc32_byte(crc: Int, b: Int) -> Int {
+    var c: Int = sha_xor(crc, b);
+    var i: Int = 0;
+    while i < 8 invariant i >= 0 {
+        let bit: Int = c % 2;
+        let shifted: Int = sha_shr(c, 1);
+        if bit == 1 { c = sha_xor(shifted, crc32_poly()); }
+        if bit == 0 { c = shifted; }
+        i = i + 1;
+    }
+    return c;
+}
+
+fn crc32(base: Int, len: Int) -> Int ! {mem} {
+    var crc: Int = 4294967295;   // 0xFFFFFFFF
+    var i: Int = 0;
+    while i < len invariant i >= 0 {
+        crc = crc32_byte(crc, peek8(base, i));
+        i = i + 1;
+    }
+    return sha_xor(crc, 4294967295);
+}

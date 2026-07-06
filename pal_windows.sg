@@ -1,0 +1,38 @@
+// forge/pal_windows.sg — Windows (PE/COFF x86-64) PAL backend for Forge.
+// Link FIRST so these defs win over forge/pal.sg defaults.
+// Build: cc0 target=win → PE/COFF — GATED on cc0 shipping PE emit (cc0 1.1).
+//
+// All stubs. Source-ready; binary gated entirely on cc0's PE/COFF backend.
+// When cc0 ships target=win, wire display via Win32 GDI/D3D, input via
+// DirectInput/XInput, audio via XAudio2/WASAPI, mmap via VirtualAlloc.
+
+fn pal_fs_resolve(s: Sys, path: Int, out: Int) -> Int ! {sys} { return 0 - 1; }   // stub: always "not found"
+fn pal_fs_read(s: Sys, fd: Int, buf: Int, size: Int) -> Int ! {sys} { return 0; }
+fn pal_fs_write(s: Sys, fd: Int, buf: Int, size: Int) -> Int ! {sys} { return 0; }
+fn pal_fs_close(s: Sys, fd: Int) -> Int ! {sys} { return 0; }
+
+fn pal_fb_base(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_fb_pitch(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_fb_width(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_fb_height(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_present(s: Sys) -> Int ! {sys} { return 0; }
+
+fn pal_input_state(s: Sys, pad: Int) -> Int ! {sys} { return 0; }
+
+fn pal_aud_open(s: Sys, rate: Int, channels: Int, frames: Int) -> Int ! {sys} { return 0; }
+fn pal_aud_submit(s: Sys, buf: Int, frames: Int) -> Int ! {sys} { return 0; }
+fn pal_aud_volume(s: Sys, vol: Int) -> Int ! {sys} { return 0; }
+fn pal_aud_close(s: Sys) -> Int ! {sys} { return 0; }
+
+fn pal_frame_yield() -> Int { return 0; }
+fn pal_should_quit() -> Int { return 0; }
+
+// A fresh peek8/poke8-able region of `size` bytes from cc0's bump heap (alloc_buf) —
+// target-agnostic compiler builtin, not a VirtualAlloc syscall. `base` is advisory
+// and ignored, same contract as pal_macos.sg/pal_linux.sg. Compiles clean for win
+// (verified); not execution-tested (no way to run a PE binary on this Mac).
+fn pal_mem_map(base: Int, size: Int) -> Int { return alloc_buf(size); }
+
+fn pal_launch(s: Sys, app_id: Int) -> Int ! {sys} { return 0; }   // no-op; caller reads return value
+
+fn pal_host() -> Int { return 3; }   // Windows

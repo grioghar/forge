@@ -1,0 +1,22 @@
+// forge/input/bind_normalized.sg — canonical pad -> the Sigil-Retropie fleet's
+// "normalized button mask" convention (cores/nes.sg's documented format,
+// shared by core_set_input/core_set_input_port across the cores/ family):
+//   1=Up 2=Down 4=Left 8=Right 16=A 32=B 64=Start 128=Select
+//
+// This is the SAME canonical pad (forge/input/pad.sg) used for CHIP-8 and the
+// DOS/Doom keyboard-synthesis binding — one abstraction, every core. Any core
+// whose core_set_input(m, buttons) expects this mask (GB, likely most of the
+// cores/ family per the shared convention) plugs in via this single function.
+
+fn bind_norm_mask(pad: Int) -> Int ! {mem} {
+    var v: Int = 0;
+    if pad_get(pad, pad_up())    == 1 { v = v + 1; }
+    if pad_get(pad, pad_down())  == 1 { v = v + 2; }
+    if pad_get(pad, pad_left())  == 1 { v = v + 4; }
+    if pad_get(pad, pad_right()) == 1 { v = v + 8; }
+    if pad_get(pad, pad_a())     == 1 { v = v + 16; }
+    if pad_get(pad, pad_b())     == 1 { v = v + 32; }
+    if pad_get(pad, pad_start()) == 1 { v = v + 64; }
+    if pad_get(pad, pad_select())== 1 { v = v + 128; }
+    return v;
+}

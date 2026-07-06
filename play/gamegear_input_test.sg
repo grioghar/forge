@@ -1,0 +1,48 @@
+// forge/play/gamegear_input_test.sg — verifies the Game Gear/SMS controller
+// pipeline: canonical pad -> normalized mask -> core_set_input -> the real $DC
+// joypad port, independent of any one game's behavior.
+//
+// Links: forge/input/pad.sg forge/input/bind_normalized.sg forge/play/z80_core.sg
+//        forge/play/psg_gg_core.sg forge/play/sms_vdp_core.sg forge/play/sms_core.sg
+//        forge/play/gamegear_core.sg forge/play/gamegear_input_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+fn main() -> Int ! {mem, io.write} {
+    let m: Int = alloc_buf(1310720);
+    let rom: Int = alloc_buf(32768);
+    core_load(m, rom, 32768);
+
+    let pad: Int = alloc_buf(16);
+    var pass: Int = 0;
+    var tot: Int = 0;
+
+    pad_clear(pad);
+    pad_set(pad, pad_right(), 1);
+    pad_set(pad, pad_a(), 1);
+    let mask: Int = bind_norm_mask(pad);
+    tot = tot + 1; pass = chk(mask == 24, pass);   // Right(8) + A(16) = 24
+
+    core_set_input(m, mask);
+    let p1: Int = z80_in(m, 220);   // real $DC port read (matches z80_step's `pt==220` decode)
+
+    // Active-low: bit0=Up bit1=Down bit2=Left bit3=Right bit4=btn1 bit5=btn2
+    tot = tot + 1; pass = chk(((p1 / 8) % 2) == 0, pass);    // bit3 Right pressed -> 0
+    tot = tot + 1; pass = chk(((p1 / 16) % 2) == 0, pass);   // bit4 A/btn1 pressed -> 0
+    tot = tot + 1; pass = chk((p1 % 2) == 1, pass);          // bit0 Up NOT pressed -> 1
+    tot = tot + 1; pass = chk(((p1 / 2) % 2) == 1, pass);    // bit1 Down NOT pressed -> 1
+
+    pad_clear(pad);
+    core_set_input(m, bind_norm_mask(pad));
+    let p1b: Int = z80_in(m, 220);
+    tot = tot + 1; pass = chk((p1b and 63) == 63, pass);   // released -> all 1s
+
+    print(1, "GAME GEAR/SMS CONTROLLER PIPELINE: canonical pad -> normalized mask -> $DC port\n");
+    print(1, "  pressed RIGHT+A -> mask="); print(1, chr(48 + mask / 10 % 10)); print(1, chr(48 + mask % 10));
+    print(1, " (expect 24) -> port(active-low)="); print(1, chr(48 + p1 / 100 % 10));
+    print(1, chr(48 + p1 / 10 % 10)); print(1, chr(48 + p1 % 10));
+    print(1, "\n  SELFTEST: "); print(1, chr(48 + pass)); print(1, "/"); print(1, chr(48 + tot));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

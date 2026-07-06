@@ -1,0 +1,68 @@
+// forge/app/relic_ctrl_cfg.sg — CONTROLLER relic class (RLC2 byte 0x04) per-core cfg table.
+// Per RELIC-V2.md §2: CONTROLLER relic carries device identity (VID/PID) and a ctrl_cfg
+// table — one config block per core ({core_id[2], cfg_len[2], cfg bytes…}) for button/axis
+// maps, deadzones, turbo, and hotkeys. This file covers the RLC2 header format for the
+// CONTROLLER class (VID stored in system_id field, PID in core_id field) and cfg-block scan.
+
+fn rcc_magic()            -> Int { return 843271250; }   // "RLC2" LE uint32
+fn rcc_class_controller() -> Int { return 4; }
+
+// --- RLC2 header field readers for CONTROLLER class ---
+// VID is stored in system_id field (offsets 6-7); PID in core_id field (8-9).
+
+fn rcc_read_magic(m: Mmio, base: Int) -> Int ! {mem} { return peek32(base, 0); }
+fn rcc_read_class(m: Mmio, base: Int) -> Int ! {mem} { return peek8(base, 5); }
+
+fn rcc_read_vid(m: Mmio, base: Int) -> Int ! {mem} {
+    return peek8(base, 6) + peek8(base, 7) * 256;
+}
+
+fn rcc_read_pid(m: Mmio, base: Int) -> Int ! {mem} {
+    return peek8(base, 8) + peek8(base, 9) * 256;
+}
+
+// Write minimal CONTROLLER relic header (manifest_len = 0; caller writes payload separately).
+fn rcc_write_hdr(m: Mmio, base: Int, vid: Int, pid: Int) -> Int ! {mem} {
+    poke32(base, 0, rcc_magic());
+    poke8(base, 4, 2);
+    poke8(base, 5, rcc_class_controller());
+    poke8(base, 6, vid % 256);
+    poke8(base, 7, vid / 256 % 256);
+    poke8(base, 8, pid % 256);
+    poke8(base, 9, pid / 256 % 256);
+    poke8(base, 10, 0);
+    poke8(base, 11, 0);
+    poke32(base, 12, 0);   // manifest_len = 0
+    return 0;
+}
+
+// --- ctrl_cfg table layout (payload bytes, separate from the RLC2 header) ---
+// payload[0-1]:  num_blocks (LE uint16)
+// payload[2+]:   blocks[], each block:
+//   [0-1]  core_id  (LE uint16)
+//   [2-3]  cfg_len  (LE uint16)
+//   [4+]   cfg bytes (cfg_len bytes; button/axis map, deadzones, turbo, hotkeys)
+
+fn rcc_num_blocks(m: Mmio, payload: Int) -> Int ! {mem} {
+    return peek8(payload, 0) + peek8(payload, 1) * 256;
+}
+
+// Scan the ctrl_cfg table for the block matching core_id.
+// Returns the byte offset (relative to payload) of the first cfg byte, or -1 if not found.
+fn rcc_find_cfg(m: Mmio, payload: Int, core_id: Int) -> Int ! {mem} {
+    let n: Int = rcc_num_blocks(m, payload);
+    var off: Int = 2;
+    var i: Int = 0;
+    var found: Int = 0 - 1;
+    while i < n invariant i >= 0 {
+        let cid: Int  = peek8(payload, off)     + peek8(payload, off + 1) * 256;
+        let clen: Int = peek8(payload, off + 2) + peek8(payload, off + 3) * 256;
+        if cid == core_id { found = off + 4; }
+        off = off + 4 + clen;
+        i = i + 1;
+    }
+    return found;
+}
+
+// Community profile publish stub — returns 0 until Forge cloud auth + network land.
+fn rcc_publish_stub(m: Mmio, base: Int) -> Int ! {mem} { return 0; }

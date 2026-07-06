@@ -1,0 +1,55 @@
+// forge/play/snes_input_test.sg — verifies the SNES controller pipeline: canonical
+// pad -> normalized mask -> core_set_input -> real auto-joypad hardware registers
+// ($4218/$4219 P1, $421A/$421B P2), independent of any one game's behavior.
+//
+// Links: forge/input/pad.sg forge/input/bind_normalized.sg
+//        forge/play/spc700_core.sg forge/play/snes_core.sg forge/play/snes_input_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+fn main() -> Int ! {mem, io.write} {
+    let m: Int = alloc_buf(2228224);
+    let rom: Int = alloc_buf(32768);
+    core_load(m, rom, 32768);
+
+    let pad: Int = alloc_buf(16);
+    var pass: Int = 0;
+    var tot: Int = 0;
+
+    // Press RIGHT + A on the canonical pad -> the fleet's normalized mask.
+    pad_clear(pad);
+    pad_set(pad, pad_right(), 1);
+    pad_set(pad, pad_a(), 1);
+    let mask: Int = bind_norm_mask(pad);
+    tot = tot + 1; pass = chk(mask == 24, pass);   // Right(8) + A(16) = 24
+
+    core_set_input(m, mask);
+    poke8(s9_dmareg(m), 0, 1);       // NMITIMEN $4200 bit0 = enable auto-joypad read
+    s9_autojoy(m);                   // real SNES hardware auto-read (runs each VBlank)
+
+    let p1: Int = peek8(s9_dmareg(m), 24) + peek8(s9_dmareg(m), 25) * 256;   // $4218/9
+
+    // Real SNES joypad bit layout: bit15=B bit14=Y bit13=Select bit12=Start
+    // bit11=Up bit10=Down bit9=Left bit8=Right bit7=A bit6=X bit5=L bit4=R
+    tot = tot + 1; pass = chk(((p1 / 256) % 2) == 1, pass);    // bit8 Right pressed
+    tot = tot + 1; pass = chk(((p1 / 128) % 2) == 1, pass);    // bit7 A pressed
+    tot = tot + 1; pass = chk(((p1 / 2048) % 2) == 0, pass);   // bit11 Up NOT pressed
+    tot = tot + 1; pass = chk(((p1 / 32768) % 2) == 0, pass);  // bit15 B NOT pressed
+
+    // Release everything -> register reads back to 0.
+    pad_clear(pad);
+    core_set_input(m, bind_norm_mask(pad));
+    s9_autojoy(m);
+    let p1b: Int = peek8(s9_dmareg(m), 24) + peek8(s9_dmareg(m), 25) * 256;
+    tot = tot + 1; pass = chk(p1b == 0, pass);
+
+    print(1, "SNES CONTROLLER PIPELINE: canonical pad -> normalized mask -> $4218/9 auto-joypad\n");
+    print(1, "  pressed RIGHT+A -> mask="); print(1, chr(48 + mask / 10 % 10)); print(1, chr(48 + mask % 10));
+    print(1, " (expect 24) -> P1 register="); print(1, chr(48 + p1 / 10000 % 10));
+    print(1, chr(48 + p1 / 1000 % 10)); print(1, chr(48 + p1 / 100 % 10)); print(1, chr(48 + p1 / 10 % 10)); print(1, chr(48 + p1 % 10));
+    print(1, "\n  SELFTEST: "); print(1, chr(48 + pass / 10 % 10)); print(1, chr(48 + pass % 10));
+    print(1, "/"); print(1, chr(48 + tot / 10 % 10)); print(1, chr(48 + tot % 10));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

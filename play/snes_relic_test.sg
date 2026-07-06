@@ -1,0 +1,68 @@
+// forge/play/snes_relic_test.sg — load a REAL sealed RELIC-V2 SNES ROM relic
+// and run it on the ported native SNES core (forge/play/snes_core.sg).
+//
+// Links: forge/play/snes_core.sg  forge/play/snes_relic_test.sg
+
+fn main() -> Int ! {mem, io.write, io.read, fs.read} {
+    let blob: Text = read_blob(0, "/tmp/snes_test.relic");
+    let flen: Int = len(blob);
+    let raw: Int = alloc_buf(flen);
+    var i: Int = 0;
+    while i < flen invariant i >= 0 { poke8(raw, i, ord(slice(blob, i, i + 1))); i = i + 1; }
+
+    let magic_ok: Int = peek32(raw, 0) == 843271250;
+    let class_ok: Int = peek8(raw, 5) == 1;
+    let sysid: Int = peek8(raw, 6) + peek8(raw, 7) * 256;
+    let mflen: Int = peek32(raw, 12);
+    let payload_off: Int = 16 + mflen + 44;
+    let payload_len: Int = peek32(raw, 16 + mflen + 36);
+
+    print(1, "  relic: magic_ok="); print(1, chr(48 + magic_ok));
+    print(1, " class_ok="); print(1, chr(48 + class_ok));
+    print(1, " sysid="); print(1, chr(48 + sysid / 100 % 10)); print(1, chr(48 + sysid / 10 % 10)); print(1, chr(48 + sysid % 10));
+    print(1, " payload_len="); print(1, chr(48 + payload_len / 1000000 % 10));
+    print(1, chr(48 + payload_len / 100000 % 10)); print(1, chr(48 + payload_len / 10000 % 10));
+    print(1, chr(48 + payload_len / 1000 % 10)); print(1, chr(48 + payload_len / 100 % 10));
+    print(1, chr(48 + payload_len / 10 % 10)); print(1, chr(48 + payload_len % 10));
+    print(1, "\n");
+
+    // Native SNES core needs base..base+1638400 (s9_rom + core_rom_max).
+    let m: Int = alloc_buf(2228224);   // SNES zone (1638400) + SPC700 zone (524416) + margin
+    let n: Int = core_load(m, raw + payload_off, payload_len);
+    print(1, "  core_load returned "); print(1, chr(48 + n)); print(1, "\n");
+
+    var f: Int = 0;
+    while f < 120 invariant f >= 0 { core_run_frame(m); f = f + 1; }
+
+    print(1, "  diag: PC="); let pc: Int = s9_pc(m);
+    print(1, chr(48 + pc / 10000 % 10)); print(1, chr(48 + pc / 1000 % 10));
+    print(1, chr(48 + pc / 100 % 10)); print(1, chr(48 + pc / 10 % 10)); print(1, chr(48 + pc % 10));
+    let pbr: Int = s9_pbr(m);
+    print(1, "  PBR="); print(1, chr(48 + pbr / 100 % 10)); print(1, chr(48 + pbr / 10 % 10)); print(1, chr(48 + pbr % 10));
+    let brightness: Int = peek8(s9_st(m), 0);
+    print(1, "  INIDISP="); print(1, chr(48 + brightness / 100 % 10)); print(1, chr(48 + brightness / 10 % 10)); print(1, chr(48 + brightness % 10));
+    print(1, "\n");
+
+    print(1, "  framebuffer (downsampled 40x18, real SNES image, dark=block):\n");
+    var ry: Int = 0;
+    while ry < 18 invariant ry >= 0 {
+        var rx: Int = 0;
+        while rx < 40 invariant rx >= 0 {
+            let px: Int = rx * 6;
+            let py: Int = ry * 12;
+            let idx: Int = (py * 256 + px) * 4;
+            let pixel: Int = peek32(core_fb(m), idx);
+            let r: Int = pixel % 256;
+            let g: Int = (pixel / 256) % 256;
+            let b: Int = (pixel / 65536) % 256;
+            let lum: Int = (r + g + b) / 3;
+            if lum < 128 { print(1, chr(226)); print(1, chr(150)); print(1, chr(136)); }
+            if lum >= 128 { print(1, "  "); }
+            rx = rx + 1;
+        }
+        print(1, "\n");
+        ry = ry + 1;
+    }
+    print(1, "\n  [OK] SNES relic loaded + ran natively.\n");
+    return 0;
+}

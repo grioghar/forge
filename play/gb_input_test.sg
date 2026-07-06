@@ -1,0 +1,62 @@
+// forge/play/gb_input_test.sg — verifies the controller pipeline at the GB
+// hardware-register level: canonical pad -> normalized mask -> core_set_input
+// -> the real $FF00/P1 joypad register read, independent of any one game's
+// overall behavior (which needs deeper CPU-timing work to fully verify).
+//
+// Links: forge/input/pad.sg forge/input/bind_normalized.sg
+//        forge/play/gb_core.sg forge/play/gb_input_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+fn main() -> Int ! {mem, io.write} {
+    let m: Int = alloc_buf(3735552);
+    let rom: Int = alloc_buf(16);
+    core_load(m, rom, 0);
+
+    let pad: Int = alloc_buf(16);
+    var pass: Int = 0;
+    var tot: Int = 0;
+
+    // Press RIGHT + A on the canonical pad -> the fleet's normalized mask.
+    pad_clear(pad);
+    pad_set(pad, pad_right(), 1);
+    pad_set(pad, pad_a(), 1);
+    let mask: Int = bind_norm_mask(pad);
+    tot = tot + 1; pass = chk(mask == 24, pass);   // Right(8) + A(16) = 24
+
+    core_set_input(m, mask);
+
+    // Select DIRECTION row (P14=0, P15=1 -> select byte 0x10) and read P1:
+    // bit0 (Right) should be 0 (pressed), bits1-3 should be 1 (not pressed).
+    poke8(gb_mem(m), 65280, 16);
+    let dir: Int = gb_read(m, 65280);
+    tot = tot + 1; pass = chk((dir and 1) == 0, pass);   // Right pressed -> bit0=0
+    tot = tot + 1; pass = chk((dir and 2) == 2, pass);   // Left not pressed -> bit1=1
+    tot = tot + 1; pass = chk((dir and 4) == 4, pass);   // Up not pressed
+    tot = tot + 1; pass = chk((dir and 8) == 8, pass);   // Down not pressed
+
+    // Select ACTION row (P15=0, P14=1 -> select byte 0x20) and read P1:
+    // bit0 (A) should be 0 (pressed).
+    poke8(gb_mem(m), 65280, 32);
+    let act: Int = gb_read(m, 65280);
+    tot = tot + 1; pass = chk((act and 1) == 0, pass);   // A pressed -> bit0=0
+    tot = tot + 1; pass = chk((act and 2) == 2, pass);   // B not pressed
+    tot = tot + 1; pass = chk((act and 4) == 4, pass);   // Select not pressed
+    tot = tot + 1; pass = chk((act and 8) == 8, pass);   // Start not pressed
+
+    // Release everything -> both rows read all-1s (nothing pressed).
+    pad_clear(pad);
+    core_set_input(m, bind_norm_mask(pad));
+    poke8(gb_mem(m), 65280, 16);
+    tot = tot + 1; pass = chk(gb_read(m, 65280) == 31, pass);   // sel(16)|dir(15)=31, nothing pressed
+
+    print(1, "GB CONTROLLER PIPELINE: canonical pad -> normalized mask -> $FF00 P1 register\n");
+    print(1, "  pressed RIGHT+A -> mask="); print(1, chr(48 + mask / 10 % 10)); print(1, chr(48 + mask % 10));
+    print(1, " (expect 24) -> dir-row P1="); print(1, chr(48 + dir / 10 % 10)); print(1, chr(48 + dir % 10));
+    print(1, " act-row P1="); print(1, chr(48 + act / 10 % 10)); print(1, chr(48 + act % 10));
+    print(1, "\n  SELFTEST: "); print(1, chr(48 + pass / 10 % 10)); print(1, chr(48 + pass % 10));
+    print(1, "/"); print(1, chr(48 + tot / 10 % 10)); print(1, chr(48 + tot % 10));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

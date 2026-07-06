@@ -1,0 +1,46 @@
+// forge/play/vb_boot_test.sg — verifies the ported Virtual Boy core (V810 CPU)
+// executes a hand-assembled program natively: exact expected register outcome.
+//
+// Links: forge/play/vb_core.sg  forge/play/vb_boot_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+// little-endian 16-bit halfword write.
+fn wrle16(base: Int, off: Int, v: Int) -> Int ! {mem} {
+    poke8(base, off, v and 255);
+    poke8(base, off + 1, (v / 256) and 255);
+    return 0;
+}
+
+fn main() -> Int ! {mem, io.write} {
+    let rom: Int = alloc_buf(1048576);
+    // MOV #5,r2 (op16,r1=5,r2=2 -> hw=16546) ; ADD #1,r2 (op17,r1=1,r2=2 -> hw=17442) x3
+    wrle16(rom, 0, 16546);
+    wrle16(rom, 2, 17442);
+    wrle16(rom, 4, 17442);
+    wrle16(rom, 6, 17442);
+
+    let m: Int = alloc_buf(1441792);
+    core_load(m, rom, 1048576);
+
+    var pass: Int = 0;
+    var tot: Int = 0;
+    tot = tot + 1; pass = chk(v8_pc(m) == 117440512, pass);   // PC = ROM base ($07000000)
+    tot = tot + 1; pass = chk(v8_getr(m, 3) == 61440, pass);  // SP = $F000 latched
+
+    v8_step(m); v8_step(m); v8_step(m); v8_step(m);   // MOV + 3x ADD
+
+    let r2: Int = v8_getr(m, 2);
+    let pc: Int = v8_pc(m);
+    tot = tot + 1; pass = chk(r2 == 8, pass);                        // 5 + 1 + 1 + 1 = 8
+    tot = tot + 1; pass = chk(pc == 117440520, pass);                // 4 instrs x 2 bytes = 8
+
+    print(1, "VIRTUAL BOY BOOT: V810 CPU, MOV+ADD hand-assembled program\n");
+    print(1, "  PC at ROM base ok, SP latched ok\n");
+    print(1, "  after 4 steps: r2="); print(1, chr(48 + r2 / 10 % 10)); print(1, chr(48 + r2 % 10));
+    print(1, " (expect 8 = 5+3)  PC delta from base="); print(1, chr(48 + (pc - 117440512)));
+    print(1, " (expect 8)\n  SELFTEST: "); print(1, chr(48 + pass)); print(1, "/"); print(1, chr(48 + tot));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

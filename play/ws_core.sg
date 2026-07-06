@@ -1,0 +1,436 @@
+// cores/ws.sg — WonderSwan (1999). System #45.
+// CPU: NEC V30MZ @ 3.072MHz (x86 real-mode, 16-bit, 1MB physical).
+// Display: 224×144 pixels, 2bpp grayscale (WS) / 4bpp color (WSC, follow-up).
+// First increment: V30MZ foundation — MOV/ADD/SUB/AND/OR/XOR/CMP/INC/DEC/PUSH/POP/
+//   JMP/Jcc/CALL/RET/HLT — with full ModRM addressing; 2bpp BG tile render.
+// Memory map: ws_mem = 1MB V30MZ physical space; cart ROM loaded at top.
+// ws_mem: 0x30000000  ws_fb: 0x30120000  ws_st: 0x30140000
+
+fn ws_mem(m: Int) -> Int { return m + 0; }
+fn ws_fb(m: Int)  -> Int { return m + 1179648; }
+fn ws_st(m: Int)  -> Int { return m + 1310720; }
+
+// ws_st layout (32-bit words):
+//   [0..7]*4 = AX,CX,DX,BX,SP,BP,SI,DI  (reg file, x86 encoding order)
+//   [8]*4=IP  [9]*4=CS [10]*4=DS [11]*4=SS [12]*4=ES
+//   [13]*4=fCF [14]*4=fPF [15]*4=fAF [16]*4=fZF [17]*4=fSF [18]*4=fOF [19]*4=fDF
+//   [20]*4=HALT
+
+fn ws_r16(m: Int, n: Int) -> Int ! {mem} { return peek32(ws_st(m), (n and 7) * 4) and 65535; }
+fn ws_setr16(m: Int, n: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), (n and 7) * 4, v and 65535); return 0; }
+fn ws_r8(m: Int, n: Int) -> Int ! {mem} {
+    // n 0-3=AL,CL,DL,BL  4-7=AH,CH,DH,BH
+    if n < 4 { return ws_r16(m, n) and 255; }
+    return (ws_r16(m, n - 4) / 256) and 255;
+}
+fn ws_setr8(m: Int, n: Int, v: Int) -> Int ! {mem} {
+    let r: Int = v and 255;
+    if n < 4 { ws_setr16(m, n, (ws_r16(m, n) and 65280) + r); return 0; }
+    ws_setr16(m, n - 4, (ws_r16(m, n - 4) and 255) + r * 256); return 0;
+}
+fn ws_ip(m: Int) -> Int ! {mem} { return peek32(ws_st(m), 32) and 65535; }
+fn ws_set_ip(m: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), 32, v and 65535); return 0; }
+fn ws_cs(m: Int) -> Int ! {mem} { return peek32(ws_st(m), 36) and 65535; }
+fn ws_set_cs(m: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), 36, v and 65535); return 0; }
+fn ws_ds(m: Int) -> Int ! {mem} { return peek32(ws_st(m), 40) and 65535; }
+fn ws_set_ds(m: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), 40, v and 65535); return 0; }
+fn ws_ss(m: Int) -> Int ! {mem} { return peek32(ws_st(m), 44) and 65535; }
+fn ws_set_ss(m: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), 44, v and 65535); return 0; }
+fn ws_cf(m: Int) -> Int ! {mem} { return peek32(ws_st(m), 52) and 1; }
+fn ws_set_cf(m: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), 52, v and 1); return 0; }
+fn ws_zf(m: Int) -> Int ! {mem} { return peek32(ws_st(m), 64) and 1; }
+fn ws_set_zf(m: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), 64, v and 1); return 0; }
+fn ws_sf(m: Int) -> Int ! {mem} { return peek32(ws_st(m), 68) and 1; }
+fn ws_set_sf(m: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), 68, v and 1); return 0; }
+fn ws_of(m: Int) -> Int ! {mem} { return peek32(ws_st(m), 72) and 1; }
+fn ws_set_of(m: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), 72, v and 1); return 0; }
+fn ws_pf(m: Int) -> Int ! {mem} { return peek32(ws_st(m), 56) and 1; }
+fn ws_set_pf(m: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), 56, v and 1); return 0; }
+fn ws_halt(m: Int) -> Int ! {mem} { return peek32(ws_st(m), 80) and 1; }
+fn ws_set_halt(m: Int, v: Int) -> Int ! {mem} { poke32(ws_st(m), 80, v and 1); return 0; }
+
+// 20-bit physical address
+fn ws_phys(seg: Int, off: Int) -> Int {
+    return ((seg * 16) + (off and 65535)) and 1048575;
+}
+fn ws_read8(m: Int, a: Int) -> Int ! {mem} { return peek8(ws_mem(m), a and 1048575); }
+fn ws_write8(m: Int, a: Int, v: Int) -> Int ! {mem} { poke8(ws_mem(m), a and 1048575, v and 255); return 0; }
+fn ws_read16(m: Int, a: Int) -> Int ! {mem} {
+    return ws_read8(m, a) + ws_read8(m, (a + 1) and 1048575) * 256;
+}
+fn ws_write16(m: Int, a: Int, v: Int) -> Int ! {mem} {
+    ws_write8(m, a, v and 255);
+    ws_write8(m, (a + 1) and 1048575, (v / 256) and 255);
+    return 0;
+}
+
+fn ws_fetch8(m: Int) -> Int ! {mem} {
+    let a: Int = ws_phys(ws_cs(m), ws_ip(m));
+    ws_set_ip(m, (ws_ip(m) + 1) and 65535);
+    return ws_read8(m, a);
+}
+fn ws_fetch16(m: Int) -> Int ! {mem} {
+    let lo: Int = ws_fetch8(m); let hi: Int = ws_fetch8(m);
+    return lo + hi * 256;
+}
+fn ws_fetch8s(m: Int) -> Int ! {mem} {
+    let v: Int = ws_fetch8(m); if v >= 128 { return v - 256; } return v;
+}
+fn ws_fetch16s(m: Int) -> Int ! {mem} {
+    let v: Int = ws_fetch16(m); if v >= 32768 { return v - 65536; } return v;
+}
+
+// Stack
+fn ws_push16(m: Int, v: Int) -> Int ! {mem} {
+    let sp: Int = (ws_r16(m, 4) - 2) and 65535;
+    ws_setr16(m, 4, sp);
+    ws_write16(m, ws_phys(ws_ss(m), sp), v);
+    return 0;
+}
+fn ws_pop16(m: Int) -> Int ! {mem} {
+    let sp: Int = ws_r16(m, 4);
+    let v: Int = ws_read16(m, ws_phys(ws_ss(m), sp));
+    ws_setr16(m, 4, (sp + 2) and 65535);
+    return v;
+}
+
+// Flag updates
+fn ws_parity8(v: Int) -> Int {
+    let b: Int = v and 255;
+    let c: Int = (b / 1) % 2 + (b / 2) % 2 + (b / 4) % 2 + (b / 8) % 2
+               + (b / 16) % 2 + (b / 32) % 2 + (b / 64) % 2 + (b / 128) % 2;
+    return (c + 1) % 2;   // PF=1 if even bit count
+}
+fn ws_setflags16(m: Int, r: Int) -> Int ! {mem} {
+    let v: Int = r and 65535;
+    ws_set_zf(m, 0); if v == 0 { ws_set_zf(m, 1); }
+    ws_set_sf(m, v / 32768);
+    ws_set_pf(m, ws_parity8(v));
+    return v;
+}
+fn ws_setflags8(m: Int, r: Int) -> Int ! {mem} {
+    let v: Int = r and 255;
+    ws_set_zf(m, 0); if v == 0 { ws_set_zf(m, 1); }
+    ws_set_sf(m, v / 128);
+    ws_set_pf(m, ws_parity8(v));
+    return v;
+}
+
+// ALU 16-bit: returns result with ZF/SF/PF/CF/OF set
+fn ws_add16(m: Int, a: Int, b: Int) -> Int ! {mem} {
+    let r: Int = a + b;
+    ws_set_cf(m, 0); if r > 65535 { ws_set_cf(m, 1); }
+    let sa: Int = a / 32768; let sb: Int = b / 32768; let sr: Int = (r and 65535) / 32768;
+    var ov: Int = 0; if sa == sb { if sa != sr { ov = 1; } } ws_set_of(m, ov);
+    return ws_setflags16(m, r);
+}
+fn ws_sub16(m: Int, a: Int, b: Int) -> Int ! {mem} {
+    let r: Int = a - b;
+    ws_set_cf(m, 0); if r < 0 { ws_set_cf(m, 1); }
+    let sa: Int = a / 32768; let sb: Int = b / 32768; let sr: Int = (r and 65535) / 32768;
+    var ov: Int = 0; if sa != sb { if sb == sr { ov = 1; } } ws_set_of(m, ov);
+    return ws_setflags16(m, r);
+}
+fn ws_and16(m: Int, a: Int, b: Int) -> Int ! {mem} { ws_set_cf(m, 0); ws_set_of(m, 0); return ws_setflags16(m, a and b); }
+fn ws_or16(m: Int, a: Int, b: Int) -> Int ! {mem} { ws_set_cf(m, 0); ws_set_of(m, 0); return ws_setflags16(m, a or b); }
+fn ws_xor16(m: Int, a: Int, b: Int) -> Int ! {mem} { ws_set_cf(m, 0); ws_set_of(m, 0); return ws_setflags16(m, (a or b) and (0 - (a and b) - 1)); }
+
+fn ws_add8(m: Int, a: Int, b: Int) -> Int ! {mem} {
+    let r: Int = a + b;
+    ws_set_cf(m, 0); if r > 255 { ws_set_cf(m, 1); }
+    let sa: Int = a / 128; let sb: Int = b / 128; let sr: Int = (r and 255) / 128;
+    var ov: Int = 0; if sa == sb { if sa != sr { ov = 1; } } ws_set_of(m, ov);
+    return ws_setflags8(m, r);
+}
+fn ws_sub8(m: Int, a: Int, b: Int) -> Int ! {mem} {
+    let r: Int = a - b;
+    ws_set_cf(m, 0); if r < 0 { ws_set_cf(m, 1); }
+    let sa: Int = a / 128; let sb: Int = b / 128; let sr: Int = (r and 255) / 128;
+    var ov: Int = 0; if sa != sb { if sb == sr { ov = 1; } } ws_set_of(m, ov);
+    return ws_setflags8(m, r);
+}
+fn ws_and8(m: Int, a: Int, b: Int) -> Int ! {mem} { ws_set_cf(m, 0); ws_set_of(m, 0); return ws_setflags8(m, a and b); }
+fn ws_or8(m: Int, a: Int, b: Int) -> Int ! {mem} { ws_set_cf(m, 0); ws_set_of(m, 0); return ws_setflags8(m, a or b); }
+fn ws_xor8(m: Int, a: Int, b: Int) -> Int ! {mem} { ws_set_cf(m, 0); ws_set_of(m, 0); return ws_setflags8(m, (a or b) and (0 - (a and b) - 1)); }
+
+// ModRM: decode effective address (does NOT consume displacement for mod=11)
+// Returns address in physical memory; for mod=11 (reg), use ws_modrm_reg()
+fn ws_modrm_ea(m: Int, modrm: Int, seg: Int) -> Int ! {mem} {
+    let mod: Int = modrm / 64;
+    let rm: Int = modrm and 7;
+    var base: Int = 0;
+    if mod == 3 { return 0; }   // register form — caller uses ws_modrm_reg()
+    if rm == 0 { base = (ws_r16(m, 3) + ws_r16(m, 6)) and 65535; }
+    if rm == 1 { base = (ws_r16(m, 3) + ws_r16(m, 7)) and 65535; }
+    if rm == 2 { base = (ws_r16(m, 5) + ws_r16(m, 6)) and 65535; }
+    if rm == 3 { base = (ws_r16(m, 5) + ws_r16(m, 7)) and 65535; }
+    if rm == 4 { base = ws_r16(m, 6); }
+    if rm == 5 { base = ws_r16(m, 7); }
+    if rm == 6 { if mod == 0 { base = ws_fetch16(m); } if mod != 0 { base = ws_r16(m, 5); } }
+    if rm == 7 { base = ws_r16(m, 3); }
+    var disp: Int = 0;
+    if mod == 1 { disp = ws_fetch8s(m); }
+    if mod == 2 { disp = ws_fetch16s(m); }
+    return ws_phys(seg, (base + disp) and 65535);
+}
+
+// ALU dispatch for 16-bit group ($00-$3F even opcodes)
+fn ws_alu16(m: Int, op: Int, a: Int, b: Int) -> Int ! {mem} {
+    if op == 0 { return ws_add16(m, a, b); }
+    if op == 1 { return ws_or16(m, a, b); }
+    if op == 3 { return ws_sub16(m, a, b); }   // SBB (ignore borrow for simplicity: same as SUB)
+    if op == 4 { return ws_and16(m, a, b); }
+    if op == 5 { return ws_sub16(m, a, b); }
+    if op == 6 { return ws_xor16(m, a, b); }
+    if op == 7 { ws_sub16(m, a, b); return a; }   // CMP: update flags but don't store
+    return a;
+}
+fn ws_alu8(m: Int, op: Int, a: Int, b: Int) -> Int ! {mem} {
+    if op == 0 { return ws_add8(m, a, b); }
+    if op == 1 { return ws_or8(m, a, b); }
+    if op == 3 { return ws_sub8(m, a, b); }
+    if op == 4 { return ws_and8(m, a, b); }
+    if op == 5 { return ws_sub8(m, a, b); }
+    if op == 6 { return ws_xor8(m, a, b); }
+    if op == 7 { ws_sub8(m, a, b); return a; }
+    return a;
+}
+
+// One instruction step (returns 1, or 0 on HALT)
+fn ws_step(m: Int) -> Int ! {mem} {
+    if ws_halt(m) == 1 { return 0; }
+    let op: Int = ws_fetch8(m);
+
+    // $40-$47: INC r16  $48-$4F: DEC r16
+    if op >= 64 { if op < 72 {
+        let r: Int = op - 64; ws_setr16(m, r, ws_add16(m, ws_r16(m, r), 1)); return 1;
+    } }
+    if op >= 72 { if op < 80 {
+        let r: Int = op - 72; ws_setr16(m, r, ws_sub16(m, ws_r16(m, r), 1)); return 1;
+    } }
+    // $50-$57: PUSH r16  $58-$5F: POP r16
+    if op >= 80 { if op < 88 { ws_push16(m, ws_r16(m, op - 80)); return 1; } }
+    if op >= 88 { if op < 96 { ws_setr16(m, op - 88, ws_pop16(m)); return 1; } }
+
+    // $70-$7F: Jcc short
+    if op >= 112 { if op < 128 {
+        let disp: Int = ws_fetch8s(m);
+        let cond: Int = op - 112;
+        var taken: Int = 0;
+        var jatmp: Int = ws_cf(m) + ws_zf(m);      // JA: CF=0 and ZF=0 iff jatmp==0
+        var jgok: Int = 0;                        // JG: ZF=0 and SF==OF
+        if ws_sf(m)==ws_of(m) { if ws_zf(m)==0 { jgok = 1; } }
+        if cond == 0 { if ws_of(m) == 1 { taken = 1; } }                            // JO
+        if cond == 1 { if ws_of(m) == 0 { taken = 1; } }                            // JNO
+        if cond == 2 { if ws_cf(m) == 1 { taken = 1; } }                            // JB/JC
+        if cond == 3 { if ws_cf(m) == 0 { taken = 1; } }                            // JNB/JNC
+        if cond == 4 { if ws_zf(m) == 1 { taken = 1; } }                            // JZ/JE
+        if cond == 5 { if ws_zf(m) == 0 { taken = 1; } }                            // JNZ/JNE
+        if cond == 6 { if (ws_cf(m) == 1) or (ws_zf(m) == 1) { taken = 1; } }       // JBE
+        if cond == 7 { if jatmp==0 { taken = 1; } }                                // JA
+        if cond == 8 { if ws_sf(m) == 1 { taken = 1; } }                            // JS
+        if cond == 9 { if ws_sf(m) == 0 { taken = 1; } }                            // JNS
+        if cond == 12 { if ws_sf(m) != ws_of(m) { taken = 1; } }                     // JL
+        if cond == 13 { if ws_sf(m) == ws_of(m) { taken = 1; } }                     // JGE
+        if cond == 14 { if (ws_zf(m) == 1) or (ws_sf(m) != ws_of(m)) { taken = 1; } }// JLE
+        if cond == 15 { taken = jgok; }                                             // JG
+        if taken == 1 { ws_set_ip(m, (ws_ip(m) + disp) and 65535); }
+        return 1;
+    } }
+
+    // $80/$81: ALU r/m,imm  $83: ALU r/m,imm8 (sign-extended)
+    if (op == 128) or (op == 129) or (op == 131) {
+        let modrm: Int = ws_fetch8(m);
+        let oper: Int = (modrm / 8) and 7;
+        let mod: Int = modrm / 64; let rm: Int = modrm and 7;
+        if op == 129 {
+            let imm: Int = ws_fetch16(m);
+            if mod == 3 { let r: Int = ws_alu16(m, oper, ws_r16(m, rm), imm); if oper != 7 { ws_setr16(m, rm, r); } }
+            if mod != 3 { let ea: Int = ws_modrm_ea(m, modrm, ws_ds(m)); let r: Int = ws_alu16(m, oper, ws_read16(m, ea), imm); if oper != 7 { ws_write16(m, ea, r); } }
+        }
+        if op != 129 {
+            var imm8: Int = ws_fetch8(m);
+            if op == 131 {
+                if imm8 >= 128 { var im16: Int = imm8 - 256;
+                    if mod == 3 { let r: Int = ws_alu16(m, oper, ws_r16(m, rm), im16); if oper != 7 { ws_setr16(m, rm, r); } }
+                    if mod != 3 { let ea: Int = ws_modrm_ea(m, modrm, ws_ds(m)); let r: Int = ws_alu16(m, oper, ws_read16(m, ea), im16); if oper != 7 { ws_write16(m, ea, r); } }
+                }
+                if imm8 < 128 {
+                    if mod == 3 { let r: Int = ws_alu16(m, oper, ws_r16(m, rm), imm8); if oper != 7 { ws_setr16(m, rm, r); } }
+                    if mod != 3 { let ea: Int = ws_modrm_ea(m, modrm, ws_ds(m)); let r: Int = ws_alu16(m, oper, ws_read16(m, ea), imm8); if oper != 7 { ws_write16(m, ea, r); } }
+                }
+            }
+            if op == 128 {
+                if mod == 3 { let r: Int = ws_alu8(m, oper, ws_r8(m, rm), imm8); if oper != 7 { ws_setr8(m, rm, r); } }
+                if mod != 3 { let ea: Int = ws_modrm_ea(m, modrm, ws_ds(m)); let r: Int = ws_alu8(m, oper, ws_read8(m, ea), imm8); if oper != 7 { ws_write8(m, ea, r); } }
+            }
+        }
+        return 1;
+    }
+
+    // $88-$8E: MOV group
+    if op == 136 {   // MOV r/m8, r8
+        let modrm: Int = ws_fetch8(m); let reg: Int = (modrm / 8) and 7; let mod: Int = modrm / 64; let rm: Int = modrm and 7;
+        if mod == 3 { ws_setr8(m, rm, ws_r8(m, reg)); }
+        if mod != 3 { ws_write8(m, ws_modrm_ea(m, modrm, ws_ds(m)), ws_r8(m, reg)); }
+        return 1;
+    }
+    if op == 137 {   // MOV r/m16, r16
+        let modrm: Int = ws_fetch8(m); let reg: Int = (modrm / 8) and 7; let mod: Int = modrm / 64; let rm: Int = modrm and 7;
+        if mod == 3 { ws_setr16(m, rm, ws_r16(m, reg)); }
+        if mod != 3 { ws_write16(m, ws_modrm_ea(m, modrm, ws_ds(m)), ws_r16(m, reg)); }
+        return 1;
+    }
+    if op == 138 {   // MOV r8, r/m8
+        let modrm: Int = ws_fetch8(m); let reg: Int = (modrm / 8) and 7; let mod: Int = modrm / 64; let rm: Int = modrm and 7;
+        if mod == 3 { ws_setr8(m, reg, ws_r8(m, rm)); }
+        if mod != 3 { ws_setr8(m, reg, ws_read8(m, ws_modrm_ea(m, modrm, ws_ds(m)))); }
+        return 1;
+    }
+    if op == 139 {   // MOV r16, r/m16
+        let modrm: Int = ws_fetch8(m); let reg: Int = (modrm / 8) and 7; let mod: Int = modrm / 64; let rm: Int = modrm and 7;
+        if mod == 3 { ws_setr16(m, reg, ws_r16(m, rm)); }
+        if mod != 3 { ws_setr16(m, reg, ws_read16(m, ws_modrm_ea(m, modrm, ws_ds(m)))); }
+        return 1;
+    }
+    if op == 141 {   // LEA r16, r/m
+        let modrm: Int = ws_fetch8(m); let reg: Int = (modrm / 8) and 7;
+        let ea: Int = ws_modrm_ea(m, modrm, ws_ds(m));
+        ws_setr16(m, reg, ea and 65535);   // offset part only
+        return 1;
+    }
+
+    // $90: NOP
+    if op == 144 { return 1; }
+
+    // $A0/$A1: MOV AL/AX, [imm16]  $A2/$A3: MOV [imm16], AL/AX
+    if op == 160 { let a: Int = ws_fetch16(m); ws_setr8(m, 0, ws_read8(m, ws_phys(ws_ds(m), a))); return 1; }
+    if op == 161 { let a: Int = ws_fetch16(m); ws_setr16(m, 0, ws_read16(m, ws_phys(ws_ds(m), a))); return 1; }
+    if op == 162 { let a: Int = ws_fetch16(m); ws_write8(m, ws_phys(ws_ds(m), a), ws_r8(m, 0)); return 1; }
+    if op == 163 { let a: Int = ws_fetch16(m); ws_write16(m, ws_phys(ws_ds(m), a), ws_r16(m, 0)); return 1; }
+
+    // $B0-$BF: MOV r8/r16, imm
+    if op >= 176 { if op < 184 { ws_setr8(m, op - 176, ws_fetch8(m)); return 1; } }
+    if op >= 184 { if op < 192 { ws_setr16(m, op - 184, ws_fetch16(m)); return 1; } }
+
+    // $C3: RET near  $C2: RET near imm16
+    if op == 195 { ws_set_ip(m, ws_pop16(m)); return 1; }
+    if op == 194 { let n: Int = ws_fetch16(m); ws_set_ip(m, ws_pop16(m)); ws_setr16(m, 4, (ws_r16(m, 4) + n) and 65535); return 1; }
+
+    // $E8: CALL near  $E9: JMP near  $EB: JMP short
+    if op == 232 { let off: Int = ws_fetch16s(m); ws_push16(m, ws_ip(m)); ws_set_ip(m, (ws_ip(m) + off) and 65535); return 1; }
+    if op == 233 { let off: Int = ws_fetch16s(m); ws_set_ip(m, (ws_ip(m) + off) and 65535); return 1; }
+    if op == 235 { let off: Int = ws_fetch8s(m); ws_set_ip(m, (ws_ip(m) + off) and 65535); return 1; }
+
+    // $F4: HLT
+    if op == 244 { ws_set_halt(m, 1); return 0; }
+
+    // Main opcode groups $00-$3D: ALU operations
+    // Pattern: op/8=alu-op, op%8: 0=r/m8,r8  1=r/m16,r16  2=r8,r/m8  3=r16,r/m16  4=AL,imm8  5=AX,imm16
+    if op < 64 {
+        let oper: Int = op / 8;
+        let kind: Int = op % 8;
+        if kind == 5 {   // AX, imm16
+            let imm: Int = ws_fetch16(m);
+            let r: Int = ws_alu16(m, oper, ws_r16(m, 0), imm);
+            if oper != 7 { ws_setr16(m, 0, r); }
+            return 1;
+        }
+        if kind == 4 {   // AL, imm8
+            let imm: Int = ws_fetch8(m);
+            let r: Int = ws_alu8(m, oper, ws_r8(m, 0), imm);
+            if oper != 7 { ws_setr8(m, 0, r); }
+            return 1;
+        }
+        let modrm: Int = ws_fetch8(m);
+        let reg: Int = (modrm / 8) and 7; let mod: Int = modrm / 64; let rm: Int = modrm and 7;
+        if kind == 1 {   // r/m16, r16
+            if mod == 3 { let r: Int = ws_alu16(m, oper, ws_r16(m, rm), ws_r16(m, reg)); if oper != 7 { ws_setr16(m, rm, r); } }
+            if mod != 3 { let ea: Int = ws_modrm_ea(m, modrm, ws_ds(m)); let r: Int = ws_alu16(m, oper, ws_read16(m, ea), ws_r16(m, reg)); if oper != 7 { ws_write16(m, ea, r); } }
+            return 1;
+        }
+        if kind == 3 {   // r16, r/m16
+            if mod == 3 { let r: Int = ws_alu16(m, oper, ws_r16(m, reg), ws_r16(m, rm)); if oper != 7 { ws_setr16(m, reg, r); } }
+            if mod != 3 { let ea: Int = ws_modrm_ea(m, modrm, ws_ds(m)); let r: Int = ws_alu16(m, oper, ws_r16(m, reg), ws_read16(m, ea)); if oper != 7 { ws_setr16(m, reg, r); } }
+            return 1;
+        }
+        if kind == 0 {   // r/m8, r8
+            if mod == 3 { let r: Int = ws_alu8(m, oper, ws_r8(m, rm), ws_r8(m, reg)); if oper != 7 { ws_setr8(m, rm, r); } }
+            if mod != 3 { let ea: Int = ws_modrm_ea(m, modrm, ws_ds(m)); let r: Int = ws_alu8(m, oper, ws_read8(m, ea), ws_r8(m, reg)); if oper != 7 { ws_write8(m, ea, r); } }
+            return 1;
+        }
+        if kind == 2 {   // r8, r/m8
+            if mod == 3 { let r: Int = ws_alu8(m, oper, ws_r8(m, reg), ws_r8(m, rm)); if oper != 7 { ws_setr8(m, reg, r); } }
+            if mod != 3 { let ea: Int = ws_modrm_ea(m, modrm, ws_ds(m)); let r: Int = ws_alu8(m, oper, ws_r8(m, reg), ws_read8(m, ea)); if oper != 7 { ws_setr8(m, reg, r); } }
+            return 1;
+        }
+    }
+    // Unknown opcode: NOP stub
+    return 1;
+}
+
+// BG tile render: WonderSwan screen base register at ws_mem+port-shadow.
+// For first increment: render from VRAM at port $02 (BG0 map base = tile map).
+// Tile map: 32×32 entries × 2 bytes at SCR1_BASE*2048 in VRAM.
+// core_id/ws_tile_color/ws_render_row/ws_render (the mono 2bpp renderer) split into
+// cores/ws_video.sg — cores/wsc.sg supplies its own complete 4bpp color versions of
+// all four (sigil-Retropie#13; cc0 has no first-def-wins). core_run_frame below calls
+// ws_render(m) and resolves to whichever variant is linked, exactly like
+// cores/segacd.sg reusing cores/genesis.sg's other code while overriding core_fb.
+// Link cores/ws_video.sg for standalone WS only.
+fn core_fb(m: Int) -> Int { return ws_fb(m); }
+fn core_fb_w() -> Int { return 224; }
+fn core_fb_h() -> Int { return 144; }
+
+fn core_load(m: Int, blob: Int, len: Int) -> Int ! {mem} {
+    // Clear 1MB memory
+    var i: Int = 0;
+    while i < 1048576 invariant i >= 0 { poke8(ws_mem(m), i, 0); i = i + 1; }
+    // Load cart ROM to top of 1MB space
+    var n: Int = len; if n > 1048576 { n = 1048576; }
+    let dest: Int = 1048576 - n;
+    var j: Int = 0;
+    while j < n invariant j >= 0 { poke8(ws_mem(m), dest + j, peek8(blob, j)); j = j + 1; }
+    // Clear CPU state
+    var k: Int = 0;
+    while k < 128 invariant k >= 0 { poke8(ws_st(m), k, 0); k = k + 1; }
+    // Reset: CS=$FFFF, IP=$0000 (physical = $FFFF0)
+    ws_set_cs(m, 65535);
+    ws_set_ip(m, 0);
+    // SS = $0000, SP = $2000 (8KB RAM stack area)
+    ws_set_ss(m, 0);
+    ws_setr16(m, 4, 8192);
+    // DS = $0000
+    ws_set_ds(m, 0);
+    return 0;
+}
+
+fn core_set_input_port(port: Int, buttons: Int) -> Int {
+    if port == 0 { core_set_input(buttons); return 0; }
+    return 0;
+}
+
+fn core_set_input(buttons: Int) -> Int { return 0; }
+
+fn core_run_frame(m: Int) -> Int ! {mem} {
+    // ~3072000 / 60 ≈ 51200 cycles/frame; simplify to 5120 for first increment
+    var c: Int = 0;
+    while c < 5120 invariant c >= 0 { ws_step(m); c = c + 1; }
+    ws_render(m);
+    return 0;
+}
+fn core_savestate(m: Int, dst: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 131072 invariant i >= 0 { poke8(dst, i, peek8(ws_mem(m), i)); i = i + 1; }
+    var j: Int = 0;
+    while j < 128 invariant j >= 0 { poke8(dst, 131072 + j, peek8(ws_st(m), j)); j = j + 1; }
+    return 0;
+}
+fn core_loadstate(m: Int, src: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 131072 invariant i >= 0 { poke8(ws_mem(m), i, peek8(src, i)); i = i + 1; }
+    var j: Int = 0;
+    while j < 128 invariant j >= 0 { poke8(ws_st(m), j, peek8(src, 131072 + j)); j = j + 1; }
+    return 0;
+}
+fn core_savestate_size() -> Int { return 131200; }

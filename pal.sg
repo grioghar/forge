@@ -1,0 +1,60 @@
+// forge/pal.sg — Portable Abstraction Layer for the Forge gaming runtime.
+//
+// The Forge core calls pal_* functions everywhere instead of sigil-os syscalls
+// directly. This default backend maps every pal_* to the current sigil-os ABI
+// so existing EL0 apps are zero-behavior-change.
+//
+// Per-platform backends (pal_macos.sg, pal_linux.sg, pal_windows.sg) override
+// these by being linked FIRST (cc0 first-def-wins). Link order:
+//   forge/pal_{macos,linux,windows}.sg  →  forge/pal.sg  →  cores/*  →  el0/*
+//
+// Groups:
+//   FS       — file resolve + read
+//   Display  — framebuffer base/pitch/size + present
+//   Input    — pad state (bit-field: D-pad, face buttons, shoulder, start/select)
+//   Audio    — open/submit/volume/close ring at 0x700000 + slot*0x10000
+//   Window   — event-pump yield + quit signal (no-op on sigil-os)
+//   Memory   — mmap fixed-address regions for hosted emulator cores
+
+// --- FS ---
+fn pal_fs_resolve(s: Sys, path: Int, out: Int) -> Int ! {sys} { return sys3(26, path, out, 0); }
+fn pal_fs_read(s: Sys, fd: Int, buf: Int, size: Int) -> Int ! {sys} { return sys3(18, fd, buf, size); }
+
+// --- Display ---
+fn pal_fb_base(s: Sys) -> Int ! {sys} { return sys3(32, 0, 0, 0); }
+fn pal_fb_pitch(s: Sys) -> Int ! {sys} { return sys3(33, 0, 0, 0); }
+fn pal_fb_width(s: Sys) -> Int ! {sys} { return sys3(34, 0, 0, 0); }
+fn pal_fb_height(s: Sys) -> Int ! {sys} { return sys3(35, 0, 0, 0); }
+fn pal_present(s: Sys) -> Int ! {sys} { return sys3(37, 0, 0, 0); }
+
+// --- Input ---
+// Bit layout (matches sigil-os sys3(44)): bits 0-3 = DURL, 4-7 = ABXY,
+// 8-9 = L/R shoulder, 10-11 = start/select.
+fn pal_input_state(s: Sys, pad: Int) -> Int ! {sys} { return sys3(44, pad, 0, 0); }
+
+// --- Audio ---
+fn pal_aud_open(s: Sys, rate: Int, channels: Int, frames: Int) -> Int ! {sys} { return sys3(80, rate, channels, frames); }
+fn pal_aud_submit(s: Sys, buf: Int, frames: Int) -> Int ! {sys} { return sys3(81, buf, frames, 0); }
+fn pal_aud_volume(s: Sys, vol: Int) -> Int ! {sys} { return sys3(82, vol, 0, 0); }
+fn pal_aud_close(s: Sys) -> Int ! {sys} { return sys3(83, 0, 0, 0); }
+
+// --- Window ---
+// On sigil-os the OS drives the event loop; Forge just calls present() per frame.
+fn pal_frame_yield() -> Int { return 0; }
+fn pal_should_quit() -> Int { return 0; }
+
+// --- Memory ---
+// On sigil-os EL0 all bare-metal addresses are pre-mapped; this is a no-op.
+// Hosted backends (Mac/Linux) must mmap [base, base+size) MAP_FIXED so the
+// same fixed peek/poke calls work without refactoring the emulator cores.
+// Gated on cc0 shipping an mmap host syscall (tracked in cc0#mmap).
+fn pal_mem_map(base: Int, size: Int) -> Int { return 0; }
+
+// --- Launch ---
+// Ask sigil-os to load and exec EL0 app by index. Writes to shared result slot
+// (0x3B000000) then calls sys3(45, app_id) — the OS completes the handoff.
+// Native platform stubs return 0 (no-op; caller also returns id+1 from app()).
+fn pal_launch(s: Sys, app_id: Int) -> Int ! {sys} { return sys3(45, app_id, 0, 0); }
+
+// --- Host ID ---
+fn pal_host() -> Int { return 0; }   // 0=sigil-os, 1=macOS, 2=Linux, 3=Windows

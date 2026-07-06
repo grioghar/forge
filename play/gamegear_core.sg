@@ -1,0 +1,30 @@
+// gamegear.sg — Sega Game Gear: the SMS in a handheld. The Game Gear IS the Master System hardware
+// (Z80 + the SMS VDP + SN76489) with two differences the SMS core already handles: 12-bit CRAM
+// (sms_set_gg(1) -> sms_color decodes BGR444) and a smaller 160x144 LCD that shows the CENTER window
+// of the VDP's 256x192 output. So the Game Gear reuses the ENTIRE SMS stack (cores/sms.sg +
+// cores/sms_vdp.sg + cores/z80.sg) — this file only adds the GG mode enable + the 160x144 window
+// crop into a contiguous framebuffer the shared el0/blit.sg can consume. Leverage-first: a whole
+// system for ~one screen of code. (The GG EL0 app calls gg_on() after core_load, then gg_crop().)
+//
+// The LCD window: columns 48..207, rows 24..167 of the 256x192 VDP framebuffer (centered).
+fn gg_fb(m: Int) -> Int { return m + 1179648; }         // base+1179648: 160x144 ARGB (92160 B)
+fn gg_fb_w() -> Int { return 160; }
+fn gg_fb_h() -> Int { return 144; }
+fn gg_x0() -> Int { return 48; }            // (256-160)/2
+fn gg_y0() -> Int { return 24; }            // (192-144)/2
+// enable Game Gear mode on the SMS VDP (12-bit CRAM decode).
+fn gg_on(m: Int) -> Int ! {mem} { return sms_set_gg(m, 1); }
+// copy the centered 160x144 LCD window from the SMS framebuffer (256-stride) into the contiguous
+// Game Gear framebuffer (160-stride) for the shared blit.
+fn gg_crop(m: Int) -> Int ! {mem} {
+    var y: Int = 0;
+    while y < 144 invariant y >= 0 {
+        var x: Int = 0;
+        while x < 160 invariant x >= 0 {
+            poke32(gg_fb(m), (y * 160 + x) * 4, peek32(sms_fb(m), ((y + 24) * 256 + (x + 48)) * 4));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}

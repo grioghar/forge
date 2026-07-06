@@ -1,0 +1,371 @@
+// cores/gba.sg — Game Boy Advance (system #35): ARM7TDMI CPU + PPU.
+// ARM7TDMI register file + ARM32 data-processing (MOV/ADD/SUB/AND/ORR/EOR/BIC/MVN/CMP/CMN/TST +
+// B/BL branch, immediate and register operands, all 16 condition codes). Second increment: the
+// **PPU Mode 3 bitmap display** (240×160, 15bpp BGR555 direct-colour — the simplest GBA video
+// mode, used by many homebrew programs; DISPCNT $04000000 bits[2:0]=3 selects it; each pixel in
+// VRAM is a 16-bit LE BGR555 value decoded by gba_15argb to ARGB). LDR/STR + Thumb follow.
+// Memory bus: EWRAM (256KB) + IWRAM (32KB) + VRAM (96KB) + I/O ($04000000) + PAL ($05000000).
+// Regions in a clean high block above MSX2 (0x11300000). Prefix gba_ / decimal only.
+
+fn gba_ewram(m: Int) -> Int { return m + 0; }             // base+0: 256KB EWRAM
+fn gba_iwram(m: Int) -> Int { return m + 262144; }        // base+262144: 32KB IWRAM
+fn gba_st(m: Int) -> Int { return m + 327680; }           // base+327680: CPU state
+fn gba_io(m: Int) -> Int { return m + 393216; }           // base+393216: I/O registers (1KB)
+fn gba_pal(m: Int) -> Int { return m + 397312; }          // base+397312: palette RAM (1KB)
+fn gba_vram(m: Int) -> Int { return m + 401408; }         // base+401408: VRAM (96KB)
+fn gba_oam(m: Int) -> Int { return m + 499712; }          // base+499712: OAM (1KB)
+fn gba_fb(m: Int) -> Int { return m + 503808; }           // base+503808: 240x160 ARGB framebuffer
+
+// helpers
+fn gba_p2(n: Int) -> Int {
+    var p: Int = 1; var i: Int = 0;
+    while i < (n and 31) invariant i >= 0 { p = p * 2; i = i + 1; }
+    return p;
+}
+fn gba_mask32(v: Int) -> Int { return v and 4294967295; }  // keep low 32 bits
+
+// --- register file: r0-r15 (r13=SP, r14=LR, r15=PC), CPSR ---
+fn gba_r(m: Int, n: Int) -> Int ! {mem} { return peek32(gba_st(m), (n and 15) * 4); }
+fn gba_setr(m: Int, n: Int, v: Int) -> Int ! {mem} { poke32(gba_st(m), (n and 15) * 4, gba_mask32(v)); return 0; }
+fn gba_pc(m: Int) -> Int ! {mem} { return gba_r(m, 15); }
+fn gba_setpc(m: Int, v: Int) -> Int ! {mem} { return gba_setr(m, 15, v); }
+fn gba_cpsr(m: Int) -> Int ! {mem} { return peek32(gba_st(m), 64); }
+fn gba_setcpsr(m: Int, v: Int) -> Int ! {mem} { poke32(gba_st(m), 64, gba_mask32(v)); return 0; }
+// CPSR flags: N=bit31, Z=bit30, C=bit29, V=bit28
+fn gba_flag_n(m: Int) -> Int ! {mem} { return (gba_cpsr(m) / 2147483648) and 1; }
+fn gba_flag_z(m: Int) -> Int ! {mem} { return (gba_cpsr(m) / 1073741824) and 1; }
+fn gba_flag_c(m: Int) -> Int ! {mem} { return (gba_cpsr(m) / 536870912) and 1; }
+fn gba_flag_v(m: Int) -> Int ! {mem} { return (gba_cpsr(m) / 268435456) and 1; }
+fn gba_setflags(m: Int, n: Int, z: Int, c: Int, v: Int) -> Int ! {mem} {
+    var f: Int = gba_cpsr(m) and 268435455;
+    if n != 0 { f = f or 2147483648; }
+    if z != 0 { f = f or 1073741824; }
+    if c != 0 { f = f or 536870912; }
+    if v != 0 { f = f or 268435456; }
+    return gba_setcpsr(m, f);
+}
+
+// --- ROM buffer (8MB cap) ---
+fn gba_rom(m: Int) -> Int { return m + 1048576; }        // base+1048576: 8MB ROM
+
+// --- memory bus (word, halfword, byte) covering all major regions ---
+fn gba_bus_r8(m: Int, addr: Int) -> Int ! {mem} {
+    let a: Int = gba_mask32(addr);
+    if a / 16777216 == 2 { return peek8(gba_ewram(m), a and 262143); }
+    if a / 8388608 == 6 { return peek8(gba_iwram(m), a and 32767); }
+    if a / 16777216 == 4 { return peek8(gba_io(m), a and 1023); }
+    if a / 16777216 == 5 { return peek8(gba_pal(m), a and 1023); }
+    if a / 16777216 == 6 { return peek8(gba_vram(m), a and 98303); }
+    if a / 16777216 == 7 { return peek8(gba_oam(m), a and 1023); }
+    if a / 134217728 == 1 { return peek8(gba_rom(m), a and 8388607); }  // $08000000-$08FFFFFF
+    return 255;
+}
+fn gba_bus_w8(m: Int, addr: Int, v: Int) -> Int ! {mem} {
+    let a: Int = gba_mask32(addr);
+    if a / 16777216 == 2 { poke8(gba_ewram(m), a and 262143, v and 255); return 0; }
+    if a / 8388608 == 6 { poke8(gba_iwram(m), a and 32767, v and 255); return 0; }
+    if a / 16777216 == 4 { poke8(gba_io(m), a and 1023, v and 255); return 0; }
+    if a / 16777216 == 5 { poke8(gba_pal(m), a and 1023, v and 255); return 0; }
+    if a / 16777216 == 6 { poke8(gba_vram(m), a and 98303, v and 255); return 0; }
+    if a / 16777216 == 7 { poke8(gba_oam(m), a and 1023, v and 255); return 0; }
+    return 0;
+}
+fn gba_bus_r32(m: Int, addr: Int) -> Int ! {mem} {
+    let a: Int = gba_mask32(addr) and 4294967292;
+    if a / 16777216 == 2 { return peek32(gba_ewram(m), a and 262140); }
+    if a / 8388608 == 6 { return peek32(gba_iwram(m), a and 32764); }
+    if a / 16777216 == 4 { return gba_io_r16(m, a and 1022) + gba_io_r16(m, (a and 1022) + 2) * 65536; }
+    if a / 16777216 == 5 { return gba_pal_r16(m, a and 1022) + gba_pal_r16(m, (a and 1022) + 2) * 65536; }
+    if a / 16777216 == 6 { return gba_vram_r16(m, a and 98302) + gba_vram_r16(m, (a and 98302) + 2) * 65536; }
+    if a / 134217728 == 1 {    // ROM: byte-granular read so core_load (poke8 loop) and fetch agree
+        let off: Int = a and 8388604;
+        return peek8(gba_rom(m), off) + peek8(gba_rom(m), off + 1) * 256 + peek8(gba_rom(m), off + 2) * 65536 + peek8(gba_rom(m), off + 3) * 16777216;
+    }
+    return 0;
+}
+fn gba_bus_w32(m: Int, addr: Int, v: Int) -> Int ! {mem} {
+    let a: Int = gba_mask32(addr) and 4294967292;
+    if a / 16777216 == 2 { poke32(gba_ewram(m), a and 262140, v); return 0; }
+    if a / 8388608 == 6 { poke32(gba_iwram(m), a and 32764, v); return 0; }
+    if a / 16777216 == 4 { gba_io_w16(m, a and 1022, v and 65535); gba_io_w16(m, (a and 1022) + 2, v / 65536); return 0; }
+    if a / 16777216 == 5 { gba_pal_w16(m, a and 1022, v and 65535); return 0; }
+    if a / 16777216 == 6 { gba_vram_w16(m, a and 98302, v and 65535); gba_vram_w16(m, (a and 98302) + 2, v / 65536); return 0; }
+    return 0;
+}
+fn gba_fetch(m: Int) -> Int ! {mem} {
+    let pc: Int = gba_pc(m);
+    let instr: Int = gba_bus_r32(m, pc);
+    gba_setpc(m, pc + 4);
+    return instr;
+}
+
+// --- condition check (bits [31:28]) ---
+fn gba_cond_ok(m: Int, instr: Int) -> Int ! {mem} {
+    let c: Int = instr / 268435456;
+    if c == 14 { return 1; }                                              // AL
+    if c == 15 { return 1; }                                              // NV (always in ARMv4)
+    if c == 0  { return gba_flag_z(m); }                                   // EQ
+    if c == 1  { if gba_flag_z(m) == 0 { return 1; } return 0; }          // NE
+    if c == 2  { return gba_flag_c(m); }                                   // CS/HS
+    if c == 3  { if gba_flag_c(m) == 0 { return 1; } return 0; }          // CC/LO
+    if c == 4  { return gba_flag_n(m); }                                   // MI
+    if c == 5  { if gba_flag_n(m) == 0 { return 1; } return 0; }          // PL
+    if c == 6  { return gba_flag_v(m); }                                   // VS
+    if c == 7  { if gba_flag_v(m) == 0 { return 1; } return 0; }          // VC
+    if c == 8  { if gba_flag_c(m) == 1 { if gba_flag_z(m) == 0 { return 1; } } return 0; }  // HI
+    if c == 9  { if (gba_flag_c(m) == 0) or (gba_flag_z(m) == 1) { return 1; } return 0; }  // LS
+    if c == 10 { if gba_flag_n(m) == gba_flag_v(m) { return 1; } return 0; }  // GE
+    if c == 11 { if gba_flag_n(m) != gba_flag_v(m) { return 1; } return 0; }  // LT
+    if c == 12 { if gba_flag_z(m) == 0 { if gba_flag_n(m) == gba_flag_v(m) { return 1; } } return 0; }  // GT
+    if c == 13 { if (gba_flag_z(m) == 1) or (gba_flag_n(m) != gba_flag_v(m)) { return 1; } return 0; }  // LE
+    return 0;
+}
+
+// --- operand2 decode ---
+// ROR(v, rot): rotate right 32-bit value v by rot bits
+fn gba_ror32(v: Int, rot: Int) -> Int {
+    let r: Int = rot and 31;
+    if r == 0 { return gba_mask32(v); }
+    return gba_mask32((gba_mask32(v) / gba_p2(r)) or (gba_mask32(v) * gba_p2(32 - r)));
+}
+// immediate operand2: ROR(imm8, rotate*2)
+fn gba_op2_imm(instr: Int) -> Int {
+    let rot: Int = (instr / 256) and 15;
+    let imm: Int = instr and 255;
+    return gba_ror32(imm, rot * 2);
+}
+// LSL by immediate amount (bits [11:7] shift, bits [6:5]=00 type, bits [3:0] Rm)
+fn gba_lsl(v: Int, n: Int) -> Int {
+    let s: Int = n and 31;
+    if s == 0 { return gba_mask32(v); }
+    return gba_mask32(gba_mask32(v) * gba_p2(s));
+}
+// LSR by immediate amount
+fn gba_lsr(v: Int, n: Int) -> Int {
+    let s: Int = n and 31;
+    if s == 0 { return 0; }     // LSR #0 encodes LSR #32 (result 0)
+    return gba_mask32(v) / gba_p2(s);
+}
+// register operand2: Rm with LSL/LSR/ASR/ROR shift by immediate
+fn gba_op2_reg(m: Int, instr: Int) -> Int ! {mem} {
+    let rm: Int = instr and 15;
+    let shift_imm: Int = (instr / 128) and 31;   // bits [11:7]
+    let shift_type: Int = (instr / 32) and 3;     // bits [6:5]
+    let v: Int = gba_r(m, rm);
+    if shift_type == 0 { return gba_lsl(v, shift_imm); }   // LSL
+    if shift_type == 1 { return gba_lsr(v, shift_imm); }   // LSR
+    return gba_mask32(v);  // ASR/ROR stubs (additive)
+}
+
+// --- data-processing execute ---
+fn gba_exec_dp(m: Int, instr: Int) -> Int ! {mem} {
+    let I: Int = (instr / 33554432) and 1;        // bit [25]
+    let opc: Int = (instr / 2097152) and 15;      // bits [24:21]
+    let S: Int = (instr / 1048576) and 1;          // bit [20]
+    let rn: Int = (instr / 65536) and 15;         // bits [19:16]
+    let rd: Int = (instr / 4096) and 15;          // bits [15:12]
+    var op2: Int = 0;
+    if I == 1 { op2 = gba_op2_imm(instr); }
+    if I != 1 { op2 = gba_op2_reg(m, instr); }
+    let a: Int = gba_r(m, rn);
+    var res: Int = 0; var write: Int = 1;
+    if opc == 0  { res = gba_mask32(a and op2); }                      // AND
+    if opc == 1  { res = gba_mask32((a or op2) - (a and op2)); }       // EOR (XOR)
+    if opc == 2  { res = gba_mask32(a - op2); }                        // SUB
+    if opc == 3  { res = gba_mask32(op2 - a); }                        // RSB
+    if opc == 4  { res = gba_mask32(a + op2); }                        // ADD
+    if opc == 8  { res = gba_mask32(a and op2); write = 0; }           // TST (no write)
+    if opc == 10 { res = gba_mask32(a - op2); write = 0; }             // CMP (no write)
+    if opc == 11 { res = gba_mask32(a + op2); write = 0; }             // CMN (no write)
+    if opc == 12 { res = gba_mask32(a or op2); }                       // ORR
+    if opc == 13 { res = gba_mask32(op2); }                            // MOV
+    if opc == 14 { res = gba_mask32(a and (4294967295 - op2)); }       // BIC (AND NOT)
+    if opc == 15 { res = gba_mask32(4294967295 - op2); }               // MVN (NOT)
+    if S == 1 {
+        var fz: Int = 0; if res == 0 { fz = 1; }
+        gba_setflags(m, res / 2147483648, fz, 0, 0);
+    }
+    if write == 1 { gba_setr(m, rd, res); }
+    return 0;
+}
+
+// --- branch ---
+fn gba_exec_b(m: Int, instr: Int) -> Int ! {mem} {
+    let link: Int = (instr / 16777216) and 1;      // bit [24]: L flag (BL saves return addr)
+    var off24: Int = instr and 16777215;            // bits [23:0] unsigned
+    if off24 / 8388608 == 1 { off24 = off24 - 16777216; }  // sign-extend bit 23
+    // ARM-visible PC = instr_addr + 8. gba_pc(m) at exec time = instr_addr + 4. target += +4.
+    let target: Int = gba_mask32(gba_pc(m) + 4 + off24 * 4);
+    if link == 1 { gba_setr(m, 14, gba_mask32(gba_pc(m))); }    // LR = next instr (= current gba_pc(m))
+    gba_setpc(m, target);
+    return 0;
+}
+
+// --- LDR/STR (single-register load/store, bits[27:26]=01) ---
+fn gba_exec_ldstr(m: Int, instr: Int) -> Int ! {mem} {
+    let I: Int = (instr / 33554432) and 1;      // bit 25: 0=immediate offset, 1=register
+    let P: Int = (instr / 16777216) and 1;      // bit 24: 1=pre-index
+    let U: Int = (instr / 8388608) and 1;       // bit 23: 1=add offset
+    let B: Int = (instr / 4194304) and 1;       // bit 22: 1=byte
+    let L: Int = (instr / 1048576) and 1;       // bit 20: 1=load
+    let rn: Int = (instr / 65536) and 15;
+    let rd: Int = (instr / 4096) and 15;
+    var offset: Int = 0;
+    if I == 0 { offset = instr and 4095; }
+    if I != 0 { offset = gba_op2_reg(m, instr); }
+    let base: Int = gba_r(m, rn);
+    var ea: Int = 0;
+    if P == 1 {
+        if U == 1 { ea = gba_mask32(base + offset); }
+        if U != 1 { ea = gba_mask32(base - offset); }
+    }
+    if P != 1 { ea = base; }
+    if L == 1 {
+        var v: Int = 0;
+        if B == 1 { v = gba_bus_r8(m, ea); }
+        if B != 1 { v = gba_bus_r32(m, ea); }
+        gba_setr(m, rd, v);
+    }
+    if L != 1 {
+        let sv: Int = gba_r(m, rd);
+        if B == 1 { gba_bus_w8(m, ea, sv and 255); }
+        if B != 1 { gba_bus_w32(m, ea, sv); }
+    }
+    return 0;
+}
+
+// --- single instruction step ---
+fn gba_step(m: Int) -> Int ! {mem} {
+    let instr: Int = gba_fetch(m);
+    if gba_cond_ok(m, instr) == 0 { return 0; }
+    let cls: Int = (instr / 67108864) and 3;    // bits [27:26]
+    if cls == 0 { return gba_exec_dp(m, instr); }
+    if cls == 1 { return gba_exec_ldstr(m, instr); }
+    if cls == 2 {
+        if (instr / 16777216) and 14 == 10 { return gba_exec_b(m, instr); }
+    }
+    return 0;
+}
+
+// --- reset: set PC to addr, clear r0-r14 and CPSR ---
+fn gba_reset(m: Int, addr: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 15 invariant i >= 0 { gba_setr(m, i, 0); i = i + 1; }
+    gba_setpc(m, addr);
+    gba_setcpsr(m, 0);
+    return 0;
+}
+
+// --- bus extension: VRAM + PAL + I/O (byte + halfword) ---
+fn gba_vram_r16(m: Int, off: Int) -> Int ! {mem} {
+    let o: Int = off and 98302;    // 96KB mask (0x17FFE), halfword-aligned
+    return peek8(gba_vram(m), o) + peek8(gba_vram(m), o + 1) * 256;
+}
+fn gba_vram_w16(m: Int, off: Int, v: Int) -> Int ! {mem} {
+    let o: Int = off and 98302;
+    poke8(gba_vram(m), o, v and 255); poke8(gba_vram(m), o + 1, (v / 256) and 255);
+    return 0;
+}
+fn gba_pal_r16(m: Int, off: Int) -> Int ! {mem} {
+    let o: Int = off and 510;      // 512B BG palette (entries 0-255 of 1KB), halfword-aligned
+    return peek8(gba_pal(m), o) + peek8(gba_pal(m), o + 1) * 256;
+}
+fn gba_pal_w16(m: Int, off: Int, v: Int) -> Int ! {mem} {
+    let o: Int = off and 510;
+    poke8(gba_pal(m), o, v and 255); poke8(gba_pal(m), o + 1, (v / 256) and 255);
+    return 0;
+}
+fn gba_io_r16(m: Int, off: Int) -> Int ! {mem} {
+    let o: Int = off and 1022;
+    return peek8(gba_io(m), o) + peek8(gba_io(m), o + 1) * 256;
+}
+fn gba_io_w16(m: Int, off: Int, v: Int) -> Int ! {mem} {
+    let o: Int = off and 1022;
+    poke8(gba_io(m), o, v and 255); poke8(gba_io(m), o + 1, (v / 256) and 255);
+    return 0;
+}
+// DISPCNT ($04000000): bits [2:0] = video mode
+fn gba_dispcnt(m: Int) -> Int ! {mem} { return gba_io_r16(m, 0); }
+fn gba_set_dispcnt(m: Int, v: Int) -> Int ! {mem} { return gba_io_w16(m, 0, v); }
+
+// --- PPU: Mode 3 bitmap display (240×160, BGR555 direct-colour) ---
+// BGR555: bits[4:0]=R, [9:5]=G, [14:10]=B (same format as PSX). Scale 5-bit → 8-bit: ch*8.
+fn gba_15argb(c: Int) -> Int {
+    return (c and 31) * 8 + ((c / 32) and 31) * 8 * 256 + ((c / 1024) and 31) * 8 * 65536 + 4278190080;
+}
+fn gba_display_mode3(m: Int) -> Int ! {mem} {
+    var y: Int = 0;
+    while y < 160 invariant y >= 0 {
+        var x: Int = 0;
+        while x < 240 invariant x >= 0 {
+            let c: Int = gba_vram_r16(m, y * 480 + x * 2);
+            poke32(gba_fb(m), (y * 240 + x) * 4, gba_15argb(c));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+// Mode 4: 240×160 8bpp palette-indexed
+fn gba_display_mode4(m: Int) -> Int ! {mem} {
+    var y: Int = 0;
+    while y < 160 invariant y >= 0 {
+        var x: Int = 0;
+        while x < 240 invariant x >= 0 {
+            let idx: Int = peek8(gba_vram(m), y * 240 + x) and 255;
+            let c: Int = gba_pal_r16(m, idx * 2);
+            poke32(gba_fb(m), (y * 240 + x) * 4, gba_15argb(c));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+fn gba_display(m: Int) -> Int ! {mem} {
+    let mode: Int = gba_dispcnt(m) and 7;
+    if mode == 3 { return gba_display_mode3(m); }
+    if mode == 4 { return gba_display_mode4(m); }
+    return 0;   // tiled modes 0-2 follow
+}
+
+// --- core ABI (RetroPie system #35: Game Boy Advance) ---
+fn core_id() -> Int { return 35; }
+fn core_fb(m: Int) -> Int { return gba_fb(m); }
+fn core_fb_w() -> Int { return 240; }
+fn core_fb_h() -> Int { return 160; }
+// KEYINPUT ($04000130): active-LOW, bit 0=A, 1=B, 2=SELECT, 3=START, 4=RIGHT, 5=LEFT, 6=UP, 7=DOWN, 8=R, 9=L
+fn core_set_input_port(m: Int, port: Int, btn: Int) -> Int ! {mem} {
+    if port == 0 { core_set_input(m, btn); return 0; }
+    return 0;
+}
+
+fn core_set_input(m: Int, btn: Int) -> Int ! {mem} {
+    let ki: Int = 1023 - (btn and 1023);        // active-low invert of 10-bit bitmask
+    gba_io_w16(m, 304, ki);                        // KEYINPUT at offset 0x130 = 304
+    return 0;
+}
+fn core_load(m: Int, blob: Int, len: Int) -> Int ! {mem} {
+    var cap: Int = len;
+    if cap > 8388608 { cap = 8388608; }   // 8MB cap
+    var i: Int = 0;
+    while i < cap invariant i >= 0 { poke8(gba_rom(m), i, peek8(blob, i)); i = i + 1; }
+    gba_reset(m, 134217728);                  // GBA $08000000 = 134217728
+    return 0;
+}
+fn core_run_frame(m: Int) -> Int ! {mem} {
+    var c: Int = 0;
+    while c < 280896 invariant c >= 0 { gba_step(m); c = c + 1; }
+    gba_display(m);
+    return 0;
+}
+fn core_savestate(m: Int, dst: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 503808 invariant i >= 0 { poke8(dst, i, peek8(gba_ewram(m), i)); i = i + 1; }
+    return 0;
+}
+fn core_loadstate(m: Int, src: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 503808 invariant i >= 0 { poke8(gba_ewram(m), i, peek8(src, i)); i = i + 1; }
+    return 0;
+}
+fn core_savestate_size() -> Int { return 503808; }

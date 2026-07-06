@@ -1,0 +1,43 @@
+// forge/play/ws_boot_test.sg — deterministic hand-assembled V30MZ (8086-like)
+// program for the ported WonderSwan core. Real reset state is CS=0xFFFF,
+// IP=0x0000 (physical 0xFFFF0, top of the 1MB address space) — the test
+// program is poked there directly, matching real reset addressing.
+//
+// Program (physical 0xFFFF0):
+//   B8 34 12     MOV AX, #0x1234   (AX=reg0=4660)
+//   F4           HLT               (sets ws_halt=1, spins forever)
+//
+// Expected after 5 steps: AX=4660, IP=4, halt=1.
+//
+// Links: forge/play/ws_core.sg  forge/play/ws_video_core.sg  forge/play/ws_boot_test.sg
+
+fn main() -> Int ! {mem, io.write} {
+    let m: Int = alloc_buf(1400000);
+
+    let base: Int = ws_phys(65535, 0);   // 0xFFFF0 = 1048560
+    poke8(ws_mem(m), base, 184); poke8(ws_mem(m), base + 1, 52); poke8(ws_mem(m), base + 2, 18);
+    poke8(ws_mem(m), base + 3, 244);
+
+    ws_set_cs(m, 65535);
+    ws_set_ip(m, 0);
+
+    var i: Int = 0;
+    while i < 5 invariant i >= 0 { ws_step(m); i = i + 1; }
+
+    let ax: Int = ws_r16(m, 0);
+    let ip: Int = ws_ip(m);
+    let halt: Int = ws_halt(m);
+
+    print(1, "WONDERSWAN BOOT: V30MZ CPU, MOV+HLT hand-assembled program\n");
+    print(1, "  AX="); print(1, chr(48 + ax / 1000 % 10)); print(1, chr(48 + ax / 100 % 10));
+    print(1, chr(48 + ax / 10 % 10)); print(1, chr(48 + ax % 10));
+    print(1, " (expect 4660)");
+    print(1, "  IP="); print(1, chr(48 + ip)); print(1, " (expect 4)");
+    print(1, "  halt="); print(1, chr(48 + halt)); print(1, " (expect 1)\n");
+
+    var pass: Int = 0;
+    if ax == 4660 { if ip == 4 { if halt == 1 { pass = 1; } } }
+    if pass == 1 { print(1, "  SELFTEST: 3/3 PASS\n"); return 0; }
+    print(1, "  SELFTEST: FAIL\n");
+    return 1;
+}

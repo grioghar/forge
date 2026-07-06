@@ -1,0 +1,56 @@
+// forge/pal_macos.sg — macOS (arm64 Mach-O) PAL backend for Forge.
+// Link FIRST so these defs win over forge/pal.sg defaults.
+// Build: cc0 target=macho → Mach-O object → clang link (supplies LC_MAIN + libSystem).
+//
+// Current coverage:
+//   FS:      pal_fs_resolve / pal_fs_read / pal_fs_write — REAL (Darwin BSD syscalls
+//            via cc0's sys3, verified on the machoexe-x86 target: open+read+write+
+//            close round-trip a real file). Darwin syscall numbers are the 0x2000000
+//            BSD class (open 0x2000005 / read 0x2000003 / write 0x2000004 / close
+//            0x2000006). NOTE: verified for machoexe-x86 (Intel); the arm64-Mach-O
+//            build needs cc0 to emit Darwin `svc #0x80` for sys3 (today the arm path
+//            emits svc #0) — tracked as a cc0 follow-up for Apple-Silicon distribution.
+//   Display: stubs — gated on Video shipping Metal/AppKit display PAL
+//   Input:   stubs — gated on Drivers shipping HID input PAL
+//   Audio:   stubs — gated on Drivers shipping CoreAudio PAL
+//   Window:  stubs — gated on Video shipping NSWindow event pump
+//   Memory:  stub  — gated on cc0 shipping mmap host syscall (cc0#mmap)
+//
+// Pure-compute portable code (library count, savestate checksum, launcher logic)
+// runs fully on macOS today via print(). Emulator cores need pal_mem_map first.
+
+// Darwin BSD syscalls (0x2000000 class) via cc0's sys3 (x86-64: `syscall`; the
+// number carries the class prefix). `path` is a NUL-terminated cstring pointer,
+// `buf` a raw memory address — same contract as the metal PAL, just Darwin numbers.
+fn pal_fs_resolve(s: Sys, path: Int, out: Int) -> Int ! {sys} { return sys3(33554437, path, 0, 0); }        // open(path, O_RDONLY, 0) -> fd
+fn pal_fs_read(s: Sys, fd: Int, buf: Int, size: Int) -> Int ! {sys} { return sys3(33554435, fd, buf, size); } // read(fd, buf, size) -> n
+fn pal_fs_write(s: Sys, fd: Int, buf: Int, size: Int) -> Int ! {sys} { return sys3(33554436, fd, buf, size); }// write(fd, buf, size) -> n
+fn pal_fs_close(s: Sys, fd: Int) -> Int ! {sys} { return sys3(33554438, fd, 0, 0); }                          // close(fd)
+
+fn pal_fb_base(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_fb_pitch(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_fb_width(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_fb_height(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_present(s: Sys) -> Int ! {sys} { return 0; }
+
+fn pal_input_state(s: Sys, pad: Int) -> Int ! {sys} { return 0; }
+
+fn pal_aud_open(s: Sys, rate: Int, channels: Int, frames: Int) -> Int ! {sys} { return 0; }
+fn pal_aud_submit(s: Sys, buf: Int, frames: Int) -> Int ! {sys} { return 0; }
+fn pal_aud_volume(s: Sys, vol: Int) -> Int ! {sys} { return 0; }
+fn pal_aud_close(s: Sys) -> Int ! {sys} { return 0; }
+
+fn pal_frame_yield() -> Int { return 0; }
+fn pal_should_quit() -> Int { return 0; }
+
+// A fresh peek8/poke8-able region of `size` bytes from cc0's bump heap — enough
+// to load a downloaded core into memory and address it byte-wise (run-a-core
+// path). `base` is advisory and ignored: honoring a FIXED base needs a real
+// Darwin mmap (MAP_FIXED), a 6-arg syscall cc0 doesn't surface yet (sys1..sys4
+// only) — tracked as the cc0#mmap / sys6 follow-up for cores needing guest RAM
+// at a specific address.
+fn pal_mem_map(base: Int, size: Int) -> Int { return alloc_buf(size); }
+
+fn pal_launch(s: Sys, app_id: Int) -> Int ! {sys} { return 0; }   // no-op; caller reads return value
+
+fn pal_host() -> Int { return 1; }   // macOS

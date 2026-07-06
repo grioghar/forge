@@ -1,0 +1,138 @@
+// forge_gui.sg — the first real Forge Complete GUI: a native NSWindow with
+// one button per verified system, each launching its dist binary via NSTask
+// (no shell script). Proves the whole Cocoa-FFI stack end to end: window,
+// buttons, real target-action dispatch, process launching, event loop. Built
+// on sigil#188 (dyld_call6/dyld_call_rect/addr()-PIE-fix).
+//
+// Verified: compiles+links clean (-framework Cocoa -lSystem), runs a stable
+// real NSApp event loop (didn't exit on its own over a 3s background run,
+// matching real GUI-app behavior), and each button's target-action fires
+// correctly when simulated via performClick: (Apple's own recommended way to
+// test click handling programmatically) — confirmed in a standalone test
+// with the button attached to a real window's contentView.
+//
+// KNOWN LIMITATIONS (next steps, not yet done):
+//   - launch_dist() hardcodes an absolute dev-machine path
+//     ("/Users/grio/RetroPie-Sigil/forge/dist/"). Once packaged as a real
+//     .app bundle this should resolve dist binaries relative to
+//     [[NSBundle mainBundle] resourcePath] instead (same dyld_call6
+//     mechanism, just not wired up yet).
+//   - ANVIL (the relic sealer) isn't wired in yet — it needs a proper dialog
+//     (text fields for ROM path + system id), not just a button, since its
+//     existing protocol reads 3 lines from stdin.
+//   - Not yet packaged as a real .app bundle (Info.plist + icon) for Finder
+//     double-click launch — currently a bare Mach-O binary.
+//   - One dedicated zero-arg Sigil action function per button (10 near-
+//     identical act_*() functions) because a Sigil function WITH PARAMETERS
+//     isn't safely callable as a raw ObjC IMP yet (Sigil's calling
+//     convention passes args via the stack, not x0-x7 — see sigil#188's
+//     "Known limitation" section). A future register-to-stack trampoline
+//     would let one shared handler dispatch by sender instead.
+
+fn cstr(t: Text) -> Int ! {mem} {
+    let n: Int = len(t);
+    let buf: Int = alloc_buf(n + 1);
+    var i: Int = 0;
+    while i < n invariant i >= 0 {
+        poke8(buf, i, ord(slice(t, i, i + 1)));
+        i = i + 1;
+    }
+    poke8(buf, n, 0);
+    return buf;
+}
+
+fn sel(name: Text) -> Int ! {mem} { return dyld_call6("_sel_registerName", cstr(name), 0, 0, 0, 0, 0); }
+fn cls(name: Text) -> Int ! {mem} { return dyld_call6("_objc_getClass", cstr(name), 0, 0, 0, 0, 0); }
+fn msg0(recv: Int, s: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, 0, 0, 0, 0); }
+fn msg1(recv: Int, s: Int, a: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, a, 0, 0, 0); }
+fn nsstring(t: Text) -> Int ! {mem} { return msg1(cls("NSString"), sel("stringWithUTF8String:"), cstr(t)); }
+
+// IEEE-754 double bit patterns for the fixed layout (verified via a small C
+// reference: memcpy(&bits, &(double){N}, 8)).
+fn d0() -> Int { return 0; }
+fn d15() -> Int { return 4624633867356078080; }
+fn d20() -> Int { return 4626322717216342016; }
+fn d30() -> Int { return 4629137466983448576; }
+fn d60() -> Int { return 4633641066610819072; }
+fn d100() -> Int { return 4636737291354636288; }
+fn d140() -> Int { return 4639129828656676864; }
+fn d180() -> Int { return 4640537203540230144; }
+fn d200() -> Int { return 4641240890982006784; }
+fn d220() -> Int { return 4641944578423783424; }
+fn d250() -> Int { return 4643000109586448384; }
+fn d260() -> Int { return 4643281584563159040; }
+fn d300() -> Int { return 4643985272004935680; }
+fn d340() -> Int { return 4644688959446712320; }
+fn d380() -> Int { return 4645392646888488960; }
+fn d420() -> Int { return 4646096334330265600; }
+fn d460() -> Int { return 4646800021772042240; }
+fn d500() -> Int { return 4647503709213818880; }
+
+// Launch a Forge dist binary via NSTask — no shell script anywhere.
+fn launch_dist(name: Text) -> Int ! {mem} {
+    let task: Int = msg0(msg0(cls("NSTask"), sel("alloc")), sel("init"));
+    let path: Text = "/Users/grio/RetroPie-Sigil/forge/dist/" + name;
+    dyld_call6("_objc_msgSend", task, sel("setLaunchPath:"), nsstring(path), 0, 0, 0);
+    dyld_call6("_objc_msgSend", task, sel("launch"), 0, 0, 0, 0);
+    return 0;
+}
+
+// One dedicated zero-arg action per button (Sigil callbacks can't safely
+// receive args from a raw C caller like objc_msgSend — see sigil#188).
+fn act_gb() -> Int ! {mem} { launch_dist("forge-gb-boot-test-macos-arm64"); return 0; }
+fn act_gba() -> Int ! {mem} { launch_dist("forge-gba-boot-test-macos-arm64"); return 0; }
+fn act_snes() -> Int ! {mem} { launch_dist("forge-snes-input-test-macos-arm64"); return 0; }
+fn act_genesis() -> Int ! {mem} { launch_dist("forge-genesis-boot-test-macos-arm64"); return 0; }
+fn act_s32x() -> Int ! {mem} { launch_dist("forge-s32x-boot-test-macos-arm64"); return 0; }
+fn act_gamegear() -> Int ! {mem} { launch_dist("forge-gamegear-boot-test-macos-arm64"); return 0; }
+fn act_vb() -> Int ! {mem} { launch_dist("forge-vb-boot-test-macos-arm64"); return 0; }
+fn act_fds() -> Int ! {mem} { launch_dist("forge-fds-boot-test-macos-arm64"); return 0; }
+fn act_ngpc() -> Int ! {mem} { launch_dist("forge-ngpc-boot-test-macos-arm64"); return 0; }
+fn act_ws() -> Int ! {mem} { launch_dist("forge-ws-boot-test-macos-arm64"); return 0; }
+
+fn make_target(name: Text, action_fn: Int, action_sel: Text) -> Int ! {mem} {
+    let target_cls: Int = dyld_call6("_objc_allocateClassPair", cls("NSObject"), cstr(name), 0, 0, 0, 0);
+    dyld_call6("_class_addMethod", target_cls, sel(action_sel), action_fn, cstr("v@:@"), 0, 0);
+    dyld_call6("_objc_registerClassPair", target_cls, 0, 0, 0, 0, 0);
+    return msg0(msg0(target_cls, sel("alloc")), sel("init"));
+}
+
+fn make_button(content_view: Int, title: Text, y: Int, target: Int) -> Int ! {mem} {
+    let btn_alloc: Int = msg0(cls("NSButton"), sel("alloc"));
+    let btn: Int = dyld_call_rect("_objc_msgSend", btn_alloc, sel("initWithFrame:"), d20(), y, d200(), d30(), 0, 0, 0);
+    dyld_call6("_objc_msgSend", btn, sel("setTitle:"), nsstring(title), 0, 0, 0);
+    dyld_call6("_objc_msgSend", btn, sel("setBezelStyle:"), 1, 0, 0, 0);
+    dyld_call6("_objc_msgSend", btn, sel("setTarget:"), target, 0, 0, 0);
+    dyld_call6("_objc_msgSend", btn, sel("setAction:"), sel("fire:"), 0, 0, 0);
+    dyld_call6("_objc_msgSend", content_view, sel("addSubview:"), btn, 0, 0, 0);
+    return btn;
+}
+
+fn main() -> Int ! {mem, io.write} {
+    let app: Int = msg0(cls("NSApplication"), sel("sharedApplication"));
+    dyld_call6("_objc_msgSend", app, sel("setActivationPolicy:"), 0, 0, 0, 0);
+
+    let win_alloc: Int = msg0(cls("NSWindow"), sel("alloc"));
+    let win: Int = dyld_call_rect("_objc_msgSend", win_alloc, sel("initWithContentRect:styleMask:backing:defer:"),
+        d100(), d100(), d250(), d500(), 15, 2, 0);
+    dyld_call6("_objc_msgSend", win, sel("setTitle:"), nsstring("Forge Complete"), 0, 0, 0);
+    let content_view: Int = msg0(win, sel("contentView"));
+
+    make_button(content_view, "Game Boy", d460(), make_target("ForgeTargetGB", addr(act_gb), "fire:"));
+    make_button(content_view, "Game Boy Advance", d420(), make_target("ForgeTargetGBA", addr(act_gba), "fire:"));
+    make_button(content_view, "SNES", d380(), make_target("ForgeTargetSNES", addr(act_snes), "fire:"));
+    make_button(content_view, "Genesis", d340(), make_target("ForgeTargetGenesis", addr(act_genesis), "fire:"));
+    make_button(content_view, "32X", d300(), make_target("ForgeTarget32X", addr(act_s32x), "fire:"));
+    make_button(content_view, "Game Gear", d260(), make_target("ForgeTargetGG", addr(act_gamegear), "fire:"));
+    make_button(content_view, "Virtual Boy", d220(), make_target("ForgeTargetVB", addr(act_vb), "fire:"));
+    make_button(content_view, "Famicom Disk System", d180(), make_target("ForgeTargetFDS", addr(act_fds), "fire:"));
+    make_button(content_view, "Neo Geo Pocket Color", d140(), make_target("ForgeTargetNGPC", addr(act_ngpc), "fire:"));
+    make_button(content_view, "WonderSwan", d100(), make_target("ForgeTargetWS", addr(act_ws), "fire:"));
+
+    dyld_call6("_objc_msgSend", win, sel("makeKeyAndOrderFront:"), 0, 0, 0, 0);
+    dyld_call6("_objc_msgSend", app, sel("activateIgnoringOtherApps:"), 1, 0, 0, 0);
+
+    print(1, "Forge Complete GUI running. Window created with 10 launch buttons.\n");
+    dyld_call6("_objc_msgSend", app, sel("run"), 0, 0, 0, 0);
+    return 0;
+}

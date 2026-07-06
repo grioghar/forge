@@ -1,0 +1,244 @@
+// genesis.sg — Sega Genesis / Mega Drive (Motorola 68000) core for sigil-Retropie,
+// bare-metal Sigil Int-subset. Sixth core (after CHIP-8, 8080, GB, NES, SNES), per
+// the Director's road-to-1.0 "core breadth". THIS INCREMENT: the 68000 CPU
+// foundation — 8 data + 8 address registers (32-bit), big-endian bus, the reset
+// vector, and a first opcode slice (NOP / MOVEQ / MOVE.l Dn,Dm) to prove the
+// fetch/decode/execute loop. NEXT: the rest of the opcode set + addressing modes,
+// then the VDP (planes A/B + sprites), the Z80 sound CPU, and the I/O. Function
+// names gn_*-prefixed (avoids asm register-name collisions, sigil#12 — esp. the
+// 68000's SP/PC/SR).
+//
+// Genesis is BIG-ENDIAN (hi byte at the lower address) — the opposite of the SNES.
+//
+// Fixed RAM: WRAM 0x3000000 (64KB work RAM @ bus $FF0000), ST 0x3010000 (regs),
+// FB 0x3020000 (320x224 ARGB), ROM 0x3100000 (up to 4MB cartridge).
+
+fn gn_wram(m: Int) -> Int { return m + 0; }              // base+0: 68000 work RAM
+fn gn_fb(m: Int) -> Int { return m + 131072; }          // base+131072: framebuffer 320x224 ARGB
+fn gn_rom(m: Int) -> Int { return m + 1048576; }        // base+1048576: cartridge ROM
+fn gn_vram(m: Int) -> Int { return m + 524288; }        // base+524288: VDP VRAM (64KB)
+fn gn_cram(m: Int) -> Int { return m + 589824; }        // base+589824: CRAM (128B)
+fn gn_vsram(m: Int) -> Int { return m + 655360; }       // base+655360: VSRAM (80B)
+
+
+
+// --- big-endian bus ($000000-$3FFFFF ROM, $FF0000-$FFFFFF WRAM; VDP/Z80/IO stubbed) ---
+fn gn_read8(m: Int, a: Int) -> Int ! {mem} {
+    let ad: Int = a and 16777215;                          // 24-bit
+    if ad < 4194304 { return peek8(gn_rom(m), ad); }        // $000000-$3FFFFF cartridge
+    if ad >= 16711680 { return peek8(gn_wram(m), ad - 16711680); }   // $FF0000-$FFFFFF WRAM
+    if ad == 10551298 { return gn_pad_lo(peek32(gn_st(m), 72)); }    // $A10002 P1 pad (active-low)
+    if ad == 10551300 { return gn_pad_lo(peek32(gn_st(m), 76)); }    // $A10004 P2 pad (active-low)
+    return 0;                                              // VDP/Z80/IO: stub
+}
+fn gn_write8(m: Int, a: Int, v: Int) -> Int ! {mem} {
+    let ad: Int = a and 16777215;
+    if ad >= 10502144 { if ad <= 10502147 { ym_port_write(m, ad - 10502144, v and 255); return 0; } }  // $A04000-3 YM2612
+    if (ad == 12582929) { psg_write(m, v and 255); return 0; }                                             // $C00011 SN76489 PSG
+    if ad >= 16711680 { poke8(gn_wram(m), ad - 16711680, v and 255); }   // WRAM (ROM is read-only)
+    return 0;
+}
+fn gn_read16(m: Int, a: Int) -> Int ! {mem} {
+    let ad: Int = a and 16777215;
+    if ad >= 12582916 { if ad < 12582920 { return 512; } }   // $C00004-7 VDP status: FIFO-empty (bit9), avoids write-wait hangs
+    return gn_read8(m, a) * 256 + gn_read8(m, a + 1);                // big-endian
+}
+fn gn_read32(m: Int, a: Int) -> Int ! {mem} { return gn_read16(m, a) * 65536 + gn_read16(m, a + 2); }
+fn gn_write16(m: Int, a: Int, v: Int) -> Int ! {mem} {
+    let ad: Int = a and 16777215;
+    if ad >= 12582912 { if ad < 12582920 {                    // $C00000-7 VDP ports
+        if ad < 12582916 { gn_vdp_data(m, v); }
+        if ad >= 12582916 { gn_vdp_ctrl(m, v); }
+        return 0;
+    } }
+    gn_write8(m, a, (v / 256) and 255); gn_write8(m, a + 1, v and 255); return 0;
+}
+fn gn_write32(m: Int, a: Int, v: Int) -> Int ! {mem} { gn_write16(m, a, (v / 65536) and 65535); gn_write16(m, a + 2, v and 65535); return 0; }
+
+// --- VDP: 24 registers + VRAM/CRAM/VSRAM access via the control/data ports ---
+// VDP state in ST: regs @ 80-103, access addr @ 104, code @ 108, ctrl latch @ 109,
+// first command word @ 110.
+fn gn_vreg(m: Int, n: Int) -> Int ! {mem} { return peek8(gn_st(m), 80 + n); }
+fn gn_vdp_ctrl(m: Int, v: Int) -> Int ! {mem} {
+    let w: Int = v and 65535;
+    if peek8(gn_st(m), 109) == 0 {                          // first word / register write
+        if (w and 49152) == 32768 {                        // 10rrrrr dddddddd -> register write
+            poke8(gn_st(m), 80 + ((w / 256) and 31), w and 255); return 0;
+        }
+        poke32(gn_st(m), 110, w); poke8(gn_st(m), 109, 1); return 0;   // latch first word of addr command
+    }
+    let first: Int = peek32(gn_st(m), 110);
+    poke32(gn_st(m), 104, (first and 16383) + ((w and 3) * 16384));    // addr: A0-13 | A14-15
+    poke8(gn_st(m), 108, ((first / 16384) and 3) + (((w / 16) and 15) * 4));  // code: CD0-1 | CD2-5
+    poke8(gn_st(m), 109, 0); return 0;
+}
+fn gn_vdp_data(m: Int, v: Int) -> Int ! {mem} {
+    let addr: Int = peek32(gn_st(m), 104) and 65535;
+    let dest: Int = peek8(gn_st(m), 108) and 7;
+    let hi: Int = (v / 256) and 255; let lo: Int = v and 255;
+    if dest == 1 { poke8(gn_vram(m), addr, hi); poke8(gn_vram(m), (addr + 1) and 65535, lo); }       // VRAM
+    if dest == 3 { poke8(gn_cram(m), addr and 127, hi); poke8(gn_cram(m), (addr + 1) and 127, lo); } // CRAM
+    if dest == 5 { poke8(gn_vsram(m), addr % 80, hi); poke8(gn_vsram(m), (addr + 1) % 80, lo); }      // VSRAM
+    poke32(gn_st(m), 104, (addr + gn_vreg(m, 15)) and 65535);            // auto-increment (reg 15)
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+// --- VDP plane render: nametable -> 4bpp tiles -> CRAM (BGR333) -> framebuffer ---
+// (core_id/core_rom_max/core_fb/core_fb_w/core_fb_h/core_load moved to cores/genesis_abi.sg —
+// single-definition-with-dispatch: link genesis_abi.sg for standalone Genesis/Pico, skip it and
+// supply your own Core ABI for a reuse-the-internals system like the Sega CD.)
+// CRAM word: 0000 BBB0 GGG0 RRR0 (3 bits/channel). idx = palette*16 + pixel.
+fn gn_bgr(c: Int) -> Int {
+    let r: Int = ((c / 2) and 7) * 36;
+    let g: Int = ((c / 32) and 7) * 36;
+    let b: Int = ((c / 512) and 7) * 36;
+    return r + g * 256 + b * 65536 + 4278190080;
+}
+fn gn_cram_color(m: Int, idx: Int) -> Int ! {mem} {
+    let i: Int = (idx and 63) * 2;
+    return gn_bgr(peek8(gn_cram(m), i) * 256 + peek8(gn_cram(m), i + 1));
+}
+// one 8x8 4bpp tile (Genesis packs 2 px/byte; high nibble = left). color 0 transparent.
+// Draw one 8x8 4bpp tile with screen clipping (used by sprites, which can sit partly
+// off-screen). color 0 transparent. Planes use gn_plane_px instead (full-screen).
+fn gn_draw_tile_row(m: Int, px: Int, sy: Int, base: Int, pal: Int, hflip: Int, sr: Int) -> Int ! {mem} {
+    var x: Int = 0;
+    while x < 8 invariant x >= 0 {
+        let sxp: Int = px + x;
+        if sxp >= 0 { if sxp < 320 {
+            var sx: Int = x; if hflip == 1 { sx = 7 - x; }
+            let byte: Int = peek8(gn_vram(m), (base + sr * 4 + (sx / 2)) and 65535);
+            var v: Int = byte and 15; if (sx and 1) == 0 { v = (byte / 16) and 15; }
+            if v != 0 { poke32(gn_fb(m), (sy * 320 + sxp) * 4, gn_cram_color(m, pal * 16 + v)); }
+        } }
+        x = x + 1;
+    }
+    return 0;
+}
+fn gn_draw_tile(m: Int, px: Int, py: Int, tile: Int, pal: Int, hflip: Int, vflip: Int) -> Int ! {mem} {
+    let base: Int = (tile and 2047) * 32;
+    var r: Int = 0;
+    while r < 8 invariant r >= 0 {
+        let sy: Int = py + r;
+        if sy >= 0 { if sy < 224 {
+            var sr: Int = r; if vflip == 1 { sr = 7 - r; }
+            gn_draw_tile_row(m, px, sy, base, pal, hflip, sr);
+        } }
+        r = r + 1;
+    }
+    return 0;
+}
+// Draw one tile-row of a scrolled plane: 41 tiles (40 visible + 1 for the fine-x
+// fractional edge) from nametable row `srow`, starting at source tile col `tcol0`,
+// shifted left by `finex` px, at screen y `sy`. The nametable entry is read ONCE per
+// tile (not per pixel) and gn_draw_tile clips the fractional edges. wt is a power of 2
+// (32/64/128) so the column wraps via (and wt-1).
+fn gn_plane_row(m: Int, nt: Int, wt: Int, srow: Int, tcol0: Int, finex: Int, sy: Int) -> Int ! {mem} {
+    var j: Int = 0;
+    while j < 41 invariant j >= 0 {
+        let scol: Int = (tcol0 + j) and (wt - 1);
+        let o: Int = (nt + (srow * wt + scol) * 2) and 65535;
+        let e: Int = peek8(gn_vram(m), o) * 256 + peek8(gn_vram(m), (o + 1) and 65535);
+        gn_draw_tile(m, j * 8 - finex, sy, e and 2047, (e / 8192) and 3, (e / 2048) and 1, (e / 4096) and 1);
+        j = j + 1;
+    }
+    return 0;
+}
+// Render a full-screen-scrolled plane, tile-at-a-time. hs/vs are pixel scroll; pw/ph
+// are powers of 2 so the scroll source wraps via (and mask). Per-tile (vs per-pixel)
+// so a frame is ~1.2k tiles, not ~72k pixel decodes -> viable at 60fps on Pi3.
+fn gn_render_plane(m: Int, nt: Int, wt: Int, ht: Int, hs: Int, vs: Int) -> Int ! {mem} {
+    let pw: Int = wt * 8; let ph: Int = ht * 8;
+    let fx0: Int = (0 - hs) and (pw - 1);            // source x at screen x=0
+    let fy0: Int = vs and (ph - 1);                  // source y at screen y=0
+    var i: Int = 0;
+    while i < 29 invariant i >= 0 {                  // 28 visible rows + 1 fine-y edge
+        gn_plane_row(m, nt, wt, ((fy0 / 8) + i) and (ht - 1), fx0 / 8, fx0 and 7, i * 8 - (fy0 and 7));
+        i = i + 1;
+    }
+    return 0;
+}
+fn gn_pwidth(m: Int) -> Int ! {mem} { let s: Int = gn_vreg(m, 16) and 3; if s == 1 { return 64; } if s == 3 { return 128; } return 32; }
+fn gn_pheight(m: Int) -> Int ! {mem} { let s: Int = (gn_vreg(m, 16) / 16) and 3; if s == 1 { return 64; } if s == 3 { return 128; } return 32; }
+// Full-screen scroll: HScroll table (reg13<<10) word 0=A, word 1=B; VSRAM word 0=A, word 1=B.
+fn gn_hscroll(m: Int, plane: Int) -> Int ! {mem} {
+    let o: Int = ((gn_vreg(m, 13) and 63) * 1024 + plane * 2) and 65535;
+    return peek8(gn_vram(m), o) * 256 + peek8(gn_vram(m), (o + 1) and 65535);
+}
+fn gn_vscroll(m: Int, plane: Int) -> Int ! {mem} { return peek8(gn_vsram(m), plane * 2) * 256 + peek8(gn_vsram(m), plane * 2 + 1); }
+fn gn_render_plane_a(m: Int) -> Int ! {mem} {
+    let nt: Int = (gn_vreg(m, 2) and 56) * 1024;             // reg2 bits 3-5 -> nametable A base (<<13)
+    return gn_render_plane(m, nt, gn_pwidth(m), gn_pheight(m), gn_hscroll(m, 0), gn_vscroll(m, 0));
+}
+fn gn_render_plane_b(m: Int) -> Int ! {mem} {
+    let nt: Int = (gn_vreg(m, 4) and 7) * 8192;              // reg4 bits 0-2 -> nametable B base (<<13)
+    return gn_render_plane(m, nt, gn_pwidth(m), gn_pheight(m), gn_hscroll(m, 1), gn_vscroll(m, 1));
+}
+// --- sprites (OAM) ---  Sprite attribute table = reg5 bits 0-6 << 9, 80 entries x 8B:
+//   word0 = Y (10b, +128 bias); byte2 = size (b0-1 = w-1 tiles, b2-3 = h-1 tiles);
+//   byte3 = link (next sprite index, 7b); word4 = bit15 prio, b13-14 pal, b12 vflip,
+//   b11 hflip, b0-10 tile; word6 = X (9b, +128 bias). Tiles are column-major:
+//   tile(col,row) = base + col*h + row. color 0 transparent. (priority TODO.)
+fn gn_blit_sprite(m: Int, x: Int, y: Int, hs: Int, vs: Int, tile: Int, pal: Int, hf: Int, vf: Int) -> Int ! {mem} {
+    var col: Int = 0;
+    while col < hs invariant col >= 0 {
+        var row: Int = 0;
+        while row < vs invariant row >= 0 {
+            var dx: Int = col; if hf == 1 { dx = (hs - 1) - col; }     // flip reverses tile placement
+            var dy: Int = row; if vf == 1 { dy = (vs - 1) - row; }
+            gn_draw_tile(m, x + dx * 8, y + dy * 8, tile + col * vs + row, pal, hf, vf);
+            row = row + 1;
+        }
+        col = col + 1;
+    }
+    return 0;
+}
+fn gn_draw_sprite(m: Int, ea: Int) -> Int ! {mem} {                      // ea = VRAM addr of the 8B entry; returns link
+    let y: Int = ((peek8(gn_vram(m), ea) * 256 + peek8(gn_vram(m), ea + 1)) and 1023) - 128;
+    let sz: Int = peek8(gn_vram(m), ea + 2);
+    let link: Int = peek8(gn_vram(m), ea + 3) and 127;
+    let attr: Int = peek8(gn_vram(m), ea + 4) * 256 + peek8(gn_vram(m), ea + 5);
+    let x: Int = ((peek8(gn_vram(m), ea + 6) * 256 + peek8(gn_vram(m), ea + 7)) and 511) - 128;
+    gn_blit_sprite(m, x, y, (sz and 3) + 1, ((sz / 4) and 3) + 1,
+                   attr and 2047, (attr / 8192) and 3, (attr / 2048) and 1, (attr / 4096) and 1);
+    return link;
+}
+fn gn_render_sprites(m: Int) -> Int ! {mem} {
+    let sat: Int = (gn_vreg(m, 5) and 127) * 512;
+    var ea: Int = sat;
+    var n: Int = 0;
+    while n < 80 invariant n >= 0 {                       // walk the link list (max 80 sprites)
+        let nx: Int = gn_draw_sprite(m, ea and 65535);
+        if nx == 0 { return 0; }                          // link 0 terminates the list
+        ea = (sat + nx * 8) and 65535;
+        n = n + 1;
+    }
+    return 0;
+}
+fn gn_clear(m: Int, color: Int) -> Int ! {mem} {
+    var p: Int = 0;
+    while p < 71680 invariant p >= 0 { poke32(gn_fb(m), p * 4, color); p = p + 1; }   // 320x224
+    return 0;
+}
+// Active-low Genesis pad byte from 6-bit NES-style active-high bitmask (U=0 D=1 L=2 R=3 B=4 A=5)
+fn gn_pad_lo(btn: Int) -> Int { return 63 - (btn and 63); }
+
+// gn_copy: shared byte-copy helper for save states (genesis_abi.sg + segacd.sg both use it).
+// Full Genesis machine: WRAM (64KB), gn_st (68000 regs + VDP regs/addr/latch + input),
+// VRAM (64KB), CRAM, VSRAM — AND the sound side: ym_reg (FM register file) + ym_st (FM
+// chan/op/EG state) + psg_st (PSG channels/LFSR). ROM constant; fb re-rendered.
+fn gn_copy(m: Int, dst: Int, doff: Int, src: Int, soff: Int, len: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < len invariant i >= 0 { poke8(dst, doff + i, peek8(src, soff + i)); i = i + 1; }
+    return 0;
+}
+// (core_set_input_port/core_set_input/core_run_frame/core_state_size/core_save_state/
+// core_load_state/core_savestate/core_loadstate/core_savestate_size moved to cores/genesis_abi.sg.)

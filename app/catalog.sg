@@ -1,0 +1,163 @@
+// forge/app/catalog.sg — Forge system catalog: 74 supported platforms.
+// Each entry: name (printed), cpu family, year, region notes.
+// Shared by the console app and future GUI; no host dependencies.
+
+fn cat_count() -> Int { return 74; }
+
+// System display name for index n (0-73).
+fn cat_name(n: Int, c: Int) -> Int ! {io.write} {
+    if n == 0  { print(c, "3DO Interactive Multiplayer"); return 0; }
+    if n == 1  { print(c, "Commodore Amiga"); return 0; }
+    if n == 2  { print(c, "Apple II / IIe"); return 0; }
+    if n == 3  { print(c, "Arcade (Namco / Capcom / SNK)"); return 0; }
+    if n == 4  { print(c, "Atari 8-bit (400/800/XL/XE)"); return 0; }
+    if n == 5  { print(c, "Atari 2600 / VCS"); return 0; }
+    if n == 6  { print(c, "Atari 5200"); return 0; }
+    if n == 7  { print(c, "Atari 7800 ProSystem"); return 0; }
+    if n == 8  { print(c, "Atari ST / STE"); return 0; }
+    if n == 9  { print(c, "Acorn BBC Micro Model B"); return 0; }
+    if n == 10 { print(c, "Commodore 64"); return 0; }
+    if n == 11 { print(c, "Fairchild Channel F"); return 0; }
+    if n == 12 { print(c, "CHIP-8 / SUPER-CHIP"); return 0; }
+    if n == 13 { print(c, "ColecoVision"); return 0; }
+    if n == 14 { print(c, "Amstrad CPC 464/664/6128"); return 0; }
+    if n == 15 { print(c, "Capcom CPS-1"); return 0; }
+    if n == 16 { print(c, "Capcom CPS-2"); return 0; }
+    if n == 17 { print(c, "Capcom CPS-3"); return 0; }
+    if n == 18 { print(c, "MS-DOS / x86 PC"); return 0; }
+    if n == 19 { print(c, "Dragon 32/64"); return 0; }
+    if n == 20 { print(c, "Sega Dreamcast"); return 0; }
+    if n == 21 { print(c, "Acorn Electron"); return 0; }
+    if n == 22 { print(c, "Famicom Disk System"); return 0; }
+    if n == 23 { print(c, "Nintendo GameCube"); return 0; }
+    if n == 24 { print(c, "Sega Game Gear"); return 0; }
+    if n == 25 { print(c, "Nintendo Game Boy"); return 0; }
+    if n == 26 { print(c, "Nintendo Game Boy Advance"); return 0; }
+    if n == 27 { print(c, "Nintendo Game Boy Color"); return 0; }
+    if n == 28 { print(c, "Sega Genesis / Mega Drive"); return 0; }
+    if n == 29 { print(c, "Intel 8080 / Space Invaders HW"); return 0; }
+    if n == 30 { print(c, "Mattel Intellivision"); return 0; }
+    if n == 31 { print(c, "Atari Jaguar"); return 0; }
+    if n == 32 { print(c, "Atari Lynx"); return 0; }
+    if n == 33 { print(c, "MSX (MSX1)"); return 0; }
+    if n == 34 { print(c, "MSX2"); return 0; }
+    if n == 35 { print(c, "MSX Turbo-R"); return 0; }
+    if n == 36 { print(c, "Nintendo 3DS"); return 0; }
+    if n == 37 { print(c, "Nintendo 64"); return 0; }
+    if n == 38 { print(c, "Nintendo DS"); return 0; }
+    if n == 39 { print(c, "SNK Neo Geo MVS / AES"); return 0; }
+    if n == 40 { print(c, "Nintendo NES / Famicom"); return 0; }
+    if n == 41 { print(c, "SNK Neo Geo CD"); return 0; }
+    if n == 42 { print(c, "SNK Neo Geo Pocket Color"); return 0; }
+    if n == 43 { print(c, "NEC PC-8801"); return 0; }
+    if n == 44 { print(c, "NEC PC Engine / TurboGrafx-16"); return 0; }
+    if n == 45 { print(c, "NEC PC Engine CD-ROM2"); return 0; }
+    if n == 46 { print(c, "NEC PC-FX"); return 0; }
+    if n == 47 { print(c, "Sega Pico"); return 0; }
+    if n == 48 { print(c, "Nintendo Pokemon Mini"); return 0; }
+    if n == 49 { print(c, "Sony PlayStation 2"); return 0; }
+    if n == 50 { print(c, "Sony PlayStation 3"); return 0; }
+    if n == 51 { print(c, "Sony PSP"); return 0; }
+    if n == 52 { print(c, "Sony PlayStation (PS1)"); return 0; }
+    if n == 53 { print(c, "Sega 32X"); return 0; }
+    if n == 54 { print(c, "Sega Saturn"); return 0; }
+    if n == 55 { print(c, "Sega CD / Mega CD"); return 0; }
+    if n == 56 { print(c, "Sega SG-1000"); return 0; }
+    if n == 57 { print(c, "Sega Master System"); return 0; }
+    if n == 58 { print(c, "Nintendo SNES / Super Famicom"); return 0; }
+    if n == 59 { print(c, "Watara Supervision"); return 0; }
+    if n == 60 { print(c, "Nintendo Switch"); return 0; }
+    if n == 61 { print(c, "Texas Instruments TI-99/4A"); return 0; }
+    if n == 62 { print(c, "Nintendo Virtual Boy"); return 0; }
+    if n == 63 { print(c, "Vectrex"); return 0; }
+    if n == 64 { print(c, "Commodore VIC-20"); return 0; }
+    if n == 65 { print(c, "Sony PlayStation Vita"); return 0; }
+    if n == 66 { print(c, "Wii / WebAssembly"); return 0; }
+    if n == 67 { print(c, "Nintendo Wii"); return 0; }
+    if n == 68 { print(c, "Nintendo Wii U"); return 0; }
+    if n == 69 { print(c, "Bandai WonderSwan"); return 0; }
+    if n == 70 { print(c, "Bandai WonderSwan Color"); return 0; }
+    if n == 71 { print(c, "Sharp X68000"); return 0; }
+    if n == 72 { print(c, "Microsoft Xbox 360"); return 0; }
+    if n == 73 { print(c, "Sinclair ZX Spectrum"); return 0; }
+    return 0;
+}
+
+// ROM file extension for system n.
+fn cat_ext(n: Int, c: Int) -> Int ! {io.write} {
+    if n == 0  { print(c, ".iso"); return 0; }
+    if n == 1  { print(c, ".adf"); return 0; }
+    if n == 2  { print(c, ".dsk"); return 0; }
+    if n == 3  { print(c, ".zip"); return 0; }
+    if n == 4  { print(c, ".xex"); return 0; }
+    if n == 5  { print(c, ".a26"); return 0; }
+    if n == 6  { print(c, ".a52"); return 0; }
+    if n == 7  { print(c, ".a78"); return 0; }
+    if n == 8  { print(c, ".st");  return 0; }
+    if n == 9  { print(c, ".rom"); return 0; }
+    if n == 10 { print(c, ".prg"); return 0; }
+    if n == 11 { print(c, ".chf"); return 0; }
+    if n == 12 { print(c, ".ch8"); return 0; }
+    if n == 13 { print(c, ".col"); return 0; }
+    if n == 14 { print(c, ".dsk"); return 0; }
+    if n == 15 { print(c, ".cps"); return 0; }
+    if n == 16 { print(c, ".cps"); return 0; }
+    if n == 17 { print(c, ".cps"); return 0; }
+    if n == 18 { print(c, ".exe"); return 0; }
+    if n == 19 { print(c, ".cas"); return 0; }
+    if n == 20 { print(c, ".bin"); return 0; }
+    if n == 21 { print(c, ".rom"); return 0; }
+    if n == 22 { print(c, ".fds"); return 0; }
+    if n == 23 { print(c, ".iso"); return 0; }
+    if n == 24 { print(c, ".gg");  return 0; }
+    if n == 25 { print(c, ".gb");  return 0; }
+    if n == 26 { print(c, ".gba"); return 0; }
+    if n == 27 { print(c, ".gbc"); return 0; }
+    if n == 28 { print(c, ".md");  return 0; }
+    if n == 29 { print(c, ".bin"); return 0; }
+    if n == 30 { print(c, ".int"); return 0; }
+    if n == 31 { print(c, ".j64"); return 0; }
+    if n == 32 { print(c, ".lnx"); return 0; }
+    if n == 33 { print(c, ".rom"); return 0; }
+    if n == 34 { print(c, ".rom"); return 0; }
+    if n == 35 { print(c, ".rom"); return 0; }
+    if n == 36 { print(c, ".3ds"); return 0; }
+    if n == 37 { print(c, ".z64"); return 0; }
+    if n == 38 { print(c, ".nds"); return 0; }
+    if n == 39 { print(c, ".neo"); return 0; }
+    if n == 40 { print(c, ".nes"); return 0; }
+    if n == 41 { print(c, ".iso"); return 0; }
+    if n == 42 { print(c, ".ngp"); return 0; }
+    if n == 43 { print(c, ".d88"); return 0; }
+    if n == 44 { print(c, ".pce"); return 0; }
+    if n == 45 { print(c, ".iso"); return 0; }
+    if n == 46 { print(c, ".iso"); return 0; }
+    if n == 47 { print(c, ".md");  return 0; }
+    if n == 48 { print(c, ".min"); return 0; }
+    if n == 49 { print(c, ".iso"); return 0; }
+    if n == 50 { print(c, ".iso"); return 0; }
+    if n == 51 { print(c, ".iso"); return 0; }
+    if n == 52 { print(c, ".exe"); return 0; }
+    if n == 53 { print(c, ".32x"); return 0; }
+    if n == 54 { print(c, ".iso"); return 0; }
+    if n == 55 { print(c, ".iso"); return 0; }
+    if n == 56 { print(c, ".sg");  return 0; }
+    if n == 57 { print(c, ".sms"); return 0; }
+    if n == 58 { print(c, ".sfc"); return 0; }
+    if n == 59 { print(c, ".sv");  return 0; }
+    if n == 60 { print(c, ".xci"); return 0; }
+    if n == 61 { print(c, ".rpk"); return 0; }
+    if n == 62 { print(c, ".vb");  return 0; }
+    if n == 63 { print(c, ".vec"); return 0; }
+    if n == 64 { print(c, ".prg"); return 0; }
+    if n == 65 { print(c, ".vpk"); return 0; }
+    if n == 66 { print(c, ".wasm"); return 0; }
+    if n == 67 { print(c, ".wbfs"); return 0; }
+    if n == 68 { print(c, ".wud"); return 0; }
+    if n == 69 { print(c, ".ws");  return 0; }
+    if n == 70 { print(c, ".wsc"); return 0; }
+    if n == 71 { print(c, ".x68"); return 0; }
+    if n == 72 { print(c, ".iso"); return 0; }
+    if n == 73 { print(c, ".tap"); return 0; }
+    return 0;
+}

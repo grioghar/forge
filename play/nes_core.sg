@@ -1,0 +1,527 @@
+// nes.sg — NES (Ricoh 2A03 / MOS 6502) core for sigil-Retropie, bare-metal Sigil
+// Int-subset. Fourth core (after CHIP-8, 8080, GB), per the Director's backlog
+// (GB -> NES -> SNES -> Genesis). THIS INCREMENT: the 6502 CPU — registers/flags,
+// all addressing modes, and the official opcode set (binary mode; the NES 2A03
+// has no decimal mode). NEXT: NES memory map + PPU (pattern/nametable/sprite
+// scanline render) + APU + mappers (NROM/MMC1/MMC3), then drive a real .nes ROM.
+// Function names are n6_*-prefixed (avoids asm register-name collisions, sigil#12).
+//
+// Fixed RAM (flat 64K for now; NES PPU/IO mapping is the next increment):
+//   NMEM 0x700000 (64 KB CPU space)   NST 0x720000 (regs)   NFB 0x730000 (256x240 ARGB)
+//   NROM 0x740000 (PRG, <=512 KB)
+// NST: A@0 X@1 Y@2 SP@3 P@4 (bytes); PC@8 (32). P bits: C0 Z1 I2 D3 B4 U5 V6 N7.
+
+// All regions relocated into the sigil-os EL0 app window 0x400000-0x6FFFFF
+// (pinned on sigil-os#3) so the core runs as an EL0 app without clashing with
+// fb_info/mailbox/ramdisk above it. Total working set ~1.1 MB, fits the 3 MB window.
+fn n6_mem(m: Int) -> Int { return m + 0; }               // base+0: 64 KB CPU space
+// FDS hook stubs (fds_mode/fds_reg_read/fds_reg_write) split into cores/nes_fdsstub.sg —
+// cc0 has no first-def-wins (sigil-Retropie#13), so cores/fds.sg's real implementation
+// can't "shadow" these by link order the way the old comment claimed. Link
+// nes_fdsstub.sg for standalone NES only; el0/fds_app.sg links fds.sg's real versions
+// instead (mirrors cores/m68k_singlebus.sg's role for the m68k family).
+fn n6_st(m: Int) -> Int { return m + 65536; }            // base+65536: registers
+fn n6_fb(m: Int) -> Int { return m + 131072; }           // base+131072: 256x240 ARGB
+fn n6_rom(m: Int) -> Int { return m + 524288; }          // base+524288: PRG (512KB cap)
+fn n6_ppu(m: Int) -> Int { return m + 393216; }          // base+393216: PPU space
+fn n6_pallut(m: Int) -> Int { return m + 413696; }       // base+413696: palette LUT
+fn n6_oam(m: Int) -> Int { return m + 409600; }          // base+409600: OAM (256B)
+
+// NES color index (0..63) -> ARGB. LUT built once by n6_pal_init.
+fn n6_palcol(m: Int, i: Int) -> Int ! {mem} { return peek32(n6_pallut(m), (i and 63) * 4); }
+fn n6_pe(m: Int, i: Int, r: Int, g: Int, b: Int) -> Int ! {mem} { poke32(n6_pallut(m), i * 4, r + g * 256 + b * 65536 + 4278190080); return 0; }
+fn n6_pal_init(m: Int) -> Int ! {mem} {
+    n6_pe(m, 0,84,84,84); n6_pe(m, 1,0,30,116); n6_pe(m, 2,8,16,144); n6_pe(m, 3,48,0,136);
+    n6_pe(m, 4,68,0,100); n6_pe(m, 5,92,0,48); n6_pe(m, 6,84,4,0); n6_pe(m, 7,60,24,0);
+    n6_pe(m, 8,32,42,0); n6_pe(m, 9,8,58,0); n6_pe(m, 10,0,64,0); n6_pe(m, 11,0,60,0);
+    n6_pe(m, 12,0,50,60); n6_pe(m, 13,0,0,0); n6_pe(m, 14,0,0,0); n6_pe(m, 15,0,0,0);
+    n6_pe(m, 16,152,150,152); n6_pe(m, 17,8,76,196); n6_pe(m, 18,48,50,236); n6_pe(m, 19,92,30,228);
+    n6_pe(m, 20,136,20,176); n6_pe(m, 21,160,20,100); n6_pe(m, 22,152,34,32); n6_pe(m, 23,120,60,0);
+    n6_pe(m, 24,84,90,0); n6_pe(m, 25,40,114,0); n6_pe(m, 26,8,124,0); n6_pe(m, 27,0,118,40);
+    n6_pe(m, 28,0,102,120); n6_pe(m, 29,0,0,0); n6_pe(m, 30,0,0,0); n6_pe(m, 31,0,0,0);
+    n6_pe(m, 32,236,238,236); n6_pe(m, 33,76,154,236); n6_pe(m, 34,120,124,236); n6_pe(m, 35,176,98,236);
+    n6_pe(m, 36,228,84,236); n6_pe(m, 37,236,88,180); n6_pe(m, 38,236,106,100); n6_pe(m, 39,212,136,32);
+    n6_pe(m, 40,160,170,0); n6_pe(m, 41,116,196,0); n6_pe(m, 42,76,208,32); n6_pe(m, 43,56,204,108);
+    n6_pe(m, 44,56,180,204); n6_pe(m, 45,60,60,60); n6_pe(m, 46,0,0,0); n6_pe(m, 47,0,0,0);
+    n6_pe(m, 48,236,238,236); n6_pe(m, 49,168,204,236); n6_pe(m, 50,188,188,236); n6_pe(m, 51,212,178,236);
+    n6_pe(m, 52,236,174,236); n6_pe(m, 53,236,174,212); n6_pe(m, 54,236,180,176); n6_pe(m, 55,228,196,144);
+    n6_pe(m, 56,204,210,120); n6_pe(m, 57,180,222,120); n6_pe(m, 58,168,226,144); n6_pe(m, 59,152,226,180);
+    n6_pe(m, 60,160,214,228); n6_pe(m, 61,160,162,160); n6_pe(m, 62,0,0,0); n6_pe(m, 63,0,0,0);
+    return 0;
+}
+
+fn n6_pow2(n: Int) -> Int { var p: Int = 1; var i: Int = 0; while i < n invariant i >= 0 { p = p * 2; i = i + 1; } return p; }
+fn n6_xor(a: Int, b: Int) -> Int {
+    var r: Int = 0; var i: Int = 0;
+    while i < 8 invariant i >= 0 { r = r + (a / n6_pow2(i) % 2 + b / n6_pow2(i) % 2) % 2 * n6_pow2(i); i = i + 1; }
+    return r;
+}
+
+// --- registers ---
+fn n6_a(m: Int) -> Int ! {mem} { return peek8(n6_st(m), 0); }
+fn n6_set_a(m: Int, v: Int) -> Int ! {mem} { poke8(n6_st(m), 0, v and 255); return 0; }
+fn n6_x(m: Int) -> Int ! {mem} { return peek8(n6_st(m), 1); }
+fn n6_set_x(m: Int, v: Int) -> Int ! {mem} { poke8(n6_st(m), 1, v and 255); return 0; }
+fn n6_y(m: Int) -> Int ! {mem} { return peek8(n6_st(m), 2); }
+fn n6_set_y(m: Int, v: Int) -> Int ! {mem} { poke8(n6_st(m), 2, v and 255); return 0; }
+fn n6_sp(m: Int) -> Int ! {mem} { return peek8(n6_st(m), 3); }
+fn n6_set_sp(m: Int, v: Int) -> Int ! {mem} { poke8(n6_st(m), 3, v and 255); return 0; }
+fn n6_p(m: Int) -> Int ! {mem} { return peek8(n6_st(m), 4); }
+fn n6_set_p(m: Int, v: Int) -> Int ! {mem} { poke8(n6_st(m), 4, v and 255); return 0; }
+fn n6_pc(m: Int) -> Int ! {mem} { return peek32(n6_st(m), 8); }
+fn n6_set_pc(m: Int, v: Int) -> Int ! {mem} { poke32(n6_st(m), 8, v and 65535); return 0; }
+
+// --- flags (bit: C0 Z1 I2 D3 B4 U5 V6 N7) ---
+fn n6_getf(m: Int, bit: Int) -> Int ! {mem} { return n6_p(m) / n6_pow2(bit) % 2; }
+fn n6_setf(m: Int, bit: Int, val: Int) -> Int ! {mem} {
+    let cur: Int = n6_p(m) / n6_pow2(bit) % 2;
+    if val == 1 { if cur == 0 { n6_set_p(m, n6_p(m) + n6_pow2(bit)); } }
+    if val == 0 { if cur == 1 { n6_set_p(m, n6_p(m) - n6_pow2(bit)); } }
+    return 0;
+}
+fn n6_setzn(m: Int, v: Int) -> Int ! {mem} {
+    let r: Int = v and 255;
+    if r == 0 { n6_setf(m, 1, 1); }
+    if r != 0 { n6_setf(m, 1, 0); }                              // Z
+    n6_setf(m, 7, r / 128 % 2);                                  // N
+    return 0;
+}
+
+// --- memory + PPU/OAM register MMIO (0x2000-0x2007 mirrored, 0x4014 OAMDMA) ---
+// PPU state in NST: ppu_addr@20, write-latch@24, PPUCTRL@28, PPUSTATUS@32,
+// OAMADDR@36, scroll_x@40, scroll_y@44.
+// AUTHORED UNVERIFIED (zero-python policy: no compile/sim until cc0-metal harness).
+fn n6_read(m: Int, a: Int) -> Int ! {mem} {
+    let ad: Int = a and 65535;
+    if ad >= 8192 { if ad < 16384 {
+        let reg: Int = ad % 8;
+        if reg == 2 {                                            // PPUSTATUS
+            let st: Int = peek32(n6_st(m), 32);
+            poke32(n6_st(m), 24, 0);                              // reset write latch
+            poke32(n6_st(m), 32, st and 127);                     // clear vblank
+            return st;
+        }
+        if reg == 4 { return peek8(n6_oam(m), peek32(n6_st(m), 36) and 255); }   // OAMDATA
+        if reg == 7 {                                            // PPUDATA
+            let val: Int = peek8(n6_ppu(m), peek32(n6_st(m), 20) and 16383);
+            var inc: Int = 1;
+            if (peek32(n6_st(m), 28) / 4) % 2 == 1 { inc = 32; }
+            poke32(n6_st(m), 20, (peek32(n6_st(m), 20) + inc) and 16383);
+            return val;
+        }
+        return 0;
+    } }
+    if ad == 16406 {                                             // 0x4016 controller 1 (serial)
+        let c: Int = peek32(n6_st(m), 52);
+        var bit: Int = 1;
+        if c < 8 { bit = (peek32(n6_st(m), 48) / n6_pow2(c)) % 2; }
+        poke32(n6_st(m), 52, c + 1);
+        return bit;
+    }
+    if ad == 16407 {                                             // 0x4017 controller 2 (serial)
+        let c2: Int = peek32(n6_st(m), 64);
+        var bit2: Int = 1;
+        if c2 < 8 { bit2 = (peek32(n6_st(m), 60) / n6_pow2(c2)) % 2; }
+        poke32(n6_st(m), 64, c2 + 1);
+        return bit2;
+    }
+    if ad >= 16416 { if ad < 16436 { if fds_mode(m) == 1 { return fds_reg_read(m, ad); } } }
+    return peek8(n6_mem(m), ad);
+}
+fn n6_write(m: Int, a: Int, v: Int) -> Int ! {mem} {
+    let ad: Int = a and 65535;
+    let vv: Int = v and 255;
+    if ad >= 8192 { if ad < 16384 {
+        let reg: Int = ad % 8;
+        if reg == 0 { poke32(n6_st(m), 28, vv); }                 // PPUCTRL
+        if reg == 3 { poke32(n6_st(m), 36, vv); }                 // OAMADDR
+        if reg == 4 {                                            // OAMDATA (auto-inc)
+            poke8(n6_oam(m), peek32(n6_st(m), 36) and 255, vv);
+            poke32(n6_st(m), 36, (peek32(n6_st(m), 36) + 1) and 255);
+        }
+        if reg == 5 {                                            // PPUSCROLL (two writes)
+            var sc24: Int = peek32(n6_st(m), 24);
+            if sc24 == 0 { poke32(n6_st(m), 40, vv); poke32(n6_st(m), 24, 1); }
+            if sc24 != 0 { poke32(n6_st(m), 44, vv); poke32(n6_st(m), 24, 0); }
+        }
+        if reg == 6 {                                            // PPUADDR (hi then lo)
+            var pa24: Int = peek32(n6_st(m), 24);
+            if pa24 == 0 { poke32(n6_st(m), 20, (vv and 63) * 256); poke32(n6_st(m), 24, 1); }
+            if pa24 != 0 { poke32(n6_st(m), 20, peek32(n6_st(m), 20) + vv); poke32(n6_st(m), 24, 0); }
+        }
+        if reg == 7 {                                            // PPUDATA write (auto-inc)
+            poke8(n6_ppu(m), peek32(n6_st(m), 20) and 16383, vv);
+            var inc: Int = 1;
+            if (peek32(n6_st(m), 28) / 4) % 2 == 1 { inc = 32; }
+            poke32(n6_st(m), 20, (peek32(n6_st(m), 20) + inc) and 16383);
+        }
+        return 0;
+    } }
+    if ad == 16404 {                                             // 0x4014 OAMDMA
+        var i: Int = 0;
+        while i < 256 invariant i >= 0 { poke8(n6_oam(m), i, peek8(n6_mem(m), vv * 256 + i)); i = i + 1; }
+        return 0;
+    }
+    if ad == 16406 {                                             // 0x4016 strobe -> latch both pads
+        poke32(n6_st(m), 48, n6_joy_byte(m));                       // P1 latch + reset shift
+        poke32(n6_st(m), 52, 0);
+        poke32(n6_st(m), 60, n6_joy_byte2(m));                      // P2 latch + reset shift
+        poke32(n6_st(m), 64, 0);
+        return 0;
+    }
+    if ad >= 16416 { if ad < 16436 { if fds_mode(m) == 1 { fds_reg_write(m, ad, vv); return 0; } } }
+    poke8(n6_mem(m), ad, vv);
+    return 0;
+}
+fn n6_read16(m: Int, a: Int) -> Int ! {mem} { return n6_read(m, a) + n6_read(m, a + 1) * 256; }
+fn n6_fetch(m: Int) -> Int ! {mem} { let v: Int = n6_read(m, n6_pc(m)); n6_set_pc(m, n6_pc(m) + 1); return v; }
+
+// Normalized button mask -> NES joypad serial byte order
+// A,B,Select,Start,Up,Down,Left,Right. Mask bits: 1U 2D 4L 8R 16A 32B 64Start 128Sel.
+// Port masks: P1 @ NST@16, P2 @ NST@56 (set by core_set_input_port).
+fn n6_joy_conv(m: Int) -> Int {
+    return (m / 16 % 2) + (m / 32 % 2) * 2 + (m / 128 % 2) * 4 + (m / 64 % 2) * 8
+         + (m % 2) * 16 + (m / 2 % 2) * 32 + (m / 4 % 2) * 64 + (m / 8 % 2) * 128;
+}
+fn n6_joy_byte(m: Int) -> Int ! {mem} { return n6_joy_conv(peek32(n6_st(m), 16)); }    // P1
+fn n6_joy_byte2(m: Int) -> Int ! {mem} { return n6_joy_conv(peek32(n6_st(m), 56)); }   // P2
+
+// --- stack (0x0100 + SP) ---
+fn n6_push(m: Int, v: Int) -> Int ! {mem} { n6_write(m, 256 + n6_sp(m), v); n6_set_sp(m, (n6_sp(m) - 1) and 255); return 0; }
+fn n6_pop(m: Int) -> Int ! {mem} { n6_set_sp(m, (n6_sp(m) + 1) and 255); return n6_read(m, 256 + n6_sp(m)); }
+
+// --- addressing modes -> effective address ---
+fn n6_imm(m: Int) -> Int ! {mem} { let a: Int = n6_pc(m); n6_set_pc(m, a + 1); return a; }
+fn n6_zp(m: Int) -> Int ! {mem} { return n6_fetch(m); }
+fn n6_zpx(m: Int) -> Int ! {mem} { return (n6_fetch(m) + n6_x(m)) and 255; }
+fn n6_zpy(m: Int) -> Int ! {mem} { return (n6_fetch(m) + n6_y(m)) and 255; }
+fn n6_abs(m: Int) -> Int ! {mem} { let a: Int = n6_read16(m, n6_pc(m)); n6_set_pc(m, n6_pc(m) + 2); return a; }
+fn n6_absx(m: Int) -> Int ! {mem} { let a: Int = n6_read16(m, n6_pc(m)); n6_set_pc(m, n6_pc(m) + 2); return (a + n6_x(m)) and 65535; }
+fn n6_absy(m: Int) -> Int ! {mem} { let a: Int = n6_read16(m, n6_pc(m)); n6_set_pc(m, n6_pc(m) + 2); return (a + n6_y(m)) and 65535; }
+fn n6_izx(m: Int) -> Int ! {mem} { let z: Int = (n6_fetch(m) + n6_x(m)) and 255; return n6_read(m, z) + n6_read(m, (z + 1) and 255) * 256; }
+fn n6_izy(m: Int) -> Int ! {mem} { let z: Int = n6_fetch(m); return (n6_read(m, z) + n6_read(m, (z + 1) and 255) * 256 + n6_y(m)) and 65535; }
+
+// --- operations ---
+fn n6_lda(m: Int, addr: Int) -> Int ! {mem} { n6_set_a(m, n6_read(m, addr)); n6_setzn(m, n6_a(m)); return 0; }
+fn n6_ldx(m: Int, addr: Int) -> Int ! {mem} { n6_set_x(m, n6_read(m, addr)); n6_setzn(m, n6_x(m)); return 0; }
+fn n6_ldy(m: Int, addr: Int) -> Int ! {mem} { n6_set_y(m, n6_read(m, addr)); n6_setzn(m, n6_y(m)); return 0; }
+fn n6_adc(m: Int, addr: Int) -> Int ! {mem} {
+    let v: Int = n6_read(m, addr); let s: Int = n6_a(m) + v + n6_getf(m, 0);
+    var ov: Int = 0;
+    if n6_a(m) / 128 % 2 == v / 128 % 2 { if n6_a(m) / 128 % 2 != (s and 128) / 128 { ov = 1; } }
+    n6_setf(m, 6, ov);
+    if s > 255 { n6_setf(m, 0, 1); }
+    if s <= 255 { n6_setf(m, 0, 0); }
+    n6_set_a(m, s); n6_setzn(m, n6_a(m)); return 0;
+}
+fn n6_sbc(m: Int, addr: Int) -> Int ! {mem} {
+    let v: Int = n6_read(m, addr); let s: Int = n6_a(m) - v - (1 - n6_getf(m, 0));
+    var ov: Int = 0;
+    if n6_a(m) / 128 % 2 != v / 128 % 2 { if n6_a(m) / 128 % 2 != (s and 128) / 128 { ov = 1; } }
+    n6_setf(m, 6, ov);
+    if s >= 0 { n6_setf(m, 0, 1); }
+    if s < 0 { n6_setf(m, 0, 0); }
+    n6_set_a(m, s); n6_setzn(m, n6_a(m)); return 0;
+}
+fn n6_and(m: Int, addr: Int) -> Int ! {mem} { n6_set_a(m, n6_a(m) and n6_read(m, addr)); n6_setzn(m, n6_a(m)); return 0; }
+fn n6_ora(m: Int, addr: Int) -> Int ! {mem} { n6_set_a(m, n6_a(m) or n6_read(m, addr)); n6_setzn(m, n6_a(m)); return 0; }
+fn n6_eor(m: Int, addr: Int) -> Int ! {mem} { n6_set_a(m, n6_xor(n6_a(m), n6_read(m, addr))); n6_setzn(m, n6_a(m)); return 0; }
+fn n6_cmp_r(m: Int, r: Int, addr: Int) -> Int ! {mem} {
+    let v: Int = n6_read(m, addr); let d: Int = r - v;
+    if r >= v { n6_setf(m, 0, 1); }
+    if r < v { n6_setf(m, 0, 0); }
+    n6_setzn(m, d); return 0;
+}
+fn n6_bit(m: Int, addr: Int) -> Int ! {mem} {
+    let v: Int = n6_read(m, addr);
+    if (n6_a(m) and v) == 0 { n6_setf(m, 1, 1); }
+    if (n6_a(m) and v) != 0 { n6_setf(m, 1, 0); }
+    n6_setf(m, 7, v / 128 % 2); n6_setf(m, 6, v / 64 % 2); return 0;
+}
+fn n6_inc(m: Int, addr: Int) -> Int ! {mem} { let v: Int = (n6_read(m, addr) + 1) and 255; n6_write(m, addr, v); n6_setzn(m, v); return 0; }
+fn n6_dec(m: Int, addr: Int) -> Int ! {mem} { let v: Int = (n6_read(m, addr) - 1) and 255; n6_write(m, addr, v); n6_setzn(m, v); return 0; }
+// shifts on memory; accumulator variants pass addr=-1 handled by caller
+fn n6_asl_v(m: Int, v: Int) -> Int ! {mem} { n6_setf(m, 0, v / 128 % 2); let r: Int = (v * 2) and 255; n6_setzn(m, r); return r; }
+fn n6_lsr_v(m: Int, v: Int) -> Int ! {mem} { n6_setf(m, 0, v % 2); let r: Int = v / 2; n6_setzn(m, r); return r; }
+fn n6_rol_v(m: Int, v: Int) -> Int ! {mem} { let c: Int = n6_getf(m, 0); n6_setf(m, 0, v / 128 % 2); let r: Int = (v * 2 + c) and 255; n6_setzn(m, r); return r; }
+fn n6_ror_v(m: Int, v: Int) -> Int ! {mem} { let c: Int = n6_getf(m, 0); n6_setf(m, 0, v % 2); let r: Int = v / 2 + c * 128; n6_setzn(m, r); return r; }
+fn n6_branch(m: Int, cond: Int) -> Int ! {mem} {
+    let off: Int = n6_fetch(m);
+    if cond == 1 {
+        var d: Int = off; if off > 127 { d = off - 256; }
+        n6_set_pc(m, (n6_pc(m) + d) and 65535);
+    }
+    return 0;
+}
+
+// --- one instruction ---
+fn n6_step(m: Int) -> Int ! {mem} {
+    let op: Int = n6_fetch(m);
+    // LDA
+    if op == 169 { n6_lda(m, n6_imm(m)); return 2; }
+    if op == 165 { n6_lda(m, n6_zp(m)); return 3; }
+    if op == 181 { n6_lda(m, n6_zpx(m)); return 4; }
+    if op == 173 { n6_lda(m, n6_abs(m)); return 4; }
+    if op == 189 { n6_lda(m, n6_absx(m)); return 4; }
+    if op == 185 { n6_lda(m, n6_absy(m)); return 4; }
+    if op == 161 { n6_lda(m, n6_izx(m)); return 6; }
+    if op == 177 { n6_lda(m, n6_izy(m)); return 5; }
+    // LDX
+    if op == 162 { n6_ldx(m, n6_imm(m)); return 2; }
+    if op == 166 { n6_ldx(m, n6_zp(m)); return 3; }
+    if op == 182 { n6_ldx(m, n6_zpy(m)); return 4; }
+    if op == 174 { n6_ldx(m, n6_abs(m)); return 4; }
+    if op == 190 { n6_ldx(m, n6_absy(m)); return 4; }
+    // LDY
+    if op == 160 { n6_ldy(m, n6_imm(m)); return 2; }
+    if op == 164 { n6_ldy(m, n6_zp(m)); return 3; }
+    if op == 180 { n6_ldy(m, n6_zpx(m)); return 4; }
+    if op == 172 { n6_ldy(m, n6_abs(m)); return 4; }
+    if op == 188 { n6_ldy(m, n6_absx(m)); return 4; }
+    // STA
+    if op == 133 { n6_write(m, n6_zp(m), n6_a(m)); return 3; }
+    if op == 149 { n6_write(m, n6_zpx(m), n6_a(m)); return 4; }
+    if op == 141 { n6_write(m, n6_abs(m), n6_a(m)); return 4; }
+    if op == 157 { n6_write(m, n6_absx(m), n6_a(m)); return 5; }
+    if op == 153 { n6_write(m, n6_absy(m), n6_a(m)); return 5; }
+    if op == 129 { n6_write(m, n6_izx(m), n6_a(m)); return 6; }
+    if op == 145 { n6_write(m, n6_izy(m), n6_a(m)); return 6; }
+    // STX / STY
+    if op == 134 { n6_write(m, n6_zp(m), n6_x(m)); return 3; }
+    if op == 150 { n6_write(m, n6_zpy(m), n6_x(m)); return 4; }
+    if op == 142 { n6_write(m, n6_abs(m), n6_x(m)); return 4; }
+    if op == 132 { n6_write(m, n6_zp(m), n6_y(m)); return 3; }
+    if op == 148 { n6_write(m, n6_zpx(m), n6_y(m)); return 4; }
+    if op == 140 { n6_write(m, n6_abs(m), n6_y(m)); return 4; }
+    // ADC
+    if op == 105 { n6_adc(m, n6_imm(m)); return 2; }
+    if op == 101 { n6_adc(m, n6_zp(m)); return 3; }
+    if op == 117 { n6_adc(m, n6_zpx(m)); return 4; }
+    if op == 109 { n6_adc(m, n6_abs(m)); return 4; }
+    if op == 125 { n6_adc(m, n6_absx(m)); return 4; }
+    if op == 121 { n6_adc(m, n6_absy(m)); return 4; }
+    if op == 97 { n6_adc(m, n6_izx(m)); return 6; }
+    if op == 113 { n6_adc(m, n6_izy(m)); return 5; }
+    // SBC
+    if op == 233 { n6_sbc(m, n6_imm(m)); return 2; }
+    if op == 229 { n6_sbc(m, n6_zp(m)); return 3; }
+    if op == 245 { n6_sbc(m, n6_zpx(m)); return 4; }
+    if op == 237 { n6_sbc(m, n6_abs(m)); return 4; }
+    if op == 253 { n6_sbc(m, n6_absx(m)); return 4; }
+    if op == 249 { n6_sbc(m, n6_absy(m)); return 4; }
+    if op == 225 { n6_sbc(m, n6_izx(m)); return 6; }
+    if op == 241 { n6_sbc(m, n6_izy(m)); return 5; }
+    // AND / ORA / EOR (imm/zp/abs + indexed common ones)
+    if op == 41 { n6_and(m, n6_imm(m)); return 2; }
+    if op == 37 { n6_and(m, n6_zp(m)); return 3; }
+    if op == 45 { n6_and(m, n6_abs(m)); return 4; }
+    if op == 61 { n6_and(m, n6_absx(m)); return 4; }
+    if op == 9 { n6_ora(m, n6_imm(m)); return 2; }
+    if op == 5 { n6_ora(m, n6_zp(m)); return 3; }
+    if op == 13 { n6_ora(m, n6_abs(m)); return 4; }
+    if op == 29 { n6_ora(m, n6_absx(m)); return 4; }
+    if op == 73 { n6_eor(m, n6_imm(m)); return 2; }
+    if op == 69 { n6_eor(m, n6_zp(m)); return 3; }
+    if op == 77 { n6_eor(m, n6_abs(m)); return 4; }
+    // CMP / CPX / CPY
+    if op == 201 { n6_cmp_r(m, n6_a(m), n6_imm(m)); return 2; }
+    if op == 197 { n6_cmp_r(m, n6_a(m), n6_zp(m)); return 3; }
+    if op == 205 { n6_cmp_r(m, n6_a(m), n6_abs(m)); return 4; }
+    if op == 224 { n6_cmp_r(m, n6_x(m), n6_imm(m)); return 2; }
+    if op == 228 { n6_cmp_r(m, n6_x(m), n6_zp(m)); return 3; }
+    if op == 192 { n6_cmp_r(m, n6_y(m), n6_imm(m)); return 2; }
+    if op == 196 { n6_cmp_r(m, n6_y(m), n6_zp(m)); return 3; }
+    // BIT
+    if op == 36 { n6_bit(m, n6_zp(m)); return 3; }
+    if op == 44 { n6_bit(m, n6_abs(m)); return 4; }
+    // INC / DEC
+    if op == 230 { n6_inc(m, n6_zp(m)); return 5; }
+    if op == 238 { n6_inc(m, n6_abs(m)); return 6; }
+    if op == 198 { n6_dec(m, n6_zp(m)); return 5; }
+    if op == 206 { n6_dec(m, n6_abs(m)); return 6; }
+    // INX/DEX/INY/DEY
+    if op == 232 { n6_set_x(m, (n6_x(m) + 1) and 255); n6_setzn(m, n6_x(m)); return 2; }
+    if op == 202 { n6_set_x(m, (n6_x(m) - 1) and 255); n6_setzn(m, n6_x(m)); return 2; }
+    if op == 200 { n6_set_y(m, (n6_y(m) + 1) and 255); n6_setzn(m, n6_y(m)); return 2; }
+    if op == 136 { n6_set_y(m, (n6_y(m) - 1) and 255); n6_setzn(m, n6_y(m)); return 2; }
+    // shifts on A
+    if op == 10 { n6_set_a(m, n6_asl_v(m, n6_a(m))); return 2; }
+    if op == 74 { n6_set_a(m, n6_lsr_v(m, n6_a(m))); return 2; }
+    if op == 42 { n6_set_a(m, n6_rol_v(m, n6_a(m))); return 2; }
+    if op == 106 { n6_set_a(m, n6_ror_v(m, n6_a(m))); return 2; }
+    // shifts on memory (zp/abs)
+    if op == 6 { let ad: Int = n6_zp(m); n6_write(m, ad, n6_asl_v(m, n6_read(m, ad))); return 5; }
+    if op == 14 { let ad: Int = n6_abs(m); n6_write(m, ad, n6_asl_v(m, n6_read(m, ad))); return 6; }
+    if op == 70 { let ad: Int = n6_zp(m); n6_write(m, ad, n6_lsr_v(m, n6_read(m, ad))); return 5; }
+    if op == 78 { let ad: Int = n6_abs(m); n6_write(m, ad, n6_lsr_v(m, n6_read(m, ad))); return 6; }
+    if op == 38 { let ad: Int = n6_zp(m); n6_write(m, ad, n6_rol_v(m, n6_read(m, ad))); return 5; }
+    if op == 46 { let ad: Int = n6_abs(m); n6_write(m, ad, n6_rol_v(m, n6_read(m, ad))); return 6; }
+    if op == 102 { let ad: Int = n6_zp(m); n6_write(m, ad, n6_ror_v(m, n6_read(m, ad))); return 5; }
+    if op == 110 { let ad: Int = n6_abs(m); n6_write(m, ad, n6_ror_v(m, n6_read(m, ad))); return 6; }
+    // transfers
+    if op == 170 { n6_set_x(m, n6_a(m)); n6_setzn(m, n6_x(m)); return 2; }   // TAX
+    if op == 168 { n6_set_y(m, n6_a(m)); n6_setzn(m, n6_y(m)); return 2; }   // TAY
+    if op == 138 { n6_set_a(m, n6_x(m)); n6_setzn(m, n6_a(m)); return 2; }   // TXA
+    if op == 152 { n6_set_a(m, n6_y(m)); n6_setzn(m, n6_a(m)); return 2; }   // TYA
+    if op == 186 { n6_set_x(m, n6_sp(m)); n6_setzn(m, n6_x(m)); return 2; }  // TSX
+    if op == 154 { n6_set_sp(m, n6_x(m)); return 2; }                    // TXS
+    // stack
+    if op == 72 { n6_push(m, n6_a(m)); return 3; }                       // PHA
+    if op == 104 { n6_set_a(m, n6_pop(m)); n6_setzn(m, n6_a(m)); return 4; } // PLA
+    if op == 8 { n6_push(m, n6_p(m) or 48); return 3; }                  // PHP (B,U set)
+    if op == 40 { n6_set_p(m, n6_pop(m)); return 4; }                    // PLP
+    // branches (BPL BMI BVC BVS BCC BCS BNE BEQ)
+    if op == 16 { n6_branch(m, 1 - n6_getf(m, 7)); return 2; }
+    if op == 48 { n6_branch(m, n6_getf(m, 7)); return 2; }
+    if op == 80 { n6_branch(m, 1 - n6_getf(m, 6)); return 2; }
+    if op == 112 { n6_branch(m, n6_getf(m, 6)); return 2; }
+    if op == 144 { n6_branch(m, 1 - n6_getf(m, 0)); return 2; }
+    if op == 176 { n6_branch(m, n6_getf(m, 0)); return 2; }
+    if op == 208 { n6_branch(m, 1 - n6_getf(m, 1)); return 2; }
+    if op == 240 { n6_branch(m, n6_getf(m, 1)); return 2; }
+    // JMP / JSR / RTS / RTI / BRK
+    if op == 76 { n6_set_pc(m, n6_abs(m)); return 3; }                   // JMP abs
+    if op == 108 {                                                  // JMP (ind) with page-bug
+        let ptr: Int = n6_read16(m, n6_pc(m)); n6_set_pc(m, n6_pc(m) + 2);
+        let lo: Int = n6_read(m, ptr);
+        let hi: Int = n6_read(m, (ptr and 65280) + ((ptr + 1) and 255));
+        n6_set_pc(m, lo + hi * 256); return 5;
+    }
+    if op == 32 {                                                  // JSR
+        let t: Int = n6_read16(m, n6_pc(m)); let ret: Int = (n6_pc(m) + 1) and 65535;
+        n6_push(m, (ret / 256) and 255); n6_push(m, ret and 255); n6_set_pc(m, t); return 6;
+    }
+    if op == 96 { let lo: Int = n6_pop(m); let hi: Int = n6_pop(m); n6_set_pc(m, ((hi * 256 + lo) + 1) and 65535); return 6; }  // RTS
+    if op == 64 { n6_set_p(m, n6_pop(m)); let lo: Int = n6_pop(m); let hi: Int = n6_pop(m); n6_set_pc(m, hi * 256 + lo); return 6; }  // RTI
+    if op == 0 { n6_set_pc(m, (n6_pc(m) + 1) and 65535); n6_setf(m, 2, 1); return 7; }   // BRK (simplified)
+    // flag ops
+    if op == 24 { n6_setf(m, 0, 0); return 2; }   // CLC
+    if op == 56 { n6_setf(m, 0, 1); return 2; }   // SEC
+    if op == 88 { n6_setf(m, 2, 0); return 2; }   // CLI
+    if op == 120 { n6_setf(m, 2, 1); return 2; }  // SEI
+    if op == 184 { n6_setf(m, 6, 0); return 2; }  // CLV
+    if op == 216 { n6_setf(m, 3, 0); return 2; }  // CLD
+    if op == 248 { n6_setf(m, 3, 1); return 2; }  // SED
+    // NOP and unimplemented
+    return 2;
+}
+
+// --- PPU: background renderer (first increment) ---
+// Reads CHR pattern data (PPU 0x0000) + the nametable (PPU 0x2000) and renders
+// the 256x240 BG. Maps the 2-bit pattern to 4 shades for now; the full 64-color
+// NES palette LUT + attribute-table palette selection + sprites are next.
+// Per-tile BG render: nametable/attribute read once per 8x8 tile, pattern bytes
+// once per tile-row, bits extracted by left-shift (no per-pixel pow2). Resolves
+// pattern (2bpp) + attribute palette -> palette RAM (0x3F00) -> 64-color LUT.
+fn n6_render(m: Int) -> Int ! {mem} {
+    let ppu: Int = n6_ppu(m);
+    var cy: Int = 0;
+    while cy < 30 invariant cy >= 0 {
+        var cx: Int = 0;
+        while cx < 32 invariant cx >= 0 {
+            let tile: Int = peek8(ppu, 8192 + cy * 32 + cx);
+            let attr: Int = peek8(ppu, 9152 + (cy / 4) * 8 + (cx / 4));
+            let phi: Int = attr / n6_pow2(((cy % 4 / 2) * 2 + (cx % 4 / 2)) * 2) % 4;
+            var r: Int = 0;
+            while r < 8 invariant r >= 0 {
+                var lb: Int = peek8(ppu, tile * 16 + r);
+                var hb: Int = peek8(ppu, tile * 16 + r + 8);
+                let base: Int = ((cy * 8 + r) * 256 + cx * 8) * 4;
+                var c: Int = 0;
+                while c < 8 invariant c >= 0 {
+                    let pat: Int = lb / 128 % 2 + hb / 128 % 2 * 2;
+                    var palidx: Int = 0;
+                    if pat != 0 { palidx = phi * 4 + pat; }
+                    poke32(n6_fb(m), base + c * 4, n6_palcol(m, peek8(ppu, 16128 + palidx)));
+                    lb = (lb * 2) and 255; hb = (hb * 2) and 255;
+                    c = c + 1;
+                }
+                r = r + 1;
+            }
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+    n6_render_sprites(m);
+    return 0;
+}
+
+// Sprite (OAM) pass: 64 entries {Y, tile, attr, X} over the BG, drawn 63->0 so
+// sprite 0 is on top. Color 0 = transparent; H/V flip; sprite palettes at 0x3F10.
+// Bounded (<=64*64 px) so per-pixel pow2 is fine here. 8x8 mode (8x16 next).
+fn n6_render_sprites(m: Int) -> Int ! {mem} {
+    let oam: Int = n6_oam(m);
+    var pbase: Int = 0;
+    if peek32(n6_st(m), 28) / 8 % 2 == 1 { pbase = 4096; }    // PPUCTRL bit3 -> sprite pattern table
+    var k: Int = 0;
+    while k < 64 invariant k >= 0 {
+        let s: Int = 63 - k;
+        let sy: Int = peek8(oam, s * 4) + 1;
+        let tile: Int = peek8(oam, s * 4 + 1);
+        let attr: Int = peek8(oam, s * 4 + 2);
+        let sx: Int = peek8(oam, s * 4 + 3);
+        let pal: Int = attr % 4;
+        var row: Int = 0;
+        while row < 8 invariant row >= 0 {
+            var tr: Int = row;
+            if attr / 128 % 2 == 1 { tr = 7 - row; }         // V flip
+            let lo: Int = peek8(n6_ppu(m), pbase + tile * 16 + tr);
+            let hi: Int = peek8(n6_ppu(m), pbase + tile * 16 + tr + 8);
+            var col: Int = 0;
+            while col < 8 invariant col >= 0 {
+                var bit: Int = 7 - col;
+                if attr / 64 % 2 == 1 { bit = col; }         // H flip
+                let pat: Int = lo / n6_pow2(bit) % 2 + hi / n6_pow2(bit) % 2 * 2;
+                let py: Int = sy + row; let px: Int = sx + col;
+                var draw: Int = 1;
+                if pat == 0 { draw = 0; }
+                if py >= 240 { draw = 0; }
+                if px >= 256 { draw = 0; }
+                if draw == 1 { poke32(n6_fb(m), (py * 256 + px) * 4, n6_palcol(m, peek8(n6_ppu(m), 16144 + pal * 4 + pat))); }
+                col = col + 1;
+            }
+            row = row + 1;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// --- core ABI (CPU + BG/sprite PPU; APU + mappers + PPU MMIO next) ---
+// core_id/core_fb/core_fb_w/core_fb_h/core_load/core_set_input(_port)/core_run_frame/
+// core_savestate/core_loadstate/core_savestate_size split into cores/nes_abi.sg
+// (sigil-Retropie#13 — cores/fds.sg supplies its own complete versions of all of
+// these for the Famicom Disk System; cc0 has no first-def-wins, matching Director's
+// cores/m68k.sg ruling). Link nes_abi.sg for standalone NES only.
+fn core_rom_max() -> Int { return 524288; }
+fn core_max_players() -> Int { return 2; }
+
+// --- save state (cross-cutting runtime ABI, same shape as the other cores) ---
+// Snapshot the mutable machine state: CPU+PPU registers (n6_st), CPU RAM + PRG-RAM
+// ($0000-$8000 of n6_mem; $8000+ is ROM-mapped), PPU VRAM/nametables/palette (16KB), and
+// OAM. CHR-ROM patterns that are constant get copied harmlessly; CHR-RAM is captured.
+fn n6_copy(m: Int, dst: Int, doff: Int, src: Int, soff: Int, len: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < len invariant i >= 0 { poke8(dst, doff + i, peek8(src, soff + i)); i = i + 1; }
+    return 0;
+}
+fn core_state_size() -> Int { return 49472; }            // 64 + 32768 + 16384 + 256
+fn core_save_state(m: Int, buf: Int) -> Int ! {mem} {
+    n6_copy(m, buf, 0, n6_st(m), 0, 64);
+    n6_copy(m, buf, 64, n6_mem(m), 0, 32768);
+    n6_copy(m, buf, 32832, n6_ppu(m), 0, 16384);
+    n6_copy(m, buf, 49216, n6_oam(m), 0, 256);
+    return core_state_size();
+}
+fn core_load_state(m: Int, buf: Int) -> Int ! {mem} {
+    n6_copy(m, n6_st(m), 0, buf, 0, 64);
+    n6_copy(m, n6_mem(m), 0, buf, 64, 32768);
+    n6_copy(m, n6_ppu(m), 0, buf, 32832, 16384);
+    n6_copy(m, n6_oam(m), 0, buf, 49216, 256);
+    return 0;
+}
+
+// core_savestate/core_loadstate/core_savestate_size (delegating to core_save_state/
+// core_load_state/core_state_size above) also moved to cores/nes_abi.sg — see that
+// file's header for the fix history (2026-07-01 rewind completeness fix) and the
+// sigil-Retropie#13 split rationale.

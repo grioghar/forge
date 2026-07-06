@@ -1,0 +1,72 @@
+// cores/genesis_abi.sg — the Genesis Core ABI plumbing (core_load/core_run_frame/core_savestate/...),
+// split out of cores/genesis.sg per the single-definition-with-dispatch fix (Director ruling — no
+// first-def-wins cross-file shadowing). core_id is NOT here (see cores/genesis_id.sg) since it's the
+// one piece every reusing system sets differently. Link genesis_abi.sg for any system that wants
+// Genesis's ABI as-is (standalone Genesis, Sega Pico); pair it with genesis_id.sg unless the system
+// supplies its own core_id (Pico does). A system that needs its OWN full Core ABI — the Sega CD, which
+// time-slices a 2nd 68000 — links cores/genesis.sg WITHOUT genesis_abi.sg and supplies every core_*
+// itself (see cores/segacd.sg). Never link two providers of the same core_* function together.
+fn core_rom_max() -> Int { return 4194304; }               // 4 MB cartridge
+fn core_fb(m: Int) -> Int { return gn_fb(m); }
+fn core_fb_w() -> Int { return 320; }
+fn core_fb_h() -> Int { return 224; }
+
+fn core_load(m: Int, rom: Int, len: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < len invariant i >= 0 { poke8(gn_rom(m), i, peek8(rom, i)); i = i + 1; }
+    var s: Int = 0;                                        // clear CPU regs + input + VDP state
+    while s < 120 invariant s >= 0 { poke8(gn_st(m), s, 0); s = s + 1; }
+    gn_set_a(m, 7, gn_read32(m, 0));                              // initial SSP = ROM[$000000]
+    gn_set_pc(m, gn_read32(m, 4));                                // initial PC  = ROM[$000004]
+    gn_set_sr(m, 9216);                                        // S=1, I=7 (supervisor, ints masked) = $2700
+    return 1;
+}
+
+fn core_set_input_port(m: Int, port: Int, buttons: Int) -> Int ! {mem} {
+    if port == 0 { poke32(gn_st(m), 72, buttons); return 0; }  // P1 @ gn_st+72
+    if port == 1 { poke32(gn_st(m), 76, buttons); return 0; }  // P2 @ gn_st+76
+    return 0;
+}
+fn core_set_input(m: Int, buttons: Int) -> Int ! {mem} { return core_set_input_port(m, 0, buttons); }
+fn core_run_frame(m: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 6000 invariant i >= 0 { gn_step(m); i = i + 1; }   // run CPU (no cycle count yet)
+    gn_clear(m, gn_cram_color(m, gn_vreg(m, 7) and 63));                 // backdrop = reg7 color
+    gn_render_plane_b(m);                                        // plane B (back)
+    gn_render_plane_a(m);                                        // plane A (front, over B)
+    gn_render_sprites(m);                                        // sprites (over planes)
+    return 0;
+}
+
+// --- save state (cross-cutting runtime ABI) — includes the YM2612 + PSG sound state ---
+// Full Genesis machine: WRAM (64KB), gn_st (68000 regs + VDP regs/addr/latch + input),
+// VRAM (64KB), CRAM, VSRAM — AND the sound side: ym_reg (FM register file) + ym_st (FM
+// chan/op/EG state) + psg_st (PSG channels/LFSR). ROM constant; fb re-rendered.
+fn core_state_size() -> Int { return 132416; }
+fn core_save_state(m: Int, buf: Int) -> Int ! {mem} {
+    gn_copy(m, buf, 0, gn_wram(m), 0, 65536);
+    gn_copy(m, buf, 65536, gn_st(m), 0, 256);
+    gn_copy(m, buf, 65792, gn_vram(m), 0, 65536);
+    gn_copy(m, buf, 131328, gn_cram(m), 0, 128);
+    gn_copy(m, buf, 131456, gn_vsram(m), 0, 128);
+    gn_copy(m, buf, 131584, ym_reg(m), 0, 512);
+    gn_copy(m, buf, 132096, ym_st(m), 0, 256);
+    gn_copy(m, buf, 132352, psg_st(m), 0, 64);
+    return core_state_size();
+}
+fn core_load_state(m: Int, buf: Int) -> Int ! {mem} {
+    gn_copy(m, gn_wram(m), 0, buf, 0, 65536);
+    gn_copy(m, gn_st(m), 0, buf, 65536, 256);
+    gn_copy(m, gn_vram(m), 0, buf, 65792, 65536);
+    gn_copy(m, gn_cram(m), 0, buf, 131328, 128);
+    gn_copy(m, gn_vsram(m), 0, buf, 131456, 128);
+    gn_copy(m, ym_reg(m), 0, buf, 131584, 512);
+    gn_copy(m, ym_st(m), 0, buf, 132096, 256);
+    gn_copy(m, psg_st(m), 0, buf, 132352, 64);
+    return 0;
+}
+
+// New ABI wrappers (delegates to core_save_state/core_load_state/core_state_size above)
+fn core_savestate(m: Int, dst: Int) -> Int ! {mem} { return core_save_state(m, dst); }
+fn core_loadstate(m: Int, src: Int) -> Int ! {mem} { core_load_state(m, src); return 0; }
+fn core_savestate_size() -> Int { return 132416; }

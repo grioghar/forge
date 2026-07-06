@@ -1,0 +1,676 @@
+{
+  "catalog_version": 1,
+  "distribution": "thin",
+  "generated_from": "apps/ (arm-el0, cc0 sha 0993a466)",
+  "endpoint": "forge.sigilos.grio.co/catalog.json",
+  "note": "signed: false \u2014 .sigpkg signing pending the App Store dev-cert pipeline reaching core packages (Apps/authority issues certs, FS owns the .sigpkg format, cc0 verifies). This manifest lists blob identity (sha256) so a future signed .sigpkg can be verified against it once issued.",
+  "core_count": 74,
+  "cores": [
+    {
+      "id": "3do",
+      "name": "3DO Interactive Multiplayer",
+      "rom_ext": ".iso",
+      "size_bytes": 12872,
+      "blob_sha256": "5c5d77e1b8640ba1eb0fdc779780b9879e64c94cb91794a6d557669d5a857655",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "amiga",
+      "name": "Commodore Amiga",
+      "rom_ext": ".adf",
+      "size_bytes": 48344,
+      "blob_sha256": "95ff47508ae9cb6ff843d3a130acc440912e59012c5fa2c3e88c0ded4b906c53",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "apple2",
+      "name": "Apple II / IIe",
+      "rom_ext": ".dsk",
+      "size_bytes": 41624,
+      "blob_sha256": "04b8c7fad03b950d1cf10ca1d442245009bad4d884029c1189f097c62e77aa84",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "arcade",
+      "name": "Arcade (Namco / Capcom / SNK)",
+      "rom_ext": ".zip",
+      "size_bytes": 42552,
+      "blob_sha256": "550a59fd359c358f040399241a5a0dc78587dd8714024c93d8bd7767f35da368",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "atari",
+      "name": "Atari 2600 / VCS",
+      "rom_ext": ".a26",
+      "size_bytes": 45680,
+      "blob_sha256": "bad5cb52d759cc01d4f26a7aaa0599e7a12e9a9fe3ccb35cad2c170713332a3b",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "atari5200",
+      "name": "Atari 5200",
+      "rom_ext": ".a52",
+      "size_bytes": 43720,
+      "blob_sha256": "fbedd695bdf7b301830cb4de2693e2a84a2a3ac4886a749662ae148b560cca9b",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "atari7800",
+      "name": "Atari 7800 ProSystem",
+      "rom_ext": ".a78",
+      "size_bytes": 48272,
+      "blob_sha256": "76afc278f9103af1df2bbb50e91831353a9b01651049214f6b218975db457177",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "atari800",
+      "name": "Atari 8-bit (400/800/XL/XE)",
+      "rom_ext": ".xex",
+      "size_bytes": 38560,
+      "blob_sha256": "e27d97b6223e9f3648ba4b5277ca817f96f4082546e3fa9423c65a68dcc04785",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "atari_st",
+      "name": "Atari ST / STE",
+      "rom_ext": ".st",
+      "size_bytes": 37448,
+      "blob_sha256": "b75a76426f0822f3c3f22b0056a1dbe5acaa45a8a7c5681a5e45ad3bfcf4bad7",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "bbc",
+      "name": "Acorn BBC Micro Model B",
+      "rom_ext": ".rom",
+      "size_bytes": 34272,
+      "blob_sha256": "95b15521a5e475e82c1c93e5d544f639f1a0f4b8a4a17de4bd4aef2e2446b828",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "c64",
+      "name": "Commodore 64",
+      "rom_ext": ".prg",
+      "size_bytes": 43400,
+      "blob_sha256": "1bfdbb15c43ace4989b6ec7a6decd1e0539434706347218607e3ec8ddaea0ebf",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "channel_f",
+      "name": "Fairchild Channel F",
+      "rom_ext": ".chf",
+      "size_bytes": 10416,
+      "blob_sha256": "adc70bb9883964e32b27d34af0d9f64f5ebcbbb34b94d2c13235154e666f7ed1",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "chip8",
+      "name": "CHIP-8 / SUPER-CHIP",
+      "rom_ext": ".ch8",
+      "size_bytes": 14896,
+      "blob_sha256": "391825a8fb8dab9831448530a3d7176ad23e7c170a95d58eb9f91c1e06473ab7",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "coleco",
+      "name": "ColecoVision",
+      "rom_ext": ".col",
+      "size_bytes": 42328,
+      "blob_sha256": "a4e9c44c366fb1d6221d8950a061f7b390e00cc8670c296e7106223c38a6e379",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "cpc",
+      "name": "Amstrad CPC 464/664/6128",
+      "rom_ext": ".dsk",
+      "size_bytes": 37648,
+      "blob_sha256": "617c3e7652fa3cf353e237543e22f6e02fc0c723d1691f6fa6f10c2e5eb10777",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "cps",
+      "name": "Capcom CPS-1",
+      "rom_ext": ".cps",
+      "size_bytes": 35776,
+      "blob_sha256": "7d329b221827ebf6c05afbd9ac03b449e80d378c14968e0685e4921c02f04fc3",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "cps2",
+      "name": "Capcom CPS-2",
+      "rom_ext": ".cps",
+      "size_bytes": 37440,
+      "blob_sha256": "b63adeba0c66bdfb82e779dbbcb54a5ee602d9975e6f9e579bc777b1672eda87",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "cps3",
+      "name": "Capcom CPS-3",
+      "rom_ext": ".cps",
+      "size_bytes": 34200,
+      "blob_sha256": "39b3bf9601fc544dd8e2f861377b5f6a0f8aacf17ef199760208897657e25dc3",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "dos",
+      "name": "MS-DOS / x86 PC",
+      "rom_ext": ".exe",
+      "size_bytes": 133656,
+      "blob_sha256": "2474e350f049c13ed46d6e338d9c335c2686b57c111a7a6ba98c706e7f4c73c0",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "dragon32",
+      "name": "Dragon 32/64",
+      "rom_ext": ".cas",
+      "size_bytes": 10800,
+      "blob_sha256": "7396fff18f31106c073511262c0bfac647013cd1f14909e4373a3a6999fad592",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "dreamcast",
+      "name": "Sega Dreamcast",
+      "rom_ext": ".bin",
+      "size_bytes": 19296,
+      "blob_sha256": "5bc0bf4f384cb63a98465c54ac63d48bf900a46447e328808401114b38a90e34",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "electron",
+      "name": "Acorn Electron",
+      "rom_ext": ".rom",
+      "size_bytes": 12512,
+      "blob_sha256": "0632869593100d8087cd8622ddbc90ae4e05ebebabb5eaae36a6dcae6270b411",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "fds",
+      "name": "Famicom Disk System",
+      "rom_ext": ".fds",
+      "size_bytes": 91536,
+      "blob_sha256": "6679a9cb0dbc183c24cf33df3c081e66ce11ab60d3bed8e9a618884f9f2b2d25",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "gamecube",
+      "name": "Nintendo GameCube",
+      "rom_ext": ".iso",
+      "size_bytes": 22912,
+      "blob_sha256": "20e4c9e37de8a864b443a115147ce9d4ecc8a737795ea68df55b540f08a2d0f3",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "gamegear",
+      "name": "Sega Game Gear",
+      "rom_ext": ".gg",
+      "size_bytes": 48496,
+      "blob_sha256": "d00c92ce68f15b3c10b468313d7dfcb364152635418a918a08a8aed5cd69cab7",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "gb",
+      "name": "Nintendo Game Boy",
+      "rom_ext": ".gb",
+      "size_bytes": 52368,
+      "blob_sha256": "14c23311f13ccbb1abf7afe2c44d9092fadcebb4583c60e79191a28dcb49b874",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "gba",
+      "name": "Nintendo Game Boy Advance",
+      "rom_ext": ".gba",
+      "size_bytes": 24872,
+      "blob_sha256": "1e448e23df7ee1e862818f9fcc1c3f8c388ba888b90cba38d4c0b957b9a87968",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "gbc",
+      "name": "Nintendo Game Boy Color",
+      "rom_ext": ".gbc",
+      "size_bytes": 51432,
+      "blob_sha256": "d55fc42494b18f3d99397a402c719e90b016a4f263588012e376e0512742eb9a",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "genesis",
+      "name": "Sega Genesis / Mega Drive",
+      "rom_ext": ".md",
+      "size_bytes": 46072,
+      "blob_sha256": "4ea7c06ad28353c59ccaad16661dfa1ceeb41313740224dc20a777b5f056d0aa",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "i8080",
+      "name": "Intel 8080 / Space Invaders HW",
+      "rom_ext": ".bin",
+      "size_bytes": 34648,
+      "blob_sha256": "60dc2c91f521966ab94dda394f95d812e6d2939aaa3f0b362c0e9c9309be6510",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "intellivision",
+      "name": "Mattel Intellivision",
+      "rom_ext": ".int",
+      "size_bytes": 10512,
+      "blob_sha256": "314fe644ca2548aba33adc7cef8f2bbe9526d593a11a74a8b43e601d2aaf900e",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "jaguar",
+      "name": "Atari Jaguar",
+      "rom_ext": ".j64",
+      "size_bytes": 29928,
+      "blob_sha256": "ef6927459c6dd038889591e198da374b30b3715af0e8aeb06b401f4321257c51",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "lynx",
+      "name": "Atari Lynx",
+      "rom_ext": ".lnx",
+      "size_bytes": 42208,
+      "blob_sha256": "2846eeda38929db01e2cfcaa881d8e1f58ce4cb432c554fa389ca3da80e5150e",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "msx",
+      "name": "MSX (MSX1)",
+      "rom_ext": ".rom",
+      "size_bytes": 38512,
+      "blob_sha256": "2b40af2a64f7b86b4a5084fff262e2c72926058b1da0142a3921ed70538963ca",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "msx2",
+      "name": "MSX2",
+      "rom_ext": ".rom",
+      "size_bytes": 55096,
+      "blob_sha256": "08440789dda843ffab2e0a60670732f64411b46c21e425e40f33ee98b3584870",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "msx_turbo",
+      "name": "MSX Turbo-R",
+      "rom_ext": ".rom",
+      "size_bytes": 52944,
+      "blob_sha256": "800a9d71698bc4b9ad252f946645df525c5e639cdca38cb4160dfa70770a6043",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "n3ds",
+      "name": "Nintendo 3DS",
+      "rom_ext": ".3ds",
+      "size_bytes": 11984,
+      "blob_sha256": "30b871d41eabc1bd4f3fde585eada5ff96851c587ef73cf69a091d0517644bd4",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "n64",
+      "name": "Nintendo 64",
+      "rom_ext": ".z64",
+      "size_bytes": 25032,
+      "blob_sha256": "86fbf3e289bee18aca944279a85e867c820f475a299274d362c6a04647cbb814",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "nds",
+      "name": "Nintendo DS",
+      "rom_ext": ".nds",
+      "size_bytes": 13272,
+      "blob_sha256": "13021dd188e9edb466dee6dede8d1656448c2cae74b9d38410d52dc438c217c9",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "neogeo",
+      "name": "SNK Neo Geo MVS / AES",
+      "rom_ext": ".neo",
+      "size_bytes": 46192,
+      "blob_sha256": "ef4457eab5fa5902b5781d3dfd77b06cd75639858b1d3cd48637e69131cb1e20",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "nes",
+      "name": "Nintendo NES / Famicom",
+      "rom_ext": ".nes",
+      "size_bytes": 51696,
+      "blob_sha256": "e985044e97e29887a0b8e4dd4dba0b68affdbc4a2becae5e8d57a90c248eefcb",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "ngcd",
+      "name": "SNK Neo Geo CD",
+      "rom_ext": ".iso",
+      "size_bytes": 46040,
+      "blob_sha256": "19c4d95264494292aeb2fe3bcd7cc54561e1cdc342d3a7d877aeda10805175a2",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "ngpc",
+      "name": "SNK Neo Geo Pocket Color",
+      "rom_ext": ".ngp",
+      "size_bytes": 10584,
+      "blob_sha256": "6f90c4fcf37a504f3a032b7ec22cec0da21974e93d1d8c92c4e9bc7288603d67",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "odyssey2",
+      "name": "Magnavox Odyssey 2",
+      "rom_ext": ".bin",
+      "size_bytes": 10208,
+      "blob_sha256": "86de91b8dd422fe1c767bd5d820d0dbd96a1e509ab2861e8ee3f33f246577eeb",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "pc88",
+      "name": "NEC PC-8801",
+      "rom_ext": ".d88",
+      "size_bytes": 29040,
+      "blob_sha256": "8ad156f8c7fe32c6d9e511cade883be2f25b78c17c1e5528a7d8554184fc22f0",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "pce",
+      "name": "NEC PC Engine / TurboGrafx-16",
+      "rom_ext": ".pce",
+      "size_bytes": 52384,
+      "blob_sha256": "eedf211810172eda91f235d6467628a82f42774c097574252bb0809dec1f07fd",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "pce_cd",
+      "name": "NEC PC Engine CD-ROM2",
+      "rom_ext": ".iso",
+      "size_bytes": 73352,
+      "blob_sha256": "2dd892986860c0acd8c78bb524d97ea0fbf6fffeacf7fed699c50faa04b2d2c8",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "pcfx",
+      "name": "NEC PC-FX",
+      "rom_ext": ".iso",
+      "size_bytes": 10768,
+      "blob_sha256": "f82be1c08539b27e5194f325a562fd78dcc0627419886c33f40df4ceb97a80b2",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "pico",
+      "name": "Sega Pico",
+      "rom_ext": ".md",
+      "size_bytes": 41192,
+      "blob_sha256": "27bd7ac6819eec48b15e0a0fed01ce87d393081dae31ff6391f0a063f84f5e22",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "pokemini",
+      "name": "Nintendo Pokemon Mini",
+      "rom_ext": ".min",
+      "size_bytes": 11480,
+      "blob_sha256": "5e6ee211179ee6476da1c0afaa3549a573d4a1b7c350eb3ec9705d0d83fedb70",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "ps2",
+      "name": "Sony PlayStation 2",
+      "rom_ext": ".iso",
+      "size_bytes": 16624,
+      "blob_sha256": "20101f452f1ec203c3a4ce76499b3dc43142bcb9fe1429bb5cb535120aa0a9f0",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "ps3",
+      "name": "Sony PlayStation 3",
+      "rom_ext": ".iso",
+      "size_bytes": 16968,
+      "blob_sha256": "0fbc1bc0ca0a47d329bbf8ae2e66638efb8cba5fec4139125b54d22e75ba2cd8",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "psp",
+      "name": "Sony PSP",
+      "rom_ext": ".iso",
+      "size_bytes": 21216,
+      "blob_sha256": "51cbae8b1df33ce49ccc02d96b29bba4a8224390a45c06f2ea1af287a707446e",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "psx",
+      "name": "Sony PlayStation (PS1)",
+      "rom_ext": ".exe",
+      "size_bytes": 28048,
+      "blob_sha256": "914ed11914e24938e96ac4e41913c345c985d6cb1bc48c0ca5faf30345039e03",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "s32x",
+      "name": "Sega 32X",
+      "rom_ext": ".32x",
+      "size_bytes": 25856,
+      "blob_sha256": "53d74b054f48913a74821bbf0ce3ced2293d82e35fe9a48105829129c062bb99",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "saturn",
+      "name": "Sega Saturn",
+      "rom_ext": ".iso",
+      "size_bytes": 25880,
+      "blob_sha256": "d84cea618f39ab66056a594f5ba4668d8197e6987eb939616d6cf029b81c9bf8",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "segacd",
+      "name": "Sega CD / Mega CD",
+      "rom_ext": ".iso",
+      "size_bytes": 46544,
+      "blob_sha256": "f9b99621c5bd35eddbbeba3abc2a6fd5cc93875d0669504aa084fdea0f22b05b",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "sg1000",
+      "name": "Sega SG-1000",
+      "rom_ext": ".sg",
+      "size_bytes": 41648,
+      "blob_sha256": "334618c9a9115e4cafe119e86d20cbbdea6376c4bc7feeb2ad91b47839c27b5e",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "sms",
+      "name": "Sega Master System",
+      "rom_ext": ".sms",
+      "size_bytes": 42480,
+      "blob_sha256": "1ed597ac84fe4984a5d4a7e5b58fb159944a307001a71ceae317fe2804e06ee0",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "snes",
+      "name": "Nintendo SNES / Super Famicom",
+      "rom_ext": ".sfc",
+      "size_bytes": 114360,
+      "blob_sha256": "c2bce47776bbf7475125ec99b86a91157211f03b59d11f8fac99810e7ace7b23",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "supervision",
+      "name": "Watara Supervision",
+      "rom_ext": ".sv",
+      "size_bytes": 31200,
+      "blob_sha256": "974c04570ac98e084c3df63e6b165cda9f8bc341bd9ce3d0a5fab62a05abc297",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "switch",
+      "name": "Nintendo Switch",
+      "rom_ext": ".xci",
+      "size_bytes": 12928,
+      "blob_sha256": "2097902a0217f32069ec2eb46dd9a87befa7fc735b216126aa29a91725b8c2ae",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "ti994a",
+      "name": "Texas Instruments TI-99/4A",
+      "rom_ext": ".rpk",
+      "size_bytes": 10728,
+      "blob_sha256": "61c52af795153f0af6a0a44f4c5e16fc384b8f3e69a44044b3ae9fc7fd2ecc8f",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "vb",
+      "name": "Nintendo Virtual Boy",
+      "rom_ext": ".vb",
+      "size_bytes": 12144,
+      "blob_sha256": "9ef5ad9e4c74d22b803f50410f9e56e18aeb2eef8aedc3b1d1c209e86cae4a52",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "vectrex",
+      "name": "Vectrex",
+      "rom_ext": ".vec",
+      "size_bytes": 14384,
+      "blob_sha256": "ed6a7117f0d2132806ebdc82add2a8b87d76624e768350a4d2d1a292ec89c147",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "vic20",
+      "name": "Commodore VIC-20",
+      "rom_ext": ".prg",
+      "size_bytes": 36872,
+      "blob_sha256": "7a46f5745b64e27ada116fa4d90877f5622bb6c466398b1ae68a4f0620f7a4da",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "vita",
+      "name": "Sony PlayStation Vita",
+      "rom_ext": ".vpk",
+      "size_bytes": 13064,
+      "blob_sha256": "8da1096f8716a96d8fbe7a0528bab47b74e0551c5cef70b372a3d4fbd272b7ba",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "wii",
+      "name": "Nintendo Wii",
+      "rom_ext": ".wbfs",
+      "size_bytes": 19112,
+      "blob_sha256": "addb045d899a0481927dbcdd1a078d10f0382548410cafce74e88de8f87ad7bd",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "wiiu",
+      "name": "Nintendo Wii U",
+      "rom_ext": ".wud",
+      "size_bytes": 16816,
+      "blob_sha256": "192b32d77f449cba484410364df985e8adc3c169f6908277fe036e53cea4dc01",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "ws",
+      "name": "Bandai WonderSwan",
+      "rom_ext": ".ws",
+      "size_bytes": 39720,
+      "blob_sha256": "409dde58432bfb6eb1641ac79b637b2a9262a2cb787dd94319875a9deab58ee5",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "wsc",
+      "name": "Bandai WonderSwan Color",
+      "rom_ext": ".wsc",
+      "size_bytes": 37304,
+      "blob_sha256": "a4b52be0b9293c58140249751f210b6363ff72edd66a7892f9210711438a4704",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "x68000",
+      "name": "Sharp X68000",
+      "rom_ext": ".x68",
+      "size_bytes": 32440,
+      "blob_sha256": "8be0c56d58172e85ab1e0fb50e7e8985e82e21e46fd86a09cf85a7fa9eca9305",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "xbox360",
+      "name": "Microsoft Xbox 360",
+      "rom_ext": ".iso",
+      "size_bytes": 17672,
+      "blob_sha256": "dd4ef008493aa148d8f3b1f614c8d04671ad988310d536f39d5d4c40a16ee28c",
+      "sigpkg_ptype": 1,
+      "signed": false
+    },
+    {
+      "id": "zx",
+      "name": "Sinclair ZX Spectrum",
+      "rom_ext": ".tap",
+      "size_bytes": 30296,
+      "blob_sha256": "8d11fac6bd3eeca0302487104773233550bfb50ff6c73dae34efbe680ff87c9f",
+      "sigpkg_ptype": 1,
+      "signed": false
+    }
+  ]
+}

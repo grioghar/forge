@@ -1,0 +1,4 @@
+// cores/genesis_id.sg — Genesis's core_id, split out of cores/genesis_abi.sg so systems that reuse
+// the rest of the Genesis ABI unmodified but need their own core_id (Sega Pico: 9293) don't collide
+// with this one. Link this file for the standalone Genesis EL0 app only.
+fn core_id() -> Int { return 68000; }

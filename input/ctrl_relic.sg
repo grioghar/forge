@@ -1,0 +1,54 @@
+// forge/input/ctrl_relic.sg — CONTROLLER relic sealer + versioning.
+//
+// Controllers ARE relics (RELIC-V2 CONTROLLER class 0x04). A CONTROLLER relic is
+// the downloadable, editable, versioned home of one physical device's config:
+// its identity (VID/PID) plus one ctrl_cfg block per core (the per-core bindings).
+// When a pad is plugged in, Forge finds its relic by VID/PID (locally, or downloads
+// from controllers.forge.sigilos.grio.co); the user can remap and re-seal, bumping
+// the gen — "the controller relic has the latest updates."
+//
+// Composes with forge/app/relic_ctrl_cfg.sg (the reader: rcc_read_vid/pid,
+// rcc_num_blocks, rcc_find_cfg). This file adds the writer + the gen field.
+//
+// Layout:  hdr(16) + manifest[gen u16](2) + ctrl_cfg payload + sig(64)
+//   ctrl_cfg payload (at base+18): num_blocks(2) + blocks[{core_id(2),cfg_len(2),cfg…}]
+
+fn cr_payload_off() -> Int { return 18; }   // 16 hdr + 2 gen
+
+// gen lives in the 2-byte manifest at offset 16 (RLC2 manifest_len set to 2).
+fn cr_read_gen(base: Int) -> Int ! {mem} { return peek8(base, 16) + peek8(base, 17) * 256; }
+
+// Write the CONTROLLER header (VID/PID via the reader's rcc_write_hdr) + gen.
+// Returns the ctrl_cfg payload offset.
+fn cr_write_hdr(base: Int, vid: Int, pid: Int, gen: Int) -> Int ! {mem} {
+    rcc_write_hdr(0, base, vid, pid);
+    poke32(base, 12, 2);                       // manifest_len = 2 (gen)
+    poke8(base, 16, gen % 256);
+    poke8(base, 17, gen / 256 % 256);
+    return cr_payload_off();
+}
+
+// Append one cfg block {core_id, cfg_len, cfg bytes} at `off`. Returns the next offset.
+fn cr_put_block(out: Int, off: Int, core_id: Int, cfg: Int, clen: Int) -> Int ! {mem} {
+    poke8(out, off,     core_id % 256);
+    poke8(out, off + 1, core_id / 256 % 256);
+    poke8(out, off + 2, clen % 256);
+    poke8(out, off + 3, clen / 256 % 256);
+    var i: Int = 0;
+    while i < clen invariant i >= 0 { poke8(out, off + 4 + i, peek8(cfg, i)); i = i + 1; }
+    return off + 4 + clen;
+}
+
+// Seal a two-core CONTROLLER relic (chip8 + dos cfg blocks, 16 bytes each) into out.
+// Returns total relic size. gen carries the profile version.
+fn cr_seal2(out: Int, vid: Int, pid: Int, gen: Int,
+            c8_core: Int, c8cfg: Int, dos_core: Int, doscfg: Int) -> Int ! {mem} {
+    let p: Int = cr_write_hdr(out, vid, pid, gen);   // p = 18
+    poke8(out, p, 2); poke8(out, p + 1, 0);          // num_blocks = 2
+    var off: Int = p + 2;
+    off = cr_put_block(out, off, c8_core, c8cfg, 16);
+    off = cr_put_block(out, off, dos_core, doscfg, 16);
+    var i: Int = 0;
+    while i < 64 invariant i >= 0 { poke8(out, off + i, 0); i = i + 1; }   // signature footer
+    return off + 64;
+}

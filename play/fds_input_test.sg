@@ -1,0 +1,59 @@
+// forge/play/fds_input_test.sg — verifies the P1 controller pipeline for the
+// shared NES/FDS core: canonical pad -> normalized mask -> core_set_input ->
+// the real $4016 serial-shift protocol, independent of any one game.
+//
+// NOTE: P2 input ($4016 port 1, n6_st+20) COLLIDES with the PPU's VRAM address
+// register at the same offset — a real bug in the shared core, flagged (not
+// fixed) in fds_core.sg's history. This test only exercises P1 (offset+16,
+// confirmed collision-free).
+//
+// Links: forge/input/pad.sg forge/input/bind_normalized.sg forge/play/nes_core.sg
+//        forge/play/fds_core.sg forge/play/fds_input_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+fn main() -> Int ! {mem, io.write} {
+    let m: Int = alloc_buf(3014656);
+    let bios: Int = alloc_buf(8192);
+    let disk: Int = alloc_buf(1024);
+    fds_load_bios(m, bios, 8192);
+    core_load(m, disk, 1024);
+
+    let pad: Int = alloc_buf(16);
+    var pass: Int = 0;
+    var tot: Int = 0;
+
+    pad_clear(pad);
+    pad_set(pad, pad_right(), 1);
+    pad_set(pad, pad_a(), 1);
+    let mask: Int = bind_norm_mask(pad);
+    tot = tot + 1; pass = chk(mask == 24, pass);   // Right(8) + A(16) = 24
+
+    core_set_input(m, mask);
+    n6_write(m, 16406, 1);   // strobe $4016 -> latch P1
+
+    // Serial order (n6_joy_conv, cores/nes.sg): A,B,Select,Start,Up,Down,Left,Right.
+    let b0: Int = n6_read(m, 16406);   // A pressed -> 1
+    let b1: Int = n6_read(m, 16406);   // B not pressed -> 0
+    let b2: Int = n6_read(m, 16406);   // Select not pressed -> 0
+    let b3: Int = n6_read(m, 16406);   // Start not pressed -> 0
+    let b4: Int = n6_read(m, 16406);   // Up not pressed -> 0
+    let b5: Int = n6_read(m, 16406);   // Down not pressed -> 0
+    let b6: Int = n6_read(m, 16406);   // Left not pressed -> 0
+    let b7: Int = n6_read(m, 16406);   // Right pressed -> 1
+
+    tot = tot + 1; pass = chk(b0 == 1, pass);
+    tot = tot + 1; pass = chk(b1 == 0, pass);
+    tot = tot + 1; pass = chk(b7 == 1, pass);
+    tot = tot + 1; pass = chk(b4 == 0, pass);
+
+    print(1, "FDS/NES CONTROLLER PIPELINE (P1): canonical pad -> normalized mask -> $4016 serial\n");
+    print(1, "  pressed RIGHT+A -> mask="); print(1, chr(48 + mask / 10 % 10)); print(1, chr(48 + mask % 10));
+    print(1, " (expect 24) -> serial bits A,B,Sel,Start,Up,Dn,Lt,Rt = ");
+    print(1, chr(48+b0)); print(1, chr(48+b1)); print(1, chr(48+b2)); print(1, chr(48+b3));
+    print(1, chr(48+b4)); print(1, chr(48+b5)); print(1, chr(48+b6)); print(1, chr(48+b7));
+    print(1, "\n  SELFTEST: "); print(1, chr(48 + pass)); print(1, "/"); print(1, chr(48 + tot));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

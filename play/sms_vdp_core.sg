@@ -1,0 +1,155 @@
+// cores/sms_vdp.sg — Sega Master System / Game Gear VDP (TMS9918-derived, Mode 4), Sigil
+// Int-subset. 256x192 tilemap (32x28 of 8x8 4bpp tiles) + 64 sprites; 16KB VRAM; CRAM (32
+// colors SMS / 64 GG). Driven by the Z80 through ports $BF (control) and $BE (data) — the
+// SMS core routes those ports to sms_vdp_ctrl/sms_vdp_data. This file: the register/VRAM/
+// CRAM access protocol; the Mode-4 tile + sprite render follows.
+// Prefix sms_ (asm-reg collisions, sigil#12). Decimal literals only.
+
+fn sms_vram(m: Int) -> Int { return m + 262144; }        // base+262144: VRAM (16KB)
+fn sms_cram(m: Int) -> Int { return m + 327680; }       // base+327680: CRAM
+fn sms_vst(m: Int) -> Int { return m + 393216; }        // base+393216: VDP state
+
+// state: regs @0-10 ; addr @16 (lo) /17 (hi) ; code @18 ; latch flag @19 ; latch byte @20
+fn sms_vdp_reg(m: Int, n: Int) -> Int ! {mem} { return peek8(sms_vst(m), n and 15); }
+fn sms_vdp_addr(m: Int) -> Int ! {mem} { return peek8(sms_vst(m), 16) + peek8(sms_vst(m), 17) * 256; }
+
+// Control port ($BF): two bytes form one command. First byte latches the low address byte;
+// the second byte's top 2 bits are the code (0/1 = VRAM r/w, 2 = register write, 3 = CRAM).
+fn sms_vdp_ctrl(m: Int, v: Int) -> Int ! {mem} {
+    let b: Int = v and 255;
+    if peek8(sms_vst(m), 19) == 0 {                     // first byte
+        poke8(sms_vst(m), 20, b); poke8(sms_vst(m), 19, 1);
+        return 0;
+    }
+    poke8(sms_vst(m), 19, 0);                           // second byte (clear latch first)
+    let code: Int = (b / 64) and 3;
+    if code == 2 { poke8(sms_vst(m), b and 15, peek8(sms_vst(m), 20)); return 0; }   // register write
+    poke8(sms_vst(m), 16, peek8(sms_vst(m), 20));        // addr lo = latched byte
+    poke8(sms_vst(m), 17, b and 63);                    // addr hi (14-bit)
+    poke8(sms_vst(m), 18, code);
+    return 0;
+}
+
+// Data port ($BE): write to VRAM (code 0/1) or CRAM (code 3) at the current address, then
+// auto-increment the address (14-bit wrap).
+fn sms_vdp_data(m: Int, v: Int) -> Int ! {mem} {
+    let addr: Int = sms_vdp_addr(m);
+    if peek8(sms_vst(m), 18) == 3 { poke8(sms_cram(m), addr and 63, v and 255); }
+    if peek8(sms_vst(m), 18) != 3 { poke8(sms_vram(m), addr and 16383, v and 255); }
+    let na: Int = (addr + 1) and 16383;
+    poke8(sms_vst(m), 16, na and 255); poke8(sms_vst(m), 17, (na / 256) and 255);
+    return 0;
+}
+
+fn sms_vdp_reset(m: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 24 invariant i >= 0 { poke8(sms_vst(m), i, 0); i = i + 1; }
+    return 0;
+}
+
+// --- Mode-4 render: 4bpp PLANAR tiles -> CRAM -> framebuffer (256x192 ARGB) ---
+fn sms_fb(m: Int) -> Int { return m + 458752; }         // base+458752: 256x192 ARGB
+fn sms_pow2(n: Int) -> Int { var p: Int = 1; var i: Int = 0; while i < n invariant i >= 0 { p = p * 2; i = i + 1; } return p; }
+// Game Gear flag (sms_vst @26): the loader sets it for GG ROMs so the CRAM decodes at 12-bit.
+fn sms_set_gg(m: Int, on: Int) -> Int ! {mem} { poke8(sms_vst(m), 26, on and 1); return 0; }
+// CRAM entry -> ARGB. SMS = 6-bit --BBGGRR (2 bits/channel, *85). Game Gear = 12-bit BGR, 2 bytes/
+// entry: lo = GGGGRRRR, hi = ----BBBB (4 bits/channel, *17).
+fn sms_color(m: Int, idx: Int) -> Int ! {mem} {
+    if peek8(sms_vst(m), 26) == 1 {                                   // Game Gear 12-bit CRAM
+        let lo: Int = peek8(sms_cram(m), (idx and 31) * 2);          // GGGG RRRR
+        let hi: Int = peek8(sms_cram(m), (idx and 31) * 2 + 1);      // ---- BBBB
+        return (lo and 15) * 17 + ((lo / 16) and 15) * 17 * 256 + (hi and 15) * 17 * 65536 + 4278190080;
+    }
+    let c: Int = peek8(sms_cram(m), idx and 63);
+    return (c and 3) * 85 + ((c / 4) and 3) * 85 * 256 + ((c / 16) and 3) * 85 * 65536 + 4278190080;
+}
+// One tile pixel (0-15): 4 bitplanes interleaved per row (tile*32 + py*4 + plane), MSB-first.
+fn sms_tile_px(m: Int, tile: Int, px: Int, py: Int) -> Int ! {mem} {
+    let base: Int = (tile * 32 + py * 4) and 16383;
+    let bit: Int = sms_pow2(7 - (px and 7));
+    return ((peek8(sms_vram(m), base) / bit) and 1)
+         + ((peek8(sms_vram(m), (base + 1) and 16383) / bit) and 1) * 2
+         + ((peek8(sms_vram(m), (base + 2) and 16383) / bit) and 1) * 4
+         + ((peek8(sms_vram(m), (base + 3) and 16383) / bit) and 1) * 8;
+}
+fn sms_draw_tile_px(m: Int, sx: Int, sr: Int, py: Int, tile: Int, pal: Int, hf: Int, x: Int) -> Int ! {mem} {
+    let pxs: Int = sx + x;
+    if pxs >= 0 { if pxs < 256 {
+        var sxp: Int = x; if hf == 1 { sxp = 7 - x; }
+        let c: Int = sms_tile_px(m, tile, sxp, sr);
+        if c != 0 { poke32(sms_fb(m), (py * 256 + pxs) * 4, sms_color(m, pal * 16 + c)); }
+    } }
+    return 0;
+}
+fn sms_draw_tile_row(m: Int, sx: Int, sr: Int, py: Int, tile: Int, pal: Int, hf: Int) -> Int ! {mem} {
+    var x: Int = 0;
+    while x < 8 invariant x >= 0 {
+        sms_draw_tile_px(m, sx, sr, py, tile, pal, hf, x);
+        x = x + 1;
+    }
+    return 0;
+}
+fn sms_draw_tile(m: Int, sx: Int, sy: Int, tile: Int, pal: Int, hf: Int, vf: Int) -> Int ! {mem} {
+    var r: Int = 0;
+    while r < 8 invariant r >= 0 {
+        let py: Int = sy + r;
+        if py >= 0 { if py < 192 {
+            var sr: Int = r; if vf == 1 { sr = 7 - r; }
+            sms_draw_tile_row(m, sx, sr, py, tile, pal, hf);
+        } }
+        r = r + 1;
+    }
+    return 0;
+}
+// Sprites: SAT @ (reg5 & 0x7E)<<7 — Y bytes @ +0 (0xD0 terminates), X/tile pairs @ +128.
+// 8x8, sprite palette (CRAM 16-31). Pattern base from reg6 bit2.
+fn sms_render_sprites(m: Int) -> Int ! {mem} {
+    let sat: Int = (sms_vdp_reg(m, 5) and 126) * 128;
+    let pbase: Int = ((sms_vdp_reg(m, 6) / 4) and 1) * 256;
+    var i: Int = 0;
+    while i < 64 invariant i >= 0 {
+        let y: Int = peek8(sms_vram(m), (sat + i) and 16383);
+        if y == 208 { i = 64; }                          // $D0 terminator
+        if y != 208 {
+            let x: Int = peek8(sms_vram(m), (sat + 128 + i * 2) and 16383);
+            let t: Int = peek8(sms_vram(m), (sat + 129 + i * 2) and 16383);
+            sms_draw_tile(m, x, y + 1, pbase + t, 1, 0, 0);  // sprite palette = CRAM 16+
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+fn sms_clear(m: Int, color: Int) -> Int ! {mem} { var p: Int = 0; while p < 49152 invariant p >= 0 { poke32(sms_fb(m), p * 4, color); p = p + 1; } return 0; }
+// Render the Mode-4 background: name table (reg2 bits 1-3 << 10), 32x24 visible cells, each
+// a 16-bit entry (tile 0-511 | hflip<<9 | vflip<<10 | palette<<11 | priority<<12).
+fn sms_render(m: Int) -> Int ! {mem} {
+    sms_clear(m, sms_color(m, 16 + (sms_vdp_reg(m, 7) and 15)));               // backdrop
+    let nt: Int = (sms_vdp_reg(m, 2) and 14) * 1024;
+    var ty: Int = 0;
+    while ty < 24 invariant ty >= 0 {
+        var tx: Int = 0;
+        while tx < 32 invariant tx >= 0 {
+            let o: Int = (nt + (ty * 32 + tx) * 2) and 16383;
+            let w: Int = peek8(sms_vram(m), o) + peek8(sms_vram(m), (o + 1) and 16383) * 256;
+            sms_draw_tile(m, tx * 8, ty * 8, w and 511, (w / 2048) and 1, (w / 512) and 1, (w / 1024) and 1);
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    return 0;
+}
+
+// --- data-port read / status (for the Z80 IN side) ---
+fn sms_vdp_data_read(m: Int) -> Int ! {mem} {
+    let addr: Int = sms_vdp_addr(m);
+    let v: Int = peek8(sms_vram(m), addr and 16383);
+    let na: Int = (addr + 1) and 16383;
+    poke8(sms_vst(m), 16, na and 255); poke8(sms_vst(m), 17, (na / 256) and 255);
+    return v;
+}
+fn sms_vdp_status(m: Int) -> Int ! {mem} {                 // status @21 (bit7 = vblank); reading clears it + the latch
+    let s: Int = peek8(sms_vst(m), 21);
+    poke8(sms_vst(m), 21, 0); poke8(sms_vst(m), 19, 0);
+    return s;
+}
+fn sms_vdp_vblank(m: Int) -> Int ! {mem} { poke8(sms_vst(m), 21, 128); return 0; }   // set the vblank flag (per frame)

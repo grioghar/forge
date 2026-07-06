@@ -1,0 +1,15 @@
+// cores/m68k_singlebus.sg — the sub-CPU bus hook's default provider, for every single-68000 system
+// on the shared cores/m68k.sg engine (Genesis, Amiga, Atari ST, Neo Geo, Neo Geo CD, CPS-1/2/3,
+// X68000, Jaguar, Sega Pico). m68k.sg's gn_dread8/16/32 + gn_dwrite8/16/32 dispatch call these by name
+// when gn_busmode() == 1 (sub mode) — single-bus systems never set sub mode, so these are dead code,
+// but the symbol must still resolve at link time (m68k.sg declares no body of its own; it's a hook).
+//
+// Link this file for every single-bus m68k system. The dual-bus Sega CD links cores/segacd.sg INSTEAD
+// of this file — segacd.sg supplies the real gn_sub_* body. Never link both together (duplicate
+// definition — cc0 has no first-def-wins shadowing; exactly one provider per build, always).
+fn gn_sub_read8(m: Int, a: Int) -> Int ! {mem} { return 0; }
+fn gn_sub_read16(m: Int, a: Int) -> Int ! {mem} { return 0; }
+fn gn_sub_read32(m: Int, a: Int) -> Int ! {mem} { return 0; }
+fn gn_sub_write8(m: Int, a: Int, v: Int) -> Int ! {mem} { return 0; }
+fn gn_sub_write16(m: Int, a: Int, v: Int) -> Int ! {mem} { return 0; }
+fn gn_sub_write32(m: Int, a: Int, v: Int) -> Int ! {mem} { return 0; }

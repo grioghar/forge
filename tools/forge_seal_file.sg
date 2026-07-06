@@ -1,0 +1,146 @@
+// forge/tools/forge_seal_file.sg — seal ONE real file on disk into an RLC2 ROM relic.
+//
+// Host-side batch tool (personal library sealing — Linux, native cc0). Reads a
+// tiny 5-line config from stdin (no argv in cc0 native main()):
+//   line1  input path  (the extracted ROM file)
+//   line2  output path (the .relic to write)
+//   line3  system_id   (decimal, catalog.sg index)
+//   line4  core_id     (decimal)
+//   line5  max_bytes   (decimal, >= the input file's size — caller sizes it via `stat`)
+//
+// Seals class=ROM (0x01), no manifest, no bios_ref (personal titles, BIOS handled
+// separately/per-system), just the count-prefix(0,0) so the format matches
+// FORGE-SEAL/relic_walk exactly. sha256 + crc32 computed over the real payload.
+//
+// Link order: sha256.sg  crc32.sg  forge_seal_file.sg
+
+fn rd(fd: Int, buf: Int, n: Int) -> Int ! {sys} { return sys3(0, fd, buf, n); }
+fn wr(fd: Int, buf: Int, n: Int) -> Int ! {sys} { return sys3(1, fd, buf, n); }
+fn fopen_ro(path: Int)  -> Int ! {sys} { return sys3(2, path, 0, 0); }            // open(path, O_RDONLY)
+fn fopen_wr(path: Int)  -> Int ! {sys} { return sys3(2, path, 577, 420); }        // O_WRONLY|O_CREAT|O_TRUNC(577), 0644
+fn fread(fd: Int, buf: Int, n: Int)  -> Int ! {sys} { return sys3(0, fd, buf, n); }
+fn fwrite(fd: Int, buf: Int, n: Int) -> Int ! {sys} { return sys3(1, fd, buf, n); }
+fn fclose(fd: Int) -> Int ! {sys} { return sys3(3, fd, 0, 0); }
+
+// ---- tiny byte-level stdin config parser (no Text/read_line — metal subset) ----
+fn is_digit(c: Int) -> Int { if c >= 48 { if c <= 57 { return 1; } } return 0; }
+
+// Read all available stdin into buf (single read call; config is tiny). Returns byte count.
+fn read_all_stdin(buf: Int, cap: Int) -> Int ! {sys} { return rd(0, buf, cap); }
+
+// Copy the line starting at src+pos up to (not incl.) '\n', NUL-terminate into dst.
+// Returns the position just past the '\n'.
+fn copy_line(src: Int, pos: Int, len: Int, dst: Int) -> Int ! {mem} {
+    var i: Int = pos;
+    var j: Int = 0;
+    var done: Int = 0;
+    while i < len invariant i >= 0 {
+        if done == 0 {
+            let c: Int = peek8(src, i);
+            if c == 10 { done = 1; }
+            if done == 0 { poke8(dst, j, c); j = j + 1; }
+        }
+        i = i + 1;
+    }
+    poke8(dst, j, 0);
+    return pos + j + 1;
+}
+
+// Parse a decimal integer starting at buf (NUL or newline terminated).
+fn parse_int(buf: Int) -> Int {
+    var v: Int = 0;
+    var i: Int = 0;
+    while is_digit(peek8(buf, i)) == 1 invariant i >= 0 {
+        v = v * 10 + (peek8(buf, i) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn put32(base: Int, off: Int, v: Int) -> Int ! {mem} {
+    poke8(base, off, v % 256); poke8(base, off + 1, v / 256 % 256);
+    poke8(base, off + 2, v / 65536 % 256); poke8(base, off + 3, v / 16777216 % 256);
+    return 0;
+}
+
+fn main() -> Int ! {mem, sys, io.write} {
+    let cfgbuf: Int = alloc_buf(2048);
+    let n: Int = read_all_stdin(cfgbuf, 2048);
+    if n < 1 { print(1, "ERR: empty config\n"); return 1; }
+
+    let inpath: Int  = alloc_buf(1024);
+    let outpath: Int = alloc_buf(1024);
+    let sysid_s: Int = alloc_buf(32);
+    let coreid_s: Int = alloc_buf(32);
+    let maxb_s: Int  = alloc_buf(32);
+
+    var pos: Int = 0;
+    pos = copy_line(cfgbuf, pos, n, inpath);
+    pos = copy_line(cfgbuf, pos, n, outpath);
+    pos = copy_line(cfgbuf, pos, n, sysid_s);
+    pos = copy_line(cfgbuf, pos, n, coreid_s);
+    pos = copy_line(cfgbuf, pos, n, maxb_s);
+
+    let sysid: Int  = parse_int(sysid_s);
+    let coreid: Int = parse_int(coreid_s);
+    let maxb: Int   = parse_int(maxb_s);
+
+    let fd: Int = fopen_ro(inpath);
+    if fd < 0 { print(1, "ERR: open input failed\n"); return 2; }
+
+    let payload: Int = alloc_buf(maxb + 4096);
+    var got: Int = 0;
+    var chunk: Int = fread(fd, payload, maxb);
+    while chunk > 0 invariant chunk >= 0 {
+        got = got + chunk;
+        if got >= maxb { chunk = 0 - 1; }
+        if chunk > 0 { chunk = fread(fd, payload + got, maxb - got); }
+    }
+    fclose(fd);
+    if got < 1 { print(1, "ERR: read 0 bytes\n"); return 3; }
+
+    let sha: Int = alloc_buf(32);
+    let sc: Int  = alloc_buf(got + 700);
+    sha256(0, payload, got, sha, sc);
+    let crc: Int = crc32(payload, got);
+
+    let out: Int = alloc_buf(got + 512);
+    poke32(out, 0, 843271250);   // "RLC2"
+    poke8(out, 4, 2); poke8(out, 5, 1);   // version=2, class=ROM
+    poke8(out, 6, sysid % 256); poke8(out, 7, sysid / 256 % 256);
+    poke8(out, 8, coreid % 256); poke8(out, 9, coreid / 256 % 256);
+    poke8(out, 10, 0); poke8(out, 11, 0);
+    put32(out, 12, 0);   // manifest_len = 0
+    var i: Int = 0;
+    while i < 32 invariant i >= 0 { poke8(out, 16 + i, peek8(sha, i)); i = i + 1; }
+    put32(out, 48, crc);
+    put32(out, 52, got);
+    poke8(out, 56, 0); poke8(out, 57, 0); poke8(out, 58, 0); poke8(out, 59, 0);
+    var j: Int = 0;
+    while j < got invariant j >= 0 { poke8(out, 60 + j, peek8(payload, j)); j = j + 1; }
+    let pend: Int = 60 + got;
+    poke8(out, pend, 0); poke8(out, pend + 1, 0);       // bios_ref_count = 0
+    poke8(out, pend + 2, 0); poke8(out, pend + 3, 0);   // compat_count = 0
+    var k: Int = 0;
+    while k < 64 invariant k >= 0 { poke8(out, pend + 4 + k, 0); k = k + 1; }
+    let total: Int = pend + 4 + 64;
+
+    let ofd: Int = fopen_wr(outpath);
+    if ofd < 0 { print(1, "ERR: open output failed\n"); return 4; }
+    fwrite(ofd, out, total);
+    fclose(ofd);
+
+    print(1, "OK sysid="); print(1, chr(48 + sysid / 10 % 10)); print(1, chr(48 + sysid % 10));
+    print(1, " payload=");
+    var p: Int = got; var digs: Int = alloc_buf(16); var nd: Int = 0;
+    if p == 0 { poke8(digs, 0, 48); nd = 1; }
+    while p > 0 invariant p >= 0 { poke8(digs, nd, 48 + p % 10); p = p / 10; nd = nd + 1; }
+    var d: Int = nd - 1;
+    while d >= 0 invariant d >= 0 - 1 { print(1, chr(peek8(digs, d))); d = d - 1; }
+    print(1, " relic="); print(1, chr(48 + total / 1000000 % 10));
+    print(1, chr(48 + total / 100000 % 10)); print(1, chr(48 + total / 10000 % 10));
+    print(1, chr(48 + total / 1000 % 10)); print(1, chr(48 + total / 100 % 10));
+    print(1, chr(48 + total / 10 % 10)); print(1, chr(48 + total % 10));
+    print(1, "\n");
+    return 0;
+}

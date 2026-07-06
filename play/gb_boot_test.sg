@@ -1,0 +1,44 @@
+// forge/play/gb_boot_test.sg — verifies the ported Game Boy core executes a
+// hand-assembled program natively: exact expected register outcome. Same
+// deterministic-verification tier as the Genesis/32X/Game Gear boot tests
+// (built after those established the pattern; GB's earlier verification used
+// a real sealed relic instead — this adds the same hand-computed-exact proof).
+//
+// Links: forge/play/gb_core.sg  forge/play/gb_boot_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+fn main() -> Int ! {mem, io.write} {
+    let rom: Int = alloc_buf(4096);
+    // GB always starts execution at ROM offset 0x100 (256) - no vector table.
+    // At 0x100: LD A,0x10 (3E 10) ; INC A (3C) ; INC A (3C) ; INC A (3C)
+    poke8(rom, 256, 62); poke8(rom, 257, 16);
+    poke8(rom, 258, 60);
+    poke8(rom, 259, 60);
+    poke8(rom, 260, 60);
+
+    let m: Int = alloc_buf(6464);
+    let ok: Int = core_load(m, rom, 4096);
+
+    var pass: Int = 0;
+    var tot: Int = 0;
+    tot = tot + 1; pass = chk(ok == 1, pass);
+    tot = tot + 1; pass = chk(gb_pc(m) == 256, pass);   // GB always enters at 0x100
+
+    gb_step(m); gb_step(m); gb_step(m); gb_step(m);   // LD A,n + 3x INC A
+
+    let a: Int = gb_a(m);
+    let pc: Int = gb_pc(m);
+    tot = tot + 1; pass = chk(a == 19, pass);    // 0x10 + 3 = 19
+    tot = tot + 1; pass = chk(pc == 261, pass);  // 2 + 1 + 1 + 1 = 5 bytes, 256+5=261
+
+    print(1, "GAME BOY BOOT: LR35902 CPU, LD+INC hand-assembled program\n");
+    print(1, "  core_load ok="); print(1, chr(48 + ok));
+    print(1, "  after 4 cycles: A="); print(1, chr(48 + a / 10 % 10)); print(1, chr(48 + a % 10));
+    print(1, " (expect 19 = 0x10+3)  PC="); print(1, chr(48 + pc / 100 % 10));
+    print(1, chr(48 + pc / 10 % 10)); print(1, chr(48 + pc % 10)); print(1, " (expect 261)\n");
+    print(1, "  SELFTEST: "); print(1, chr(48 + pass)); print(1, "/"); print(1, chr(48 + tot));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

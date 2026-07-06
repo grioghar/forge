@@ -1,0 +1,788 @@
+// gb.sg — Game Boy (DMG) SM83/LR35902 core for sigil-Retropie, in the bare-metal
+// Sigil Int-subset. Third emulator core (after CHIP-8 and 8080), per the
+// Director's GO. Implements the docs/SYSTEMS.md core_* ABI so the shell/EL0 app
+// stays system-agnostic; ROM loads via sigil-fs (fs_resolve/fs_read) at the app
+// layer, then core_load() here.
+//
+// THIS INCREMENT: the SM83 CPU — registers/flags, the full memory map with a
+// minimal MBC1 read path, the regular LD/ALU families + CB-prefix bit ops + the
+// control/misc opcodes, timer (DIV/TIMA) and the interrupt dispatch. Compile-
+// verified. NEXT increments: the PPU (BG/window/sprite scanline pipeline,
+// LCDC/STAT/LY) — at which point a GB ROM renders and gets screendumped — then
+// MBC3/5. Per-arch (Director): PPU scanline targets NEON; SM83 targets a dynarec
+// later. Validation path: Blargg cpu_instrs test ROMs via the QEMU/sim harness.
+//
+// Function/accessor names are gb_*-prefixed so none collide with AArch64 register
+// mnemonics (a function named `sp`/`a` would mis-assemble — see sigil#12).
+//
+// Fixed RAM (flat physical, MMU off): MEM 0x480000 (64 KB addr space),
+// ST 0x4A0000 (cpu+timer state), FB 0x4B0000 (160x144 ARGB), ROM 0x600000 (≤2 MB).
+
+fn gb_mem(m: Int) -> Int { return m + 0; }         // base+0
+fn gb_st(m: Int) -> Int { return m + 131072; }     // base+131072
+fn gb_fb(m: Int) -> Int { return m + 196608; }     // base+196608
+fn gb_rom(m: Int) -> Int { return m + 1572864; }    // base+1572864
+
+fn gb_p2(n: Int) -> Int {
+    var p: Int = 1; var i: Int = 0;
+    while i < n invariant i >= 0 { p = p * 2; i = i + 1; }
+    return p;
+}
+fn gb_xor(a: Int, b: Int) -> Int {
+    var r: Int = 0; var i: Int = 0;
+    while i < 8 invariant i >= 0 {
+        r = r + (a / gb_p2(i) % 2 + b / gb_p2(i) % 2) % 2 * gb_p2(i);
+        i = i + 1;
+    }
+    return r;
+}
+
+// ST layout (bytes unless noted): A@0 F@1 B@2 C@3 D@4 E@5 H@6 L@7;
+// SP@8 PC@12 (32); IME@16 HALT@20 (32); rom_bank@24 ram_enable@28 (32);
+// div@32 tima@36 tma@40 tac@44 div_acc@48 tima_acc@52 (32).
+fn gb_a(m: Int) -> Int ! {mem} { return peek8(gb_st(m), 0); }
+fn gb_set_a(m: Int, v: Int) -> Int ! {mem} { poke8(gb_st(m), 0, v and 255); return 0; }
+fn gb_f(m: Int) -> Int ! {mem} { return peek8(gb_st(m), 1); }
+fn gb_set_f(m: Int, v: Int) -> Int ! {mem} { poke8(gb_st(m), 1, v and 240); return 0; }   // low nibble always 0
+
+fn gb_fz(m: Int) -> Int ! {mem} { return gb_f(m) / 128 % 2; }
+fn gb_fn(m: Int) -> Int ! {mem} { return gb_f(m) / 64 % 2; }
+fn gb_fh(m: Int) -> Int ! {mem} { return gb_f(m) / 32 % 2; }
+fn gb_fc(m: Int) -> Int ! {mem} { return gb_f(m) / 16 % 2; }
+fn gb_set_flags(m: Int, z: Int, n: Int, h: Int, c: Int) -> Int ! {mem} {
+    gb_set_f(m, z * 128 + n * 64 + h * 32 + c * 16);
+    return 0;
+}
+
+// 16-bit register pairs.
+fn gb_pc(m: Int) -> Int ! {mem} { return peek32(gb_st(m), 12); }
+fn gb_set_pc(m: Int, v: Int) -> Int ! {mem} { poke32(gb_st(m), 12, v and 65535); return 0; }
+fn gb_sp(m: Int) -> Int ! {mem} { return peek32(gb_st(m), 8); }
+fn gb_set_sp(m: Int, v: Int) -> Int ! {mem} { poke32(gb_st(m), 8, v and 65535); return 0; }
+fn gb_hl(m: Int) -> Int ! {mem} { return peek8(gb_st(m), 6) * 256 + peek8(gb_st(m), 7); }
+fn gb_bc(m: Int) -> Int ! {mem} { return peek8(gb_st(m), 2) * 256 + peek8(gb_st(m), 3); }
+fn gb_de(m: Int) -> Int ! {mem} { return peek8(gb_st(m), 4) * 256 + peek8(gb_st(m), 5); }
+fn gb_set_hl(m: Int, v: Int) -> Int ! {mem} { poke8(gb_st(m), 6, (v / 256) and 255); poke8(gb_st(m), 7, v and 255); return 0; }
+fn gb_set_bc(m: Int, v: Int) -> Int ! {mem} { poke8(gb_st(m), 2, (v / 256) and 255); poke8(gb_st(m), 3, v and 255); return 0; }
+fn gb_set_de(m: Int, v: Int) -> Int ! {mem} { poke8(gb_st(m), 4, (v / 256) and 255); poke8(gb_st(m), 5, v and 255); return 0; }
+
+// --- memory map (minimal MBC1 read remap) ---
+fn gb_read(m: Int, addr: Int) -> Int ! {mem} {
+    let a: Int = addr and 65535;
+    if a < 16384 { return peek8(gb_rom(m), a); }                      // bank 0
+    if a < 32768 {
+        var bank: Int = peek32(gb_st(m), 24);
+        if bank == 0 { bank = 1; }
+        return peek8(gb_rom(m), bank * 16384 + (a - 16384));          // banked
+    }
+    if a >= 32768 { if a < 40960 {                                    // $8000-$9FFF VRAM
+        if (peek8(gb_mem(m), 65359) and 1) == 1 { return peek8(gbc_vram1(m), a - 32768); }   // CGB VRAM bank 1
+    } }
+    if a >= 53248 { if a < 57344 {                                    // $D000-$DFFF switchable WRAM
+        let sv: Int = peek8(gb_mem(m), 65392) and 7;                  // $FF70 SVBK
+        if sv > 1 { return peek8(gbc_wram(m), (sv - 2) * 4096 + a - 53248); }   // banks 2-7
+    } }
+    if a == 65280 { return gb_joyp(m); }                              // $FF00 P1/JOYP (native port fix, see gb_joyp)
+    return peek8(gb_mem(m), a);                                       // VRAM/WRAM/IO/HRAM
+}
+
+// $FF00 P1/JOYP real-hardware readback — the shared gb.sg core (upstream)
+// stores the normalized button mask (core_set_input_port, "1U 2D 4L 8R 16A
+// 32B 64Start 128Sel" per the fleet convention, cores/nes.sg's n6_joy_conv
+// comment) but never wires it into a CPU-visible register read; games polling
+// $FF00 always saw "nothing pressed". Fixed here: P14 (bit4)=0 selects the
+// direction row, P15 (bit5)=0 selects the action row (active-low select, same
+// as real DMG hardware); the low nibble is active-low per-button (0=pressed).
+fn gb_joyp(m: Int) -> Int ! {mem} {
+    let sel: Int = peek8(gb_mem(m), 65280);
+    let btn: Int = peek32(gb_st(m), 56);
+    var dir: Int = 15;
+    if (sel and 16) == 0 {
+        var d: Int = 0;
+        if (btn and 8) != 0 { d = d + 1; }     // Right
+        if (btn and 4) != 0 { d = d + 2; }     // Left
+        if (btn and 1) != 0 { d = d + 4; }     // Up
+        if (btn and 2) != 0 { d = d + 8; }     // Down
+        dir = 15 - d;
+    }
+    var act: Int = 15;
+    if (sel and 32) == 0 {
+        var a2: Int = 0;
+        if (btn and 16) != 0 { a2 = a2 + 1; }  // A
+        if (btn and 32) != 0 { a2 = a2 + 2; }  // B
+        if (btn and 128) != 0 { a2 = a2 + 4; } // Select
+        if (btn and 64) != 0 { a2 = a2 + 8; }  // Start
+        act = 15 - a2;
+    }
+    return (sel and 240) or (dir and act);
+}
+// --- CGB (Game Boy Color) palettes: 8 BG + 8 OBJ palettes x 4 colors x 15-bit BGR555,
+// accessed via $FF68 BGPI/$FF69 BGPD and $FF6A OBPI/$FF6B OBPD (auto-increment on bit7). ---
+fn gbc_pal(m: Int) -> Int { return m + 262144; }         // base+262144: 128B BG palettes @0-63, OBJ @64-127
+fn gbc_vram1(m: Int) -> Int { return m + 327680; }       // base+327680: CGB VRAM bank 1 (8KB)
+fn gbc_wram(m: Int) -> Int { return m + 393216; }        // base+393216: CGB WRAM banks 2-7 (6x4KB)
+fn gbc_color(m: Int, off: Int) -> Int ! {mem} {              // 15-bit BGR555 entry -> ARGB (5-bit channels <<3)
+    let c: Int = peek8(gbc_pal(m), off) + peek8(gbc_pal(m), off + 1) * 256;
+    return (c and 31) * 8 + ((c / 32) and 31) * 8 * 256 + ((c / 1024) and 31) * 8 * 65536 + 4278190080;
+}
+fn gb_write(m: Int, addr: Int, v: Int) -> Int ! {mem} {
+    let a: Int = addr and 65535;
+    let mbc: Int = peek32(gb_st(m), 60);                              // 1=MBC1 3=MBC3 5=MBC5
+    if a < 8192 { poke32(gb_st(m), 28, v and 15); return 0; }         // RAM enable
+    if a < 16384 {                                                   // ROM bank select
+        if mbc == 5 {
+            if a < 12288 {                                           // 0x2000-0x2FFF: low 8 bits
+                poke32(gb_st(m), 24, (peek32(gb_st(m), 24) / 256) * 256 + (v and 255));
+            }
+            if a >= 12288 {                                          // 0x3000-0x3FFF: bit 8
+                poke32(gb_st(m), 24, (peek32(gb_st(m), 24) and 255) + (v and 1) * 256);
+            }
+        }
+        if mbc != 5 {
+            var b: Int = v and 31;                                   // MBC1: low 5 bits
+            if mbc == 3 { b = v and 127; }                           // MBC3: 7 bits
+            if b == 0 { b = 1; }
+            poke32(gb_st(m), 24, b);
+        }
+        return 0;
+    }
+    if a < 32768 { return 0; }                                       // RAM bank / mode / RTC (TODO)
+    if a >= 32768 { if a < 40960 {                                    // $8000-$9FFF VRAM
+        if (peek8(gb_mem(m), 65359) and 1) == 1 { poke8(gbc_vram1(m), a - 32768, v and 255); return 0; }   // CGB bank 1
+        poke8(gb_mem(m), a, v and 255); return 0;
+    } }
+    if a >= 53248 { if a < 57344 {                                    // $D000-$DFFF switchable WRAM
+        let sv: Int = peek8(gb_mem(m), 65392) and 7;
+        if sv > 1 { poke8(gbc_wram(m), (sv - 2) * 4096 + a - 53248, v and 255); return 0; }   // banks 2-7
+        poke8(gb_mem(m), a, v and 255); return 0;
+    } }
+    if a == 65284 { poke8(gb_mem(m), 65284, 0); return 0; }           // DIV write resets it (0xFF04)
+    if a == 65385 {                                                  // $FF69 BGPD: write BG palette @ BGPI index
+        let bi: Int = peek8(gb_mem(m), 65384);
+        poke8(gbc_pal(m), bi and 63, v and 255);
+        if (bi and 128) != 0 { poke8(gb_mem(m), 65384, ((bi + 1) and 63) or 128); }   // auto-increment
+        poke8(gb_mem(m), 65385, v and 255);
+        return 0;
+    }
+    if a == 65387 {                                                  // $FF6B OBPD: write OBJ palette @ OBPI index
+        let oi: Int = peek8(gb_mem(m), 65386);
+        poke8(gbc_pal(m), 64 + (oi and 63), v and 255);
+        if (oi and 128) != 0 { poke8(gb_mem(m), 65386, ((oi + 1) and 63) or 128); }
+        poke8(gb_mem(m), 65387, v and 255);
+        return 0;
+    }
+    poke8(gb_mem(m), a, v and 255);
+    return 0;
+}
+
+// Cartridge type (header 0x0147) -> MBC family (1/3/5, or 0 = ROM-only).
+fn gb_cart_mbc(t: Int) -> Int {
+    if t >= 1 { if t <= 3 { return 1; } }                            // 0x01-0x03 MBC1
+    if t >= 15 { if t <= 19 { return 3; } }                          // 0x0F-0x13 MBC3
+    if t >= 25 { if t <= 30 { return 5; } }                          // 0x19-0x1E MBC5
+    return 0;
+}
+fn gb_rd16(m: Int, a: Int) -> Int ! {mem} { return gb_read(m, a) + gb_read(m, a + 1) * 256; }
+
+// --- registers by index (0=B 1=C 2=D 3=E 4=H 5=L 6=(HL) 7=A) ---
+fn gb_get_reg(m: Int, i: Int) -> Int ! {mem} {
+    if i == 6 { return gb_read(m, gb_hl(m)); }
+    if i == 7 { return gb_a(m); }
+    return peek8(gb_st(m), i + 2);
+}
+fn gb_set_reg(m: Int, i: Int, v: Int) -> Int ! {mem} {
+    if i == 6 { gb_write(m, gb_hl(m), v); }
+    if i != 6 { if i == 7 { gb_set_a(m, v); } }
+    if i != 6 { if i != 7 { poke8(gb_st(m), i + 2, v and 255); } }
+    return 0;
+}
+
+fn gb_fetch8(m: Int) -> Int ! {mem} { let v: Int = gb_read(m, gb_pc(m)); gb_set_pc(m, gb_pc(m) + 1); return v; }
+fn gb_fetch16(m: Int) -> Int ! {mem} { let lo: Int = gb_fetch8(m); let hi: Int = gb_fetch8(m); return hi * 256 + lo; }
+
+// --- ALU (0 ADD 1 ADC 2 SUB 3 SBC 4 AND 5 XOR 6 OR 7 CP), SM83 flags ZNHC ---
+fn gb_alu(m: Int, op: Int, val: Int) -> Int ! {mem} {
+    let a: Int = gb_a(m);
+    if op == 0 or op == 1 {
+        var cy: Int = 0; if op == 1 { cy = gb_fc(m); }
+        let r: Int = a + val + cy;
+        var h: Int = 0; if (a and 15) + (val and 15) + cy > 15 { h = 1; }
+        var c: Int = 0; if r > 255 { c = 1; }
+        var z: Int = 0; if (r and 255) == 0 { z = 1; }
+        gb_set_a(m, r); gb_set_flags(m, z, 0, h, c);
+    }
+    if op == 2 or op == 3 or op == 7 {
+        var cy: Int = 0; if op == 3 { cy = gb_fc(m); }
+        let r: Int = a - val - cy;
+        var h: Int = 0; if (a and 15) - (val and 15) - cy < 0 { h = 1; }
+        var c: Int = 0; if r < 0 { c = 1; }
+        var z: Int = 0; if (r and 255) == 0 { z = 1; }
+        if op != 7 { gb_set_a(m, r); }
+        gb_set_flags(m, z, 1, h, c);
+    }
+    if op == 4 { let r: Int = a and val; var z: Int = 0; if r == 0 { z = 1; } gb_set_a(m, r); gb_set_flags(m, z, 0, 1, 0); }
+    if op == 5 { let r: Int = gb_xor(a, val); var z: Int = 0; if r == 0 { z = 1; } gb_set_a(m, r); gb_set_flags(m, z, 0, 0, 0); }
+    if op == 6 { let r: Int = a or val; var z: Int = 0; if r == 0 { z = 1; } gb_set_a(m, r); gb_set_flags(m, z, 0, 0, 0); }
+    return 0;
+}
+
+// DAA — decimal-adjust A after add/sub, using the N/H/C flags (SM83 semantics).
+fn gb_daa(m: Int) -> Int ! {mem} {
+    var a: Int = gb_a(m);
+    var c: Int = gb_fc(m);
+    if gb_fn(m) == 0 {                                    // after addition
+        if c == 1 or a > 153 { a = a + 96; c = 1; }     // +0x60
+        if gb_fh(m) == 1 or (a and 15) > 9 { a = a + 6; }
+    }
+    if gb_fn(m) != 0 {                                   // after subtraction
+        if c == 1 { a = a - 96; }
+        if gb_fh(m) == 1 { a = a - 6; }
+    }
+    a = a and 255;
+    var z: Int = 0; if a == 0 { z = 1; }
+    gb_set_a(m, a);
+    gb_set_flags(m, z, gb_fn(m), 0, c);
+    return 4;
+}
+
+fn gb_inc8(m: Int, v: Int) -> Int ! {mem} {
+    let r: Int = (v + 1) and 255;
+    var z: Int = 0; if r == 0 { z = 1; }
+    var h: Int = 0; if (v and 15) + 1 > 15 { h = 1; }
+    gb_set_flags(m, z, 0, h, gb_fc(m));
+    return r;
+}
+fn gb_dec8(m: Int, v: Int) -> Int ! {mem} {
+    let r: Int = (v - 1) and 255;
+    var z: Int = 0; if r == 0 { z = 1; }
+    var h: Int = 0; if (v and 15) - 1 < 0 { h = 1; }
+    gb_set_flags(m, z, 1, h, gb_fc(m));
+    return r;
+}
+
+// --- stack ---
+fn gb_push(m: Int, v: Int) -> Int ! {mem} {
+    gb_set_sp(m, gb_sp(m) - 1); gb_write(m, gb_sp(m), (v / 256) and 255);
+    gb_set_sp(m, gb_sp(m) - 1); gb_write(m, gb_sp(m), v and 255);
+    return 0;
+}
+fn gb_pop(m: Int) -> Int ! {mem} {
+    let lo: Int = gb_read(m, gb_sp(m)); gb_set_sp(m, gb_sp(m) + 1);
+    let hi: Int = gb_read(m, gb_sp(m)); gb_set_sp(m, gb_sp(m) + 1);
+    return hi * 256 + lo;
+}
+
+// --- conditions (NZ Z NC C) ---
+fn gb_cond(m: Int, c: Int) -> Int ! {mem} {
+    if c == 0 { return 1 - gb_fz(m); }
+    if c == 1 { return gb_fz(m); }
+    if c == 2 { return 1 - gb_fc(m); }
+    return gb_fc(m);
+}
+
+// --- CB-prefixed bit ops ---
+fn gb_cb(m: Int) -> Int ! {mem} {
+    let cb: Int = gb_fetch8(m);
+    let r: Int = cb % 8;
+    let g: Int = cb / 8;
+    let v: Int = gb_get_reg(m, r);
+    if g < 8 {
+        var res: Int = 0; var c: Int = 0;
+        if g == 0 { c = v / 128 % 2; res = (v * 2 + c) and 255; }                 // RLC
+        if g == 1 { c = v % 2; res = v / 2 + c * 128; }                            // RRC
+        if g == 2 { c = v / 128 % 2; res = (v * 2 + gb_fc(m)) and 255; }            // RL
+        if g == 3 { c = v % 2; res = v / 2 + gb_fc(m) * 128; }                      // RR
+        if g == 4 { c = v / 128 % 2; res = (v * 2) and 255; }                      // SLA
+        if g == 5 { c = v % 2; res = (v / 2) + (v / 128 % 2) * 128; }              // SRA
+        if g == 6 { res = (v % 16) * 16 + v / 16; c = 0; }                         // SWAP
+        if g == 7 { c = v % 2; res = v / 2; }                                      // SRL
+        var z: Int = 0; if res == 0 { z = 1; }
+        gb_set_reg(m, r, res); gb_set_flags(m, z, 0, 0, c);
+    }
+    if g >= 8 { if g < 16 {                                                          // BIT b,r
+        let b: Int = g - 8;
+        var z: Int = 1; if v / gb_p2(b) % 2 == 1 { z = 0; }
+        gb_set_flags(m, z, 0, 1, gb_fc(m));
+    } }
+    if g >= 16 { if g < 24 { gb_set_reg(m, r, v - (v / gb_p2(g - 16) % 2) * gb_p2(g - 16)); } }   // RES
+    if g >= 24 { let b: Int = g - 24; if v / gb_p2(b) % 2 == 0 { gb_set_reg(m, r, v + gb_p2(b)); } }  // SET
+    return 8;
+}
+
+// --- one instruction; returns machine cycles (T-states) ---
+fn gb_step(m: Int) -> Int ! {mem} {
+    if peek32(gb_st(m), 20) == 1 {
+        // Real DMG hardware wakes HALT whenever IF & IE != 0, EVEN IF IME=0 (a
+        // common idiom: "HALT with interrupts disabled" waits for a flag without
+        // taking the vector jump). The upstream core only cleared HALT inside
+        // gb_service_int, which is itself gated on IME==1 — so IME=0 HALT loops
+        // never woke, hanging any game that uses this pattern (native-port fix).
+        if (peek8(gb_mem(m), 65295) and peek8(gb_mem(m), 65535)) != 0 { poke32(gb_st(m), 20, 0); }
+        if peek32(gb_st(m), 20) == 1 { return 4; }
+    }
+    let op: Int = gb_fetch8(m);
+    if op >= 64 { if op <= 127 {                           // LD r,r (0x76 = HALT)
+        if op == 118 { poke32(gb_st(m), 20, 1); return 4; }
+        gb_set_reg(m, op / 8 % 8, gb_get_reg(m, op % 8));
+        return 4;
+    } }
+    if op >= 128 { if op <= 191 { gb_alu(m, op / 8 % 8, gb_get_reg(m, op % 8)); return 4; } }
+    if op == 203 { return gb_cb(m); }                       // 0xCB prefix
+    return gb_misc(m, op);
+}
+
+fn gb_misc(m: Int, op: Int) -> Int ! {mem} {
+    // 8-bit INC/DEC r (0x04+r*8 / 0x05+r*8)
+    if op % 8 == 4 { if op < 64 { gb_set_reg(m, op / 8, gb_inc8(m, gb_get_reg(m, op / 8))); return 4; } }
+    if op % 8 == 5 { if op < 64 { gb_set_reg(m, op / 8, gb_dec8(m, gb_get_reg(m, op / 8))); return 4; } }
+    if op % 8 == 6 { if op < 64 { gb_set_reg(m, op / 8, gb_fetch8(m)); return 8; } }   // LD r,d8
+    // LD rr,d16
+    if op == 1 { gb_set_bc(m, gb_fetch16(m)); return 12; }
+    if op == 17 { gb_set_de(m, gb_fetch16(m)); return 12; }
+    if op == 33 { gb_set_hl(m, gb_fetch16(m)); return 12; }
+    if op == 49 { gb_set_sp(m, gb_fetch16(m)); return 12; }
+    // INC/DEC rr
+    if op == 3 { gb_set_bc(m, (gb_bc(m) + 1) and 65535); return 8; }
+    if op == 19 { gb_set_de(m, (gb_de(m) + 1) and 65535); return 8; }
+    if op == 35 { gb_set_hl(m, (gb_hl(m) + 1) and 65535); return 8; }
+    if op == 51 { gb_set_sp(m, (gb_sp(m) + 1) and 65535); return 8; }
+    if op == 11 { gb_set_bc(m, (gb_bc(m) - 1) and 65535); return 8; }
+    if op == 27 { gb_set_de(m, (gb_de(m) - 1) and 65535); return 8; }
+    if op == 43 { gb_set_hl(m, (gb_hl(m) - 1) and 65535); return 8; }
+    if op == 59 { gb_set_sp(m, (gb_sp(m) - 1) and 65535); return 8; }
+    // LD (rr),A / A,(rr) ; LDI/LDD
+    if op == 2 { gb_write(m, gb_bc(m), gb_a(m)); return 8; }
+    if op == 18 { gb_write(m, gb_de(m), gb_a(m)); return 8; }
+    if op == 10 { gb_set_a(m, gb_read(m, gb_bc(m))); return 8; }
+    if op == 26 { gb_set_a(m, gb_read(m, gb_de(m))); return 8; }
+    if op == 34 { gb_write(m, gb_hl(m), gb_a(m)); gb_set_hl(m, (gb_hl(m) + 1) and 65535); return 8; }   // LDI (HL),A
+    if op == 50 { gb_write(m, gb_hl(m), gb_a(m)); gb_set_hl(m, (gb_hl(m) - 1) and 65535); return 8; }   // LDD (HL),A
+    if op == 42 { gb_set_a(m, gb_read(m, gb_hl(m))); gb_set_hl(m, (gb_hl(m) + 1) and 65535); return 8; }  // LDI A,(HL)
+    if op == 58 { gb_set_a(m, gb_read(m, gb_hl(m))); gb_set_hl(m, (gb_hl(m) - 1) and 65535); return 8; }  // LDD A,(HL)
+    // 16-bit ADD HL,rr
+    if op == 9 { let r: Int = gb_hl(m) + gb_bc(m); var c: Int = 0; if r > 65535 { c = 1; } gb_set_flags(m, gb_fz(m), 0, 0, c); gb_set_hl(m, r and 65535); return 8; }
+    if op == 25 { let r: Int = gb_hl(m) + gb_de(m); var c: Int = 0; if r > 65535 { c = 1; } gb_set_flags(m, gb_fz(m), 0, 0, c); gb_set_hl(m, r and 65535); return 8; }
+    if op == 41 { let r: Int = gb_hl(m) + gb_hl(m); var c: Int = 0; if r > 65535 { c = 1; } gb_set_flags(m, gb_fz(m), 0, 0, c); gb_set_hl(m, r and 65535); return 8; }
+    if op == 57 { let r: Int = gb_hl(m) + gb_sp(m); var c: Int = 0; if r > 65535 { c = 1; } gb_set_flags(m, gb_fz(m), 0, 0, c); gb_set_hl(m, r and 65535); return 8; }
+    // LD (a16),A / A,(a16) ; LD (a16),SP
+    if op == 234 { gb_write(m, gb_fetch16(m), gb_a(m)); return 16; }
+    if op == 250 { gb_set_a(m, gb_read(m, gb_fetch16(m))); return 16; }
+    if op == 8 { let a: Int = gb_fetch16(m); gb_write(m, a, gb_sp(m) and 255); gb_write(m, a + 1, (gb_sp(m) / 256) and 255); return 20; }
+    // LDH (a8),A / A,(a8) ; LD (C),A / A,(C)
+    if op == 224 { gb_write(m, 65280 + gb_fetch8(m), gb_a(m)); return 12; }
+    if op == 240 { gb_set_a(m, gb_read(m, 65280 + gb_fetch8(m))); return 12; }
+    if op == 226 { gb_write(m, 65280 + peek8(gb_st(m), 3), gb_a(m)); return 8; }
+    if op == 242 { gb_set_a(m, gb_read(m, 65280 + peek8(gb_st(m), 3))); return 8; }
+    // rotates on A (RLCA RRCA RLA RRA)
+    if op == 7 { let c: Int = gb_a(m) / 128 % 2; gb_set_a(m, (gb_a(m) * 2 + c) and 255); gb_set_flags(m, 0, 0, 0, c); return 4; }
+    if op == 15 { let c: Int = gb_a(m) % 2; gb_set_a(m, gb_a(m) / 2 + c * 128); gb_set_flags(m, 0, 0, 0, c); return 4; }
+    if op == 23 { let c: Int = gb_a(m) / 128 % 2; gb_set_a(m, (gb_a(m) * 2 + gb_fc(m)) and 255); gb_set_flags(m, 0, 0, 0, c); return 4; }
+    if op == 31 { let c: Int = gb_a(m) % 2; gb_set_a(m, gb_a(m) / 2 + gb_fc(m) * 128); gb_set_flags(m, 0, 0, 0, c); return 4; }
+    // DAA / CPL / SCF / CCF
+    if op == 39 { return gb_daa(m); }
+    if op == 47 { gb_set_a(m, 255 - gb_a(m)); gb_set_flags(m, gb_fz(m), 1, 1, gb_fc(m)); return 4; }
+    if op == 55 { gb_set_flags(m, gb_fz(m), 0, 0, 1); return 4; }
+    if op == 63 { gb_set_flags(m, gb_fz(m), 0, 0, 1 - gb_fc(m)); return 4; }
+    // immediate ALU (ADD ADC SUB SBC AND XOR OR CP)
+    if op == 198 { gb_alu(m, 0, gb_fetch8(m)); return 8; }
+    if op == 206 { gb_alu(m, 1, gb_fetch8(m)); return 8; }
+    if op == 214 { gb_alu(m, 2, gb_fetch8(m)); return 8; }
+    if op == 222 { gb_alu(m, 3, gb_fetch8(m)); return 8; }
+    if op == 230 { gb_alu(m, 4, gb_fetch8(m)); return 8; }
+    if op == 238 { gb_alu(m, 5, gb_fetch8(m)); return 8; }
+    if op == 246 { gb_alu(m, 6, gb_fetch8(m)); return 8; }
+    if op == 254 { gb_alu(m, 7, gb_fetch8(m)); return 8; }
+    // JP / JP cc / JP (HL)
+    if op == 195 { gb_set_pc(m, gb_fetch16(m)); return 16; }
+    if op == 233 { gb_set_pc(m, gb_hl(m)); return 4; }
+    if op == 194 or op == 202 or op == 210 or op == 218 {
+        let t: Int = gb_fetch16(m); if gb_cond(m, (op - 194) / 8) == 1 { gb_set_pc(m, t); return 16; } return 12;
+    }
+    // JR / JR cc (signed offset)
+    if op == 24 { let o: Int = gb_fetch8(m); gb_set_pc(m, gb_pc(m) + gb_signed(o)); return 12; }
+    if op == 32 or op == 40 or op == 48 or op == 56 {
+        let o: Int = gb_fetch8(m); if gb_cond(m, (op - 32) / 8) == 1 { gb_set_pc(m, gb_pc(m) + gb_signed(o)); return 12; } return 8;
+    }
+    // CALL / CALL cc / RET / RET cc / RETI
+    if op == 205 { let t: Int = gb_fetch16(m); gb_push(m, gb_pc(m)); gb_set_pc(m, t); return 24; }
+    if op == 196 or op == 204 or op == 212 or op == 220 {
+        let t: Int = gb_fetch16(m); if gb_cond(m, (op - 196) / 8) == 1 { gb_push(m, gb_pc(m)); gb_set_pc(m, t); return 24; } return 12;
+    }
+    if op == 201 { gb_set_pc(m, gb_pop(m)); return 16; }
+    if op == 217 { gb_set_pc(m, gb_pop(m)); poke32(gb_st(m), 16, 1); return 16; }     // RETI
+    if op == 192 or op == 200 or op == 208 or op == 216 {
+        if gb_cond(m, (op - 192) / 8) == 1 { gb_set_pc(m, gb_pop(m)); return 20; } return 8;
+    }
+    // PUSH / POP
+    if op == 197 { gb_push(m, gb_bc(m)); return 16; }
+    if op == 213 { gb_push(m, gb_de(m)); return 16; }
+    if op == 229 { gb_push(m, gb_hl(m)); return 16; }
+    if op == 245 { gb_push(m, gb_a(m) * 256 + gb_f(m)); return 16; }
+    if op == 193 { gb_set_bc(m, gb_pop(m)); return 12; }
+    if op == 209 { gb_set_de(m, gb_pop(m)); return 12; }
+    if op == 225 { gb_set_hl(m, gb_pop(m)); return 12; }
+    if op == 241 { let v: Int = gb_pop(m); gb_set_a(m, (v / 256) and 255); gb_set_f(m, v and 255); return 12; }
+    // RST
+    if op % 8 == 7 { if op >= 192 { gb_push(m, gb_pc(m)); gb_set_pc(m, (op - 192) / 8 * 8); return 16; } }
+    // LD SP,HL / ADD SP,r8 / LD HL,SP+r8 (signed; H,C from unsigned low-byte add)
+    if op == 249 { gb_set_sp(m, gb_hl(m)); return 8; }
+    if op == 232 {
+        let off: Int = gb_fetch8(m);
+        var hf: Int = 0; if (gb_sp(m) and 15) + (off and 15) > 15 { hf = 1; }
+        var cf: Int = 0; if (gb_sp(m) and 255) + off > 255 { cf = 1; }
+        gb_set_sp(m, (gb_sp(m) + gb_signed(off)) and 65535);
+        gb_set_flags(m, 0, 0, hf, cf);
+        return 16;
+    }
+    if op == 248 {
+        let off: Int = gb_fetch8(m);
+        var hf: Int = 0; if (gb_sp(m) and 15) + (off and 15) > 15 { hf = 1; }
+        var cf: Int = 0; if (gb_sp(m) and 255) + off > 255 { cf = 1; }
+        gb_set_hl(m, (gb_sp(m) + gb_signed(off)) and 65535);
+        gb_set_flags(m, 0, 0, hf, cf);
+        return 12;
+    }
+    // EI / DI
+    if op == 251 { poke32(gb_st(m), 16, 1); return 4; }
+    if op == 243 { poke32(gb_st(m), 16, 0); return 4; }
+    if op == 16 {                                        // STOP: CGB speed switch when KEY1 ($FF4D) bit0 set
+        if (peek8(gb_mem(m), 65357) and 1) != 0 {
+            var k1: Int = peek8(gb_mem(m), 65357);
+            if k1 / 128 % 2 != 0 { poke8(gb_mem(m), 65357, 0); }    // double -> single
+            if k1 / 128 % 2 == 0 { poke8(gb_mem(m), 65357, 128); }  // single -> double
+        }
+        return 4;
+    }
+    // NOP -> 4 cycles
+    return 4;
+}
+
+fn gb_signed(b: Int) -> Int { if b > 127 { return b - 256; } return b; }
+
+// --- timer (DIV @0xFF04, TIMA @0xFF05, TMA @0xFF06, TAC @0xFF07) ---
+fn gb_timer(m: Int, cycles: Int) -> Int ! {mem} {
+    poke32(gb_st(m), 48, peek32(gb_st(m), 48) + cycles);
+    while peek32(gb_st(m), 48) >= 256 invariant cycles >= 0 {
+        poke32(gb_st(m), 48, peek32(gb_st(m), 48) - 256);
+        poke8(gb_mem(m), 65284, (peek8(gb_mem(m), 65284) + 1) and 255);     // DIV++
+    }
+    let tac: Int = peek8(gb_mem(m), 65287);
+    if tac / 4 % 2 == 1 {                                                 // timer enabled
+        poke32(gb_st(m), 52, peek32(gb_st(m), 52) + cycles);
+        let period: Int = gb_tac_period(tac and 3);
+        while peek32(gb_st(m), 52) >= period invariant period >= 1 {
+            poke32(gb_st(m), 52, peek32(gb_st(m), 52) - period);
+            let t: Int = peek8(gb_mem(m), 65285) + 1;                      // TIMA++
+            if t > 255 { poke8(gb_mem(m), 65285, peek8(gb_mem(m), 65286)); gb_irq(m, 2); }  // reload TMA, request timer int
+            if t <= 255 { poke8(gb_mem(m), 65285, t); }
+        }
+    }
+    return 0;
+}
+fn gb_tac_period(sel: Int) -> Int {
+    if sel == 0 { return 1024; }
+    if sel == 1 { return 16; }
+    if sel == 2 { return 64; }
+    return 256;
+}
+
+// Request interrupt bit `b` in IF (0xFF0F): 0 vblank 1 stat 2 timer 3 serial 4 joypad.
+fn gb_irq(m: Int, b: Int) -> Int ! {mem} {
+    poke8(gb_mem(m), 65295, peek8(gb_mem(m), 65295) or gb_p2(b));
+    return 0;
+}
+// Service a pending+enabled interrupt (IME set). Returns cycles consumed.
+fn gb_service_int(m: Int) -> Int ! {mem} {
+    if peek32(gb_st(m), 16) == 0 { return 0; }
+    let pend: Int = peek8(gb_mem(m), 65295) and peek8(gb_mem(m), 65535);   // IF & IE
+    if pend == 0 { return 0; }
+    var b: Int = 0;
+    while b < 5 invariant b >= 0 {
+        if pend / gb_p2(b) % 2 == 1 {
+            poke8(gb_mem(m), 65295, peek8(gb_mem(m), 65295) - gb_p2(b));    // clear IF bit
+            poke32(gb_st(m), 16, 0);                                       // IME = 0
+            poke32(gb_st(m), 20, 0);                                       // wake from HALT
+            gb_push(m, gb_pc(m)); gb_set_pc(m, 64 + b * 8);                      // vector 0x40 + b*8
+            return 20;
+        }
+        b = b + 1;
+    }
+    return 0;
+}
+
+// --- PPU: background renderer (first increment; window+sprites+scanline next) ---
+// Maps a 2-bit color id through BGP to a grayscale ARGB pixel.
+fn gb_shade(id: Int, bgp: Int) -> Int {
+    let s: Int = bgp / gb_p2(id * 2) % 4;
+    let lvl: Int = (3 - s) * 85;                     // s0=255 .. s3=0
+    return lvl + lvl * 256 + lvl * 65536 + 4278190080;
+}
+
+fn gb_sprite_color(m: Int, attr: Int, cid: Int, pal: Int) -> Int ! {mem} {
+    if peek8(gb_st(m), 48) == 1 { return gbc_color(m, 64 + (attr and 7) * 8 + cid * 2); }
+    return gb_shade(cid, pal);
+}
+
+fn gb_draw_sprite_row(m: Int, py: Int, sx: Int, attr: Int, pal: Int, lo: Int, hi: Int) -> Int ! {mem} {
+    var col: Int = 0;
+    while col < 8 invariant col >= 0 {
+        let px: Int = sx + col;
+        if px >= 0 { if px < 160 {
+            var bit: Int = 7 - col;
+            if attr / 32 % 2 == 1 { bit = col; }
+            let cid: Int = hi / gb_p2(bit) % 2 * 2 + lo / gb_p2(bit) % 2;
+            if cid != 0 { poke32(gb_fb(m), (py * 160 + px) * 4, gb_sprite_color(m, attr, cid, pal)); }
+        } }
+        col = col + 1;
+    }
+    return 0;
+}
+
+// Sprite (OAM) pass: 40 entries at 0xFE00 {Y, X, tile, attr}, drawn over the
+// BG/window with color-0 transparency, X/Y flip, OBP0/OBP1 palette, 8x8 or 8x16.
+fn gb_draw_sprites(m: Int) -> Int ! {mem} {
+    let lcdc: Int = peek8(gb_mem(m), 65344);
+    if lcdc / 2 % 2 == 0 { return 0; }               // OBJ disabled (LCDC bit1)
+    var height: Int = 8;
+    if lcdc / 4 % 2 == 1 { height = 16; }            // bit2: 8x16
+    var s: Int = 0;
+    while s < 40 invariant s >= 0 {
+        let oa: Int = 65024 + s * 4;                 // 0xFE00
+        let sy: Int = peek8(gb_mem(m), oa) - 16;
+        let sx: Int = peek8(gb_mem(m), oa + 1) - 8;
+        var tile: Int = peek8(gb_mem(m), oa + 2);
+        if height == 16 { tile = tile - tile % 2; }
+        let attr: Int = peek8(gb_mem(m), oa + 3);
+        var pal: Int = peek8(gb_mem(m), 65352);       // OBP0
+        if attr / 16 % 2 == 1 { pal = peek8(gb_mem(m), 65353); }   // OBP1
+        var row: Int = 0;
+        while row < height invariant row >= 0 {
+            var tr: Int = row;
+            if attr / 64 % 2 == 1 { tr = height - 1 - row; }     // Y-flip (independent of py)
+            let taddr: Int = 32768 + tile * 16 + tr * 2;          // sprites: 0x8000
+            var lo: Int = peek8(gb_mem(m), taddr);
+            var hi: Int = peek8(gb_mem(m), taddr + 1);
+            if peek8(gb_st(m), 48) == 1 { if (attr and 8) != 0 {   // CGB: VRAM bank 1
+                lo = peek8(gbc_vram1(m), tile * 16 + tr * 2);
+                hi = peek8(gbc_vram1(m), tile * 16 + tr * 2 + 1);
+            } }
+            let py: Int = sy + row;
+            if py >= 0 { if py < 144 { gb_draw_sprite_row(m, py, sx, attr, pal, lo, hi); } }
+            row = row + 1;
+        }
+        s = s + 1;
+    }
+    return 0;
+}
+
+fn gb_bg_taddr(m: Int, tmap: Int, sxc: Int, syc: Int, unsig: Int) -> Int ! {mem} {
+    let tidx: Int = peek8(gb_mem(m), tmap + (syc / 8) * 32 + (sxc / 8));
+    if unsig == 0 { return 36864 + gb_signed(tidx) * 16; }
+    return 32768 + tidx * 16;
+}
+
+fn gb_bg_cid(m: Int, taddr: Int, sxc: Int, syc: Int) -> Int ! {mem} {
+    let lo: Int = peek8(gb_mem(m), taddr + (syc % 8) * 2);
+    let hi: Int = peek8(gb_mem(m), taddr + (syc % 8) * 2 + 1);
+    let bit: Int = 7 - sxc % 8;
+    return hi / gb_p2(bit) % 2 * 2 + lo / gb_p2(bit) % 2;
+}
+
+fn gb_bg_cgb_color(m: Int, tmap: Int, sxc: Int, syc: Int, cid: Int) -> Int ! {mem} {
+    let attr: Int = peek8(gbc_vram1(m), tmap + (syc / 8) * 32 + (sxc / 8) - 32768);
+    return gbc_color(m, (attr and 7) * 8 + cid * 2);
+}
+
+fn gb_render_px(m: Int, lx: Int, ly: Int, scy: Int, scx: Int, bgp: Int, bgmap: Int, unsig: Int, winrow: Int, wmap: Int, wx: Int, wy: Int) -> Int ! {mem} {
+    var tmap: Int = bgmap; var sxc: Int = (lx + scx) % 256; var syc: Int = (ly + scy) % 256;
+    if winrow == 1 { if lx + 7 >= wx { tmap = wmap; sxc = lx + 7 - wx; syc = ly - wy; } }
+    let taddr: Int = gb_bg_taddr(m, tmap, sxc, syc, unsig);
+    let cid: Int = gb_bg_cid(m, taddr, sxc, syc);
+    if peek8(gb_st(m), 48) == 1 { return gb_bg_cgb_color(m, tmap, sxc, syc, cid); }
+    return gb_shade(cid, bgp);
+}
+
+// Render BG + window into the 160x144 framebuffer, then the sprite pass on top
+// (frame-based; a cycle-accurate per-scanline pipeline is the next step). Reads
+// LCDC/SCY/SCX/BGP/WX/WY + VRAM from the GB address space.
+fn gb_render(m: Int) -> Int ! {mem} {
+    let lcdc: Int = peek8(gb_mem(m), 65344);          // 0xFF40
+    if lcdc / 128 % 2 == 0 {                          // LCD off -> white screen
+        var i: Int = 0;
+        while i < 23040 invariant i >= 0 { poke32(gb_fb(m), i * 4, 4294967295); i = i + 1; }
+        return 0;
+    }
+    let scy: Int = peek8(gb_mem(m), 65346);
+    let scx: Int = peek8(gb_mem(m), 65347);
+    let bgp: Int = peek8(gb_mem(m), 65351);
+    let unsig: Int = lcdc / 16 % 2;
+    let we: Int = lcdc / 32 % 2;
+    let bgmap: Int = 38912 + (lcdc / 8 % 2) * 2048;
+    let wmap: Int = 38912 + (lcdc / 64 % 2) * 2048;
+    let wx: Int = peek8(gb_mem(m), 65355);
+    let wy: Int = peek8(gb_mem(m), 65354);
+    var ly: Int = 0;
+    while ly < 144 invariant ly >= 0 {
+        var winrow: Int = 0;
+        if we == 1 { if ly >= wy { winrow = 1; } }
+        var lx: Int = 0;
+        while lx < 160 invariant lx >= 0 {
+            var color: Int = 4294967295;
+            if lcdc % 2 == 1 { color = gb_render_px(m, lx, ly, scy, scx, bgp, bgmap, unsig, winrow, wmap, wx, wy); }
+            poke32(gb_fb(m), (ly * 160 + lx) * 4, color);
+            lx = lx + 1;
+        }
+        ly = ly + 1;
+    }
+    gb_draw_sprites(m);
+    return 0;
+}
+
+// ===== core ABI =====
+// core_id() split into cores/gb_id.sg (sigil-Retropie#13, matching cores/genesis_id.sg's
+// precedent) — link gb_id.sg for standalone GB; cores/gbc.sg supplies its own core_id
+// for GBC, so linking both gb.sg and gbc.sg together must NOT also pull in gb_id.sg
+// (cc0 has no first-def-wins; two core_id() defs is a hard compile error).
+fn core_rom_max() -> Int { return 2097152; }         // 2 MB
+fn core_fb(m: Int) -> Int { return gb_fb(m); }
+fn core_fb_w() -> Int { return 160; }
+fn core_fb_h() -> Int { return 144; }
+
+fn core_load(m: Int, rom: Int, len: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < len invariant i >= 0 { poke8(gb_rom(m), i, peek8(rom, i)); i = i + 1; }
+    var z: Int = 0;
+    while z < 65536 invariant z >= 0 { poke8(gb_mem(m), z, 0); z = z + 1; }   // clear addr space
+    var s: Int = 0;
+    while s < 64 invariant s >= 0 { poke8(gb_st(m), s, 0); s = s + 1; }
+    gb_set_pc(m, 256);                                  // entry after boot ROM (0x100)
+    gb_set_sp(m, 65534);                                // 0xFFFE
+    poke32(gb_st(m), 24, 1);                          // ROM bank 1
+    poke32(gb_st(m), 60, gb_cart_mbc(peek8(gb_rom(m), 327)));   // 0x0147 cartridge type
+    if (peek8(gb_rom(m), 323) and 128) != 0 { poke8(gb_st(m), 48, 1); }   // 0x0143 CGB flag -> color mode
+    poke8(gb_mem(m), 65535, 0);                        // IE
+    return 1;
+}
+
+// Map normalized buttons -> GB joypad (0xFF00 select bits handled by ROM; we
+// stash the pressed state for the PPU-era input read).
+// Multi-port input ABI (sigil-Retropie#4). Game Boy is single-player.
+fn core_set_input_port(m: Int, port: Int, buttons: Int) -> Int ! {mem} {
+    if port == 0 { poke32(gb_st(m), 56, buttons); }
+    return 0;
+}
+fn core_set_input(m: Int, buttons: Int) -> Int ! {mem} { return core_set_input_port(m, 0, buttons); }
+fn core_max_players() -> Int { return 1; }
+
+// Per-scanline LY/STAT update (0xFF44 LY, 0xFF45 LYC, 0xFF41 STAT). Mode is
+// per-line (1=VBlank for LY>=144 else 2); cycle-exact mode 2/3/0 within a line
+// is a later refinement. Fires the STAT coincidence interrupt on LY==LYC.
+fn gb_stat_ly(m: Int, line: Int) -> Int ! {mem} {
+    poke8(gb_mem(m), 65348, line);                    // LY
+    let stat: Int = peek8(gb_mem(m), 65345);
+    var ns: Int = stat - stat % 8;                   // clear mode + coincidence bits
+    if line >= 144 { ns = ns + 1; }
+    if line < 144 { ns = ns + 2; }
+    if line == peek8(gb_mem(m), 65349) {              // LY == LYC
+        ns = ns + 4;
+        if stat / 64 % 2 == 1 { gb_irq(m, 1); }         // STAT (coincidence) interrupt
+    }
+    poke8(gb_mem(m), 65345, ns);
+    return 0;
+}
+
+// Set JUST the STAT mode bits (0-1), leaving LY/LYC-coincidence untouched.
+// Real DMG timing per visible scanline (456 T-cycles, or 912 in CGB double-
+// speed): mode 2 (OAM search, ~80 cyc) -> mode 3 (pixel transfer, ~172 cyc)
+// -> mode 0 (HBlank, remainder). The upstream core only ever set mode 1
+// (VBlank) or mode 2 for a WHOLE line — mode 3 was never produced at all
+// (its own comment: "cycle-exact mode 2/3/0 within a line is a later
+// refinement"). That's a real, documented gap: any game polling STAT for
+// mode==3 (a common raster-timing idiom) spins forever, since the condition
+// it waits for can never become true. Fixed here with the standard
+// approximate 80/172/204-cycle split (native-port fix, not upstream yet).
+fn gb_stat_mode(m: Int, mode: Int) -> Int ! {mem} {
+    let stat: Int = peek8(gb_mem(m), 65345);
+    poke8(gb_mem(m), 65345, (stat - stat % 4) + mode);
+    return 0;
+}
+
+// Advance one frame: 154 scanlines x 456 T-cycles, updating LY/STAT each line and
+// firing V-blank at line 144, then present the rendered image via core_fb().
+fn core_run_frame(m: Int) -> Int ! {mem} {
+    var line: Int = 0;
+    var linecyc: Int = 456;
+    if (peek8(gb_mem(m), 65357) and 128) != 0 { linecyc = 912; }   // CGB double-speed ($FF4D bit7): 2x CPU cycles/line
+    let oam_end: Int = linecyc * 80 / 456;
+    let xfer_end: Int = linecyc * 252 / 456;
+    while line < 154 invariant line >= 0 {
+        gb_stat_ly(m, line);
+        if line == 144 { gb_irq(m, 0); }                // V-blank
+        var c: Int = 0;
+        var mode3_set: Int = 0;
+        var mode0_set: Int = 0;
+        while c < linecyc invariant c >= 0 {
+            if line < 144 {
+                if c >= oam_end { if mode3_set == 0 { gb_stat_mode(m, 3); mode3_set = 1; } }
+                if c >= xfer_end { if mode0_set == 0 { gb_stat_mode(m, 0); mode0_set = 1; } }
+            }
+            let used: Int = gb_step(m) + gb_service_int(m);
+            gb_timer(m, used);
+            c = c + used;
+        }
+        line = line + 1;
+    }
+    gb_render(m);
+    return 0;
+}
+
+// --- save state (cross-cutting runtime ABI, same shape as the other cores) ---
+// $0000-$7FFF reads route to gb_rom (banked via rom_bank in gb_st), so only gb_st (CPU +
+// timer + rom_bank/ram_enable + IME/HALT) and gb_mem $8000-$FFFF (VRAM/WRAM/cart-SRAM/OAM/
+// IO/HRAM) are mutable. ROM is constant; the bank reg in gb_st re-derives the $0000-$7FFF map.
+fn gb_copy(m: Int, dst: Int, doff: Int, src: Int, soff: Int, len: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < len invariant i >= 0 { poke8(dst, doff + i, peek8(src, soff + i)); i = i + 1; }
+    return 0;
+}
+fn core_state_size() -> Int { return 32832; }            // 64 (st) + 32768 ($8000-$FFFF)
+fn core_save_state(m: Int, buf: Int) -> Int ! {mem} {
+    gb_copy(m, buf, 0, gb_st(m), 0, 64);
+    gb_copy(m, buf, 64, gb_mem(m), 32768, 32768);
+    return core_state_size();
+}
+fn core_load_state(m: Int, buf: Int) -> Int ! {mem} {
+    gb_copy(m, gb_st(m), 0, buf, 0, 64);
+    gb_copy(m, gb_mem(m), 32768, buf, 64, 32768);
+    return 0;
+}
+
+// Savestate: 65536 bytes from gb_mem(m) (full 64KB GB address space: VRAM/WRAM/OAM/IO/HRAM)
+// + 64 bytes from gb_st(m) (CPU registers). Display excluded (regenerated by core_run_frame).
+fn core_savestate(m: Int, dst: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 65536 invariant i >= 0 {
+        poke8(dst, i, peek8(gb_mem(m), i));
+        i = i + 1;
+    }
+    var j: Int = 0;
+    while j < 64 invariant j >= 0 {
+        poke8(dst, 65536+j, peek8(gb_st(m), j));
+        j = j + 1;
+    }
+    return 0;
+}
+fn core_loadstate(m: Int, src: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 65536 invariant i >= 0 {
+        poke8(gb_mem(m), i, peek8(src, i));
+        i = i + 1;
+    }
+    var j: Int = 0;
+    while j < 64 invariant j >= 0 {
+        poke8(gb_st(m), j, peek8(src, 65536+j));
+        j = j + 1;
+    }
+    return 0;
+}
+fn core_savestate_size() -> Int { return 65600; }

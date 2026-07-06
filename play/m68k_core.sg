@@ -1,0 +1,366 @@
+// cores/m68k.sg — shared Motorola 68000 CPU core, extracted (behavior-preserving) from cores/
+// genesis.sg per Director #99 so the 68000 tier (Neo Geo / Amiga / Atari ST) reuses ONE m68k
+// primitive instead of coupling it inside Genesis. Function names keep the gn_ prefix to make the
+// extraction byte-identical (no rename churn). The SEAM a system provides: the bus hooks gn_read8/
+// gn_write8/gn_read16/gn_read32/gn_write16/gn_write32 (the CPU calls them; each system maps its own
+// memory). CPU state lives in gn_st (D0-7 @0-28, A0-7 @32-60, PC @64, SR @68; a system may use the
+// region above 80 for its own state, as Genesis does for the VDP). Int-subset, decimal literals.
+
+fn gn_st(m: Int) -> Int { return m + 65536; }           // base+65536: CPU register file
+
+fn gn_pow2(n: Int) -> Int { var p: Int = 1; var i: Int = 0; while i < n invariant i >= 0 { p = p * 2; i = i + 1; } return p; }
+
+// ST layout: D0..D7 @ 0,4,..28 ; A0..A7 @ 32,36,..60 ; PC @ 64 ; SR @ 68 (16-bit).
+fn gn_d(m: Int, n: Int) -> Int ! {mem} { return peek32(gn_st(m), n * 4); }
+
+fn gn_set_d(m: Int, n: Int, v: Int) -> Int ! {mem} { poke32(gn_st(m), n * 4, v and 4294967295); return 0; }
+
+fn gn_a(m: Int, n: Int) -> Int ! {mem} { return peek32(gn_st(m), 32 + n * 4); }
+
+fn gn_set_a(m: Int, n: Int, v: Int) -> Int ! {mem} { poke32(gn_st(m), 32 + n * 4, v and 4294967295); return 0; }
+
+fn gn_pc(m: Int) -> Int ! {mem} { return peek32(gn_st(m), 64); }
+
+fn gn_set_pc(m: Int, v: Int) -> Int ! {mem} { poke32(gn_st(m), 64, v and 16777215); return 0; }   // 24-bit address bus
+
+fn gn_sr(m: Int) -> Int ! {mem} { return peek32(gn_st(m), 68); }
+
+fn gn_set_sr(m: Int, v: Int) -> Int ! {mem} { poke32(gn_st(m), 68, v and 65535); return 0; }
+
+// --- the bus-mode dispatch (the Sega CD dual-68000 seam, Director-greenlit). The engine routes every
+// bus access through these dispatchers. In MAIN mode (default 0) they hit the per-system bus seam
+// (gn_read8/gn_write8/...); in SUB mode (1) they hit the SUB-CPU bus seam (gn_sub_read8/...). m68k.sg
+// is the HOOK ONLY — it declares no gn_sub_* body, so every m68k build links exactly one provider:
+// single-bus systems (Genesis/Amiga/Atari ST/Neo Geo/CPS/X68000/Jaguar/Pico) link cores/m68k_singlebus.sg
+// (the return-0 no-op body; their builds never set sub mode). The dual-bus system (the Sega CD) links
+// cores/segacd.sg instead, which supplies the real gn_sub_* body. Never link both providers together —
+// single-definition-with-dispatch (Director ruling), not first-def-wins shadowing (cc0 doesn't do that).
+// The mode lives at gn_st @76 — a GLOBAL, outside the 72-byte register context a dual-CPU system
+// save/restores per CPU AND clear of cores/genesis.sg's input word @72-75 (which core_set_input writes)
+// and the VDP regs @80+; @76-79 is free across all m68k systems.
+fn gn_busmode(m: Int) -> Int ! {mem} { return peek8(gn_st(m), 76); }
+fn gn_set_busmode(m: Int, mode: Int) -> Int ! {mem} { poke8(gn_st(m), 76, mode and 1); return 0; }
+fn gn_dread8(m: Int, a: Int) -> Int ! {mem} { if gn_busmode(m) == 1 { return gn_sub_read8(m, a); } return gn_read8(m, a); }
+fn gn_dread16(m: Int, a: Int) -> Int ! {mem} { if gn_busmode(m) == 1 { return gn_sub_read16(m, a); } return gn_read16(m, a); }
+fn gn_dread32(m: Int, a: Int) -> Int ! {mem} { if gn_busmode(m) == 1 { return gn_sub_read32(m, a); } return gn_read32(m, a); }
+fn gn_dwrite8(m: Int, a: Int, v: Int) -> Int ! {mem} { if gn_busmode(m) == 1 { gn_sub_write8(m, a, v); return 0; } gn_write8(m, a, v); return 0; }
+fn gn_dwrite16(m: Int, a: Int, v: Int) -> Int ! {mem} { if gn_busmode(m) == 1 { gn_sub_write16(m, a, v); return 0; } gn_write16(m, a, v); return 0; }
+fn gn_dwrite32(m: Int, a: Int, v: Int) -> Int ! {mem} { if gn_busmode(m) == 1 { gn_sub_write32(m, a, v); return 0; } gn_write32(m, a, v); return 0; }
+
+// fetch the next 16-bit opcode/extension word (PC += 2)
+fn gn_fetch16(m: Int) -> Int ! {mem} { let w: Int = gn_dread16(m, gn_pc(m)); gn_set_pc(m, gn_pc(m) + 2); return w; }
+
+// sign-extend an 8-bit value to a 32-bit (masked) value
+fn gn_sx8(v: Int) -> Int { if (v and 128) != 0 { return (v - 256) and 4294967295; } return v and 255; }
+
+fn gn_sx16(v: Int) -> Int { if (v and 32768) != 0 { return (v - 65536) and 4294967295; } return v and 65535; }
+
+fn gn_szmask(size: Int) -> Int { if size == 1 { return 255; } if size == 2 { return 65535; } return 4294967295; }
+
+// read/write a value of `size` (1/2/4) through the big-endian bus
+fn gn_memread(m: Int, a: Int, size: Int) -> Int ! {mem} {
+    if size == 1 { return gn_dread8(m, a); }
+    if size == 2 { return gn_dread16(m, a); }
+    return gn_dread32(m, a);
+}
+
+fn gn_memwrite(m: Int, a: Int, size: Int, v: Int) -> Int ! {mem} {
+    if size == 1 { gn_dwrite8(m, a, v); }
+    if size != 1 { if size == 2 { gn_dwrite16(m, a, v); } }
+    if size != 1 { if size != 2 { gn_dwrite32(m, a, v); } }
+    return 0;
+}
+
+// immediate operand of `size` (byte = low byte of one extension word)
+fn gn_imm(m: Int, size: Int) -> Int ! {mem} {
+    if size == 4 { return gn_fetch16(m) * 65536 + gn_fetch16(m); }
+    let w: Int = gn_fetch16(m);
+    if size == 1 { return w and 255; }
+    return w and 65535;
+}
+
+// effective address for the MEMORY modes (2..7); fetches extension words as needed
+fn gn_ea_addr(m: Int, mode: Int, reg: Int, size: Int) -> Int ! {mem} {
+    if mode == 2 { return gn_a(m, reg) and 16777215; }                                  // (An)
+    if mode == 3 { let a: Int = gn_a(m, reg) and 16777215; gn_set_a(m, reg, a + size); return a; }   // (An)+
+    if mode == 4 { let a: Int = (gn_a(m, reg) - size) and 16777215; gn_set_a(m, reg, a); return a; } // -(An)
+    if mode == 5 { return (gn_a(m, reg) + gn_sx16(gn_fetch16(m))) and 16777215; }         // d16(An)
+    if mode == 7 {
+        if reg == 0 { return gn_sx16(gn_fetch16(m)) and 16777215; }                    // abs.W
+        if reg == 1 { return (gn_fetch16(m) * 65536 + gn_fetch16(m)) and 16777215; }    // abs.L
+        if reg == 2 { let pc: Int = gn_pc(m); return (pc + gn_sx16(gn_fetch16(m))) and 16777215; }  // d16(PC)
+    }
+    return 0;                                                                         // (index modes: follow-up)
+}
+
+fn gn_ea_read(m: Int, mode: Int, reg: Int, size: Int) -> Int ! {mem} {
+    if mode == 0 { return gn_d(m, reg) and gn_szmask(size); }                            // Dn
+    if mode == 1 { return gn_a(m, reg) and gn_szmask(size); }                            // An
+    if mode == 7 { if reg == 4 { return gn_imm(m, size); } }                             // #imm
+    return gn_memread(m, gn_ea_addr(m, mode, reg, size), size);
+}
+
+// size-aware Dn write: byte/word preserve the unaffected high bits
+fn gn_set_d_sz(m: Int, reg: Int, v: Int, size: Int) -> Int ! {mem} {
+    if size == 4 { gn_set_d(m, reg, v); return 0; }
+    let old: Int = gn_d(m, reg);
+    if size == 1 { gn_set_d(m, reg, (old and 4294967040) + (v and 255)); }
+    if size != 1 { gn_set_d(m, reg, (old and 4294901760) + (v and 65535)); }
+    return 0;
+}
+
+fn gn_ea_write(m: Int, mode: Int, reg: Int, size: Int, v: Int) -> Int ! {mem} {
+    if mode == 0 { gn_set_d_sz(m, reg, v, size); return 0; }                             // Dn
+    if mode == 1 { gn_set_a(m, reg, v); return 0; }                                      // An (full 32)
+    gn_memwrite(m, gn_ea_addr(m, mode, reg, size), size, v); return 0;
+}
+
+// MOVE sets N,Z from the result (V,C cleared); SR bits N=3 Z=2 V=1 C=0
+fn gn_setnz(m: Int, v: Int, size: Int) -> Int ! {mem} {
+    let sm: Int = gn_szmask(size);
+    var hib: Int = 128; if size == 2 { hib = 32768; } if size == 4 { hib = 2147483648; }
+    var sr: Int = gn_sr(m) and 65520;                                                  // clear N,Z,V,C
+    if (v and sm) == 0 { sr = sr + 4; }                                                // Z
+    if (v and hib) != 0 { sr = sr + 8; }                                              // N
+    gn_set_sr(m, sr); return 0;
+}
+
+// --- ALU: set N/Z/V/C/X then return; sign bit per size ---
+fn gn_hibit(size: Int) -> Int { if size == 1 { return 128; } if size == 2 { return 32768; } return 2147483648; }
+
+fn gn_setnzvc(m: Int, r: Int, size: Int, c: Int, v: Int) -> Int ! {mem} {
+    let sm: Int = gn_szmask(size);
+    let rr: Int = r and sm;
+    var sr: Int = gn_sr(m) and 65504;                       // clear X,N,Z,V,C (bits 0-4)
+    if rr == 0 { sr = sr + 4; }                            // Z (bit2)
+    if (rr and gn_hibit(size)) != 0 { sr = sr + 8; }       // N (bit3)
+    if c != 0 { sr = sr + 1; sr = sr + 16; }               // C (bit0) + X (bit4)
+    if v != 0 { sr = sr + 2; }                             // V (bit1)
+    gn_set_sr(m, sr); return 0;
+}
+
+fn gn_add(m: Int, a: Int, b: Int, size: Int) -> Int ! {mem} {
+    let sm: Int = gn_szmask(size); let hib: Int = gn_hibit(size);
+    let aa: Int = a and sm; let bb: Int = b and sm;
+    let raw: Int = aa + bb; let r: Int = raw and sm;
+    var c: Int = 0; if raw > sm { c = 1; }
+    var v: Int = 0; if (aa and hib) == (bb and hib) { if (r and hib) != (aa and hib) { v = 1; } }
+    gn_setnzvc(m, r, size, c, v); return r;
+}
+
+fn gn_sub(m: Int, a: Int, b: Int, size: Int) -> Int ! {mem} {              // a - b
+    let sm: Int = gn_szmask(size); let hib: Int = gn_hibit(size);
+    let aa: Int = a and sm; let bb: Int = b and sm;
+    let r: Int = (aa - bb) and sm;
+    var c: Int = 0; if bb > aa { c = 1; }                  // borrow
+    var v: Int = 0; if (aa and hib) != (bb and hib) { if (r and hib) != (aa and hib) { v = 1; } }
+    gn_setnzvc(m, r, size, c, v); return r;
+}
+
+// bitwise XOR without a bit loop: (a|b) - (a&b) (no borrow, since or>=and per bit)
+fn gn_xor(a: Int, b: Int) -> Int { return (a or b) - (a and b); }
+
+// ALU dispatch (top nibbles 8 OR, 9 SUB, B CMP/EOR, C AND, D ADD). Returns 1 if handled.
+fn gn_alu(m: Int, op: Int) -> Int ! {mem} {
+    let topn: Int = op / 4096;
+    if topn != 8 { if topn != 9 { if topn != 11 { if topn != 12 { if topn != 13 { return 0; } } } } }
+    let opmode: Int = (op / 64) and 7;
+    if opmode == 3 { return 0; }                           // ADDA/SUBA/CMPA word (follow-up)
+    if opmode == 7 { return 0; }                           // ...long (follow-up)
+    var size: Int = 4; let lo: Int = opmode and 3;
+    if lo == 0 { size = 1; } if lo == 1 { size = 2; }
+    let dir: Int = opmode / 4;
+    let dn: Int = (op / 512) and 7;
+    let mode: Int = (op / 8) and 7; let reg: Int = op and 7;
+    if dir == 0 {                                          // <ea> op Dn -> Dn
+        let ea: Int = gn_ea_read(m, mode, reg, size);
+        let dv: Int = gn_d(m, dn) and gn_szmask(size);
+        if topn == 13 { gn_set_d_sz(m, dn, gn_add(m, dv, ea, size), size); }
+        if topn == 9 { gn_set_d_sz(m, dn, gn_sub(m, dv, ea, size), size); }
+        if topn == 11 { gn_sub(m, dv, ea, size); }            // CMP: flags only
+        if topn == 12 { let r: Int = dv and ea; gn_setnzvc(m, r, size, 0, 0); gn_set_d_sz(m, dn, r, size); }
+        if topn == 8 { let r: Int = dv or ea; gn_setnzvc(m, r, size, 0, 0); gn_set_d_sz(m, dn, r, size); }
+        return 1;
+    }
+    let dv: Int = gn_d(m, dn) and gn_szmask(size);            // Dn op <ea> -> <ea>
+    let ea: Int = gn_ea_read(m, mode, reg, size);
+    if topn == 13 { gn_ea_write(m, mode, reg, size, gn_add(m, ea, dv, size)); }
+    if topn == 9 { gn_ea_write(m, mode, reg, size, gn_sub(m, ea, dv, size)); }
+    if topn == 12 { let r: Int = ea and dv; gn_setnzvc(m, r, size, 0, 0); gn_ea_write(m, mode, reg, size, r); }
+    if topn == 8 { let r: Int = ea or dv; gn_setnzvc(m, r, size, 0, 0); gn_ea_write(m, mode, reg, size, r); }
+    if topn == 11 { let r: Int = gn_xor(ea, dv) and gn_szmask(size); gn_setnzvc(m, r, size, 0, 0); gn_ea_write(m, mode, reg, size, r); }  // EOR
+    return 1;
+}
+
+// Immediate ALU: ORI/ANDI/SUBI/ADDI/EORI/CMPI #imm,<ea> ($0xxx family). Returns 1 if handled.
+fn gn_immalu(m: Int, op: Int) -> Int ! {mem} {
+    if (op / 4096) != 0 { return 0; }
+    let opn: Int = (op / 256) and 15;                      // 0 ORI 2 ANDI 4 SUBI 6 ADDI 10 EORI 12 CMPI
+    if opn != 0 { if opn != 2 { if opn != 4 { if opn != 6 { if opn != 10 { if opn != 12 { return 0; } } } } } }
+    let sizebits: Int = (op / 64) and 3;
+    if sizebits == 3 { return 0; }
+    var size: Int = 4; if sizebits == 0 { size = 1; } if sizebits == 1 { size = 2; }
+    let imm: Int = gn_imm(m, size);                           // immediate extension word(s) first
+    let mode: Int = (op / 8) and 7; let reg: Int = op and 7;
+    let v: Int = gn_ea_read(m, mode, reg, size);
+    if opn == 0 { let r: Int = v or imm; gn_setnzvc(m, r, size, 0, 0); gn_ea_write(m, mode, reg, size, r); }
+    if opn == 2 { let r: Int = v and imm; gn_setnzvc(m, r, size, 0, 0); gn_ea_write(m, mode, reg, size, r); }
+    if opn == 10 { let r: Int = gn_xor(v, imm) and gn_szmask(size); gn_setnzvc(m, r, size, 0, 0); gn_ea_write(m, mode, reg, size, r); }
+    if opn == 4 { gn_ea_write(m, mode, reg, size, gn_sub(m, v, imm, size)); }
+    if opn == 6 { gn_ea_write(m, mode, reg, size, gn_add(m, v, imm, size)); }
+    if opn == 12 { gn_sub(m, v, imm, size); }                 // CMPI: flags only
+    return 1;
+}
+
+// $4xxx misc: TST/CLR/NEG/NOT (sized <ea>) + SWAP Dn. Returns 1 if handled.
+fn gn_op4(m: Int, op: Int) -> Int ! {mem} {
+    if (op / 4096) != 4 { return 0; }
+    let hi: Int = op / 256;
+    let sizebits: Int = (op / 64) and 3;
+    let mode: Int = (op / 8) and 7;
+    let reg: Int = op and 7;
+    if sizebits != 3 {
+        var size: Int = 4; if sizebits == 0 { size = 1; } if sizebits == 1 { size = 2; }
+        if hi == 74 { gn_setnzvc(m, gn_ea_read(m, mode, reg, size), size, 0, 0); return 1; }        // TST
+        if hi == 66 { gn_ea_write(m, mode, reg, size, 0); gn_setnzvc(m, 0, size, 0, 0); return 1; } // CLR
+        if hi == 68 { gn_ea_write(m, mode, reg, size, gn_sub(m, 0, gn_ea_read(m, mode, reg, size), size)); return 1; }  // NEG
+        if hi == 70 {                                                                          // NOT
+            let r: Int = gn_xor(gn_ea_read(m, mode, reg, size), gn_szmask(size)) and gn_szmask(size);
+            gn_setnzvc(m, r, size, 0, 0); gn_ea_write(m, mode, reg, size, r); return 1;
+        }
+    }
+    if op >= 18496 { if op <= 18503 {                                                          // SWAP Dn ($4840-$4847)
+        let d: Int = gn_d(m, reg);
+        let r: Int = (((d and 65535) * 65536) + ((d / 65536) and 65535)) and 4294967295;
+        gn_set_d(m, reg, r); gn_setnzvc(m, r, 4, 0, 0); return 1;
+    } }
+    return 0;
+}
+
+// --- control flow: condition codes, stack, branches ---
+fn gn_flag(m: Int, b: Int) -> Int ! {mem} { return (gn_sr(m) / gn_pow2(b)) and 1; }      // 0=C 1=V 2=Z 3=N
+
+fn gn_cond(m: Int, cc: Int) -> Int ! {mem} {
+    let c: Int = gn_flag(m, 0); let v: Int = gn_flag(m, 1); let z: Int = gn_flag(m, 2); let n: Int = gn_flag(m, 3);
+    if cc == 0 { return 1; }                                            // T
+    if cc == 1 { return 0; }                                            // F
+    if cc == 2 { if c == 0 { if z == 0 { return 1; } } return 0; }      // HI
+    if cc == 3 { if c == 1 { return 1; } if z == 1 { return 1; } return 0; }  // LS
+    if cc == 4 { if c == 0 { return 1; } return 0; }                    // CC/HS
+    if cc == 5 { return c; }                                            // CS/LO
+    if cc == 6 { if z == 0 { return 1; } return 0; }                    // NE
+    if cc == 7 { return z; }                                            // EQ
+    if cc == 8 { if v == 0 { return 1; } return 0; }                    // VC
+    if cc == 9 { return v; }                                            // VS
+    if cc == 10 { if n == 0 { return 1; } return 0; }                   // PL
+    if cc == 11 { return n; }                                           // MI
+    if cc == 12 { if n == v { return 1; } return 0; }                   // GE
+    if cc == 13 { if n != v { return 1; } return 0; }                   // LT
+    if cc == 14 { if z == 0 { if n == v { return 1; } } return 0; }     // GT
+    if z == 1 { return 1; } if n != v { return 1; } return 0;           // LE (cc 15)
+}
+
+fn gn_push32(m: Int, v: Int) -> Int ! {mem} { let sp: Int = (gn_a(m, 7) - 4) and 16777215; gn_set_a(m, 7, sp); gn_dwrite32(m, sp, v); return 0; }
+
+fn gn_pop32(m: Int) -> Int ! {mem} { let sp: Int = gn_a(m, 7) and 16777215; gn_set_a(m, 7, sp + 4); return gn_dread32(m, sp); }
+
+// Bcc/BRA/BSR + JMP/JSR/RTS. Returns 1 if handled.
+fn gn_ctrl(m: Int, op: Int) -> Int ! {mem} {
+    if op == 20085 { gn_set_pc(m, gn_pop32(m)); return 1; }                 // RTS ($4E75)
+    if op >= 20096 { if op <= 20159 {                                  // JSR <ea> ($4E80-$4EBF)
+        let a: Int = gn_ea_addr(m, (op / 8) and 7, op and 7, 0);
+        gn_push32(m, gn_pc(m)); gn_set_pc(m, a); return 1;
+    } }
+    if op >= 20160 { if op <= 20223 {                                  // JMP <ea> ($4EC0-$4EFF)
+        gn_set_pc(m, gn_ea_addr(m, (op / 8) and 7, op and 7, 0)); return 1;
+    } }
+    if (op / 4096) == 6 {                                              // Bcc/BRA/BSR ($6xxx)
+        let cc: Int = (op / 256) and 15;
+        let disp8: Int = op and 255;
+        var target: Int = 0;
+        if disp8 == 0 { let base: Int = gn_pc(m); target = (base + gn_sx16(gn_fetch16(m))) and 16777215; }
+        if disp8 != 0 { target = (gn_pc(m) + gn_sx8(disp8)) and 16777215; }
+        if cc == 0 { gn_set_pc(m, target); return 1; }                    // BRA
+        if cc == 1 { gn_push32(m, gn_pc(m)); gn_set_pc(m, target); return 1; } // BSR
+        if gn_cond(m, cc) == 1 { gn_set_pc(m, target); }                     // Bcc (taken)
+        return 1;
+    }
+    return 0;
+}
+
+// ADDQ/SUBQ + DBcc + Scc (the $5xxx family). Returns 1 if handled.
+fn gn_misc(m: Int, op: Int) -> Int ! {mem} {
+    if (op / 4096) != 5 { return 0; }
+    let sizebits: Int = (op / 64) and 3;
+    let mode: Int = (op / 8) and 7;
+    let reg: Int = op and 7;
+    if sizebits == 3 {                                     // size 11 -> Scc / DBcc
+        let cc: Int = (op / 256) and 15;
+        if mode == 1 {                                     // DBcc Dn,disp16
+            let base: Int = gn_pc(m);
+            let disp: Int = gn_sx16(gn_fetch16(m));
+            if gn_cond(m, cc) == 0 {                          // condition false: decrement, maybe loop
+                let cnt: Int = (gn_d(m, reg) - 1) and 65535;
+                gn_set_d_sz(m, reg, cnt, 2);
+                if cnt != 65535 { gn_set_pc(m, (base + disp) and 16777215); }
+            }
+            return 1;                                      // condition true: exit (PC past disp)
+        }
+        var val: Int = 0; if gn_cond(m, cc) == 1 { val = 255; }   // Scc <ea> (byte)
+        gn_ea_write(m, mode, reg, 1, val); return 1;
+    }
+    var size: Int = 4; if sizebits == 0 { size = 1; } if sizebits == 1 { size = 2; }
+    var data: Int = (op / 512) and 7; if data == 0 { data = 8; }
+    let sub: Int = (op / 256) and 1;
+    if mode == 1 {                                         // ADDQ/SUBQ An: full 32, no flags
+        if sub == 1 { gn_set_a(m, reg, (gn_a(m, reg) - data) and 4294967295); }
+        if sub != 1 { gn_set_a(m, reg, (gn_a(m, reg) + data) and 4294967295); }
+        return 1;
+    }
+    let v: Int = gn_ea_read(m, mode, reg, size);
+    if sub == 1 { gn_ea_write(m, mode, reg, size, gn_sub(m, v, data, size)); }
+    if sub != 1 { gn_ea_write(m, mode, reg, size, gn_add(m, v, data, size)); }
+    return 1;
+}
+
+// --- one instruction (CPU foundation slice) ---
+fn gn_step(m: Int) -> Int ! {mem} {
+    let op: Int = gn_fetch16(m);
+    if op == 20081 { return 4; }                           // NOP ($4E71)
+    if gn_ctrl(m, op) == 1 { return 4; }                      // Bcc/BRA/BSR/JMP/JSR/RTS
+    if gn_misc(m, op) == 1 { return 4; }                      // ADDQ/SUBQ/DBcc/Scc
+    if gn_immalu(m, op) == 1 { return 4; }                    // ORI/ANDI/SUBI/ADDI/EORI/CMPI #imm
+    if gn_op4(m, op) == 1 { return 4; }                       // TST/CLR/NEG/NOT/SWAP
+    if gn_alu(m, op) == 1 { return 4; }                       // ADD/SUB/CMP/AND/OR/EOR <ea>,Dn
+    // MOVEQ #imm8,Dn : 0111 nnn 0 dddddddd  ($7000-$7EFF, bit8 == 0)
+    if (op / 4096) == 7 { if (op / 256) % 2 == 0 {
+        let n: Int = (op / 512) and 7;
+        gn_set_d(m, n, gn_sx8(op and 255)); return 4;
+    } }
+    // LEA <ea>,An : 0100 aaa 111 mmm rrr  (load effective address)
+    if (op / 4096) == 4 { if ((op / 64) and 7) == 7 { if ((op / 256) and 1) == 1 {
+        let smode: Int = (op / 8) and 7; let sreg: Int = op and 7;
+        gn_set_a(m, (op / 512) and 7, gn_ea_addr(m, smode, sreg, 4)); return 4;
+    } } }
+    // MOVE.b/.w/.l <ea>,<ea>  (top nibble 1=byte, 3=word, 2=long). MOVEA when dst mode 001.
+    let topn: Int = op / 4096;
+    var size: Int = 0;
+    if topn == 1 { size = 1; }
+    if topn == 3 { size = 2; }
+    if topn == 2 { size = 4; }
+    if size != 0 {
+        let sm: Int = (op / 8) and 7; let sr2: Int = op and 7;
+        let dm: Int = (op / 64) and 7; let dr: Int = (op / 512) and 7;
+        let v: Int = gn_ea_read(m, sm, sr2, size);            // src first (its extension words)
+        if dm == 1 {                                       // MOVEA: sign-extend to long, no flags
+            if size == 2 { gn_set_a(m, dr, gn_sx16(v)); }
+            if size != 2 { gn_set_a(m, dr, v); }
+        }
+        if dm != 1 {
+            gn_ea_write(m, dm, dr, size, v);
+            gn_setnz(m, v, size);
+        }
+        return 4;
+    }
+    return 4;                                              // unimplemented -> treat as NOP for now
+}

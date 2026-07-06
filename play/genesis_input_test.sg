@@ -1,0 +1,57 @@
+// forge/play/genesis_input_test.sg — verifies the Genesis controller pipeline:
+// canonical pad -> normalized mask -> core_set_input -> the real $A10002 pad-data
+// port (active-low, matching gn_pad_lo), independent of any one game's behavior.
+//
+// Links: forge/input/pad.sg forge/input/bind_normalized.sg
+//        forge/play/m68k_core.sg forge/play/m68k_singlebus_core.sg
+//        forge/play/ym2612_core.sg forge/play/psg_core.sg
+//        forge/play/genesis_core.sg forge/play/genesis_abi_core.sg
+//        forge/play/genesis_id_core.sg forge/play/genesis_input_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+fn main() -> Int ! {mem, io.write} {
+    let m: Int = alloc_buf(5570560);
+    let rom: Int = alloc_buf(32768);
+    core_load(m, rom, 32768);
+
+    let pad: Int = alloc_buf(16);
+    var pass: Int = 0;
+    var tot: Int = 0;
+
+    // Press RIGHT + A on the canonical pad -> the fleet's normalized mask.
+    pad_clear(pad);
+    pad_set(pad, pad_right(), 1);
+    pad_set(pad, pad_a(), 1);
+    let mask: Int = bind_norm_mask(pad);
+    tot = tot + 1; pass = chk(mask == 24, pass);   // Right(8) + A(16) = 24
+
+    core_set_input(m, mask);
+
+    // Real hardware read path: gn_read8 special-cases $A10002 (P1 pad data),
+    // calling gn_pad_lo on the stored mask.
+    let p1: Int = gn_read8(m, 10551298);
+
+    // gn_pad_lo(btn) = 63 - (btn and 63); low 6 bits active-low, standard 3-button
+    // layout: bit0=Up bit1=Down bit2=Left bit3=Right bit4=A(hw "B") bit5=B(hw "C").
+    tot = tot + 1; pass = chk(((p1 / 8) % 2) == 0, pass);    // bit3 Right pressed -> 0
+    tot = tot + 1; pass = chk(((p1 / 16) % 2) == 0, pass);   // bit4 A pressed -> 0
+    tot = tot + 1; pass = chk((p1 % 2) == 1, pass);          // bit0 Up NOT pressed -> 1
+    tot = tot + 1; pass = chk(((p1 / 2) % 2) == 1, pass);    // bit1 Down NOT pressed -> 1
+
+    // Release everything -> all 6 low bits read back as 1 (nothing pressed).
+    pad_clear(pad);
+    core_set_input(m, bind_norm_mask(pad));
+    let p1b: Int = gn_read8(m, 10551298);
+    tot = tot + 1; pass = chk((p1b and 63) == 63, pass);
+
+    print(1, "GENESIS CONTROLLER PIPELINE: canonical pad -> normalized mask -> $A10002 pad port\n");
+    print(1, "  pressed RIGHT+A -> mask="); print(1, chr(48 + mask / 10 % 10)); print(1, chr(48 + mask % 10));
+    print(1, " (expect 24) -> port(active-low)="); print(1, chr(48 + p1 / 100 % 10));
+    print(1, chr(48 + p1 / 10 % 10)); print(1, chr(48 + p1 % 10));
+    print(1, "\n  SELFTEST: "); print(1, chr(48 + pass / 10 % 10)); print(1, chr(48 + pass % 10));
+    print(1, "/"); print(1, chr(48 + tot / 10 % 10)); print(1, chr(48 + tot % 10));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

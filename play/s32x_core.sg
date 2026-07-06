@@ -1,0 +1,102 @@
+// cores/s32x.sg — Sega 32X add-on (1994). System #44.
+// Master SH-2 @ 23.0MHz, frame VRAM (320×224 RGB555), 64KB boot ROM, 256KB WRAM.
+// First increment: SH-2 bus seam, direct-color frame render → 320×224 ARGB.
+// Link order: cores/s32x.sg FIRST, then cores/sh2.sg.
+
+fn s32x_fb(m: Int) -> Int { return m + 0; }             // base+0: 320x224 ARGB (286720 B)
+fn s32x_fvram(m: Int) -> Int { return m + 286720; }     // base+286720: packed RGB555 (143360 B)
+fn s32x_brom(m: Int) -> Int { return m + 434176; }      // base+434176: 64KB boot ROM
+fn s32x_wram(m: Int) -> Int { return m + 499712; }      // base+499712: 256KB WRAM
+
+// SH-2 bus decode (first-def-wins over sh2.sg stubs).
+// $00000000-$0000FFFF=boot ROM, $04000000-$04022FFF=frame VRAM, $06000000-$0603FFFF=WRAM.
+fn sh2_mem_r8(m: Int, a: Int) -> Int ! {mem} {
+    if a < 65536 { return peek8(s32x_brom(m), a); }                                         // $00000000-$0000FFFF
+    if a >= 67108864 { if a < 67252224 { return peek8(s32x_fvram(m), a - 67108864); } }   // $04000000-$04022FFF
+    if a >= 100663296 { if a < 100925440 { return peek8(s32x_wram(m), a - 100663296); } } // $06000000-$0603FFFF
+    return 255;
+}
+fn sh2_mem_w8(m: Int, a: Int, v: Int) -> Int ! {mem} {
+    if a >= 67108864 { if a < 67252224 { poke8(s32x_fvram(m), a - 67108864, v and 255); return 0; } }
+    if a >= 100663296 { if a < 100925440 { poke8(s32x_wram(m), a - 100663296, v and 255); return 0; } }
+    return 0;
+}
+fn sh2_mem_r16(m: Int, a: Int) -> Int ! {mem} { return sh2_mem_r8(m, a) * 256 + sh2_mem_r8(m, a + 1); }
+fn sh2_mem_w16(m: Int, a: Int, v: Int) -> Int ! {mem} {
+    sh2_mem_w8(m, a, (v / 256) and 255); sh2_mem_w8(m, a + 1, v and 255); return 0;
+}
+fn sh2_mem_r32(m: Int, a: Int) -> Int ! {mem} {
+    return sh2_mem_r8(m, a) * 16777216 + sh2_mem_r8(m, a + 1) * 65536 + sh2_mem_r8(m, a + 2) * 256 + sh2_mem_r8(m, a + 3);
+}
+fn sh2_mem_w32(m: Int, a: Int, v: Int) -> Int ! {mem} {
+    sh2_mem_w8(m, a, (v / 16777216) and 255);
+    sh2_mem_w8(m, a + 1, (v / 65536) and 255);
+    sh2_mem_w8(m, a + 2, (v / 256) and 255);
+    sh2_mem_w8(m, a + 3, v and 255);
+    return 0;
+}
+
+// Direct-color decode: packed RGB555 big-endian 16-bit word → ARGB.
+// Bit 15=priority, bits 14-10=R5, bits 9-5=G5, bits 4-0=B5.
+fn s32x_rgb555(c: Int) -> Int {
+    let r: Int = ((c / 1024) and 31) * 8;
+    let g: Int = ((c / 32) and 31) * 8;
+    let b: Int = (c and 31) * 8;
+    return r + g * 256 + b * 65536 + 4278190080;
+}
+
+fn s32x_render(m: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 71680 invariant i >= 0 {
+        let c: Int = peek8(s32x_fvram(m), i * 2) * 256 + peek8(s32x_fvram(m), i * 2 + 1);
+        poke32(s32x_fb(m), i * 4, s32x_rgb555(c));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn core_id() -> Int { return 3200; }   // 32X
+fn core_fb(m: Int) -> Int { return s32x_fb(m); }
+fn core_fb_w() -> Int { return 320; }
+fn core_fb_h() -> Int { return 224; }
+
+fn core_load(m: Int, blob: Int, len: Int) -> Int ! {mem} {
+    var n: Int = len; if n > 65536 { n = 65536; }
+    var i: Int = 0;
+    while i < n invariant i >= 0 { poke8(s32x_brom(m), i, peek8(blob, i)); i = i + 1; }
+    var j: Int = 0;
+    while j < 262144 invariant j >= 0 { poke8(s32x_wram(m), j, 0); j = j + 1; }
+    var k: Int = 0;
+    while k < 143360 invariant k >= 0 { poke8(s32x_fvram(m), k, 0); k = k + 1; }
+    sh2_reset(m);
+    return 0;
+}
+
+fn core_set_input_port(port: Int, buttons: Int) -> Int { return 0; }
+fn core_set_input(buttons: Int) -> Int { return core_set_input_port(0, buttons); }
+
+fn core_run_frame(m: Int) -> Int ! {mem} {
+    // ~383333 SH-2 cycles/frame at 23.0MHz / 60Hz; 38333 for 10× speed reduction.
+    var c: Int = 0;
+    while c < 38333 invariant c >= 0 { sh2_step(m); c = c + 1; }
+    s32x_render(m);
+    return 0;
+}
+
+// Savestate: fvram (143360 B) + wram (262144 B) = 405504 bytes total.
+// Layout: [0..143359]=fvram, [143360..405503]=wram.
+fn core_savestate(m: Int, dst: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 143360 invariant i >= 0 { poke8(dst, i, peek8(s32x_fvram(m), i)); i = i + 1; }
+    var j: Int = 0;
+    while j < 262144 invariant j >= 0 { poke8(dst, 143360 + j, peek8(s32x_wram(m), j)); j = j + 1; }
+    return 0;
+}
+fn core_loadstate(m: Int, src: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 143360 invariant i >= 0 { poke8(s32x_fvram(m), i, peek8(src, i)); i = i + 1; }
+    var j: Int = 0;
+    while j < 262144 invariant j >= 0 { poke8(s32x_wram(m), j, peek8(src, 143360 + j)); j = j + 1; }
+    return 0;
+}
+fn core_savestate_size() -> Int { return 405504; }

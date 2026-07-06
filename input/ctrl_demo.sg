@@ -1,0 +1,74 @@
+// forge/input/ctrl_demo.sg — controllers ARE relics, end to end.
+//
+// Proves: seal a CONTROLLER relic for a physical pad (VID/PID) carrying per-core
+// cfg blocks; "detect" the pad by VID/PID and load its relic; drive BOTH cores
+// (CHIP-8 + DOS/Doom) using cfg read *from the relic* (not hardcoded); then let
+// the user remap and re-seal, bumping the gen ("latest updates"). Network
+// download/upload (controllers.forge.sigilos.grio.co) is the only stubbed step.
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+fn main() -> Int ! {mem, io.write} {
+    // The two per-core maps that live INSIDE the relic.
+    let c8cfg: Int  = alloc_buf(16); bindc8_default(c8cfg);
+    let doscfg: Int = alloc_buf(16); bindd_doom(doscfg);
+
+    // "Forge Standard Pad": VID 0x1209, PID 0x0001. CHIP-8 core_id 25, DOS core_id 24.
+    let vid: Int = 4617; let pid: Int = 1;
+    let c8_core: Int = 25; let dos_core: Int = 24;
+
+    // Seal the CONTROLLER relic (gen 1).
+    let relic: Int = alloc_buf(512);
+    cr_seal2(relic, vid, pid, 1, c8_core, c8cfg, dos_core, doscfg);
+
+    // DETECT: a pad is plugged in reporting VID/PID -> we located THIS relic.
+    // Confirm identity via the reader, then pull each core's cfg FROM the relic.
+    let payload: Int = relic + cr_payload_off();
+    let c8off: Int  = rcc_find_cfg(0, payload, c8_core);    // offset rel. to payload
+    let dosoff: Int = rcc_find_cfg(0, payload, dos_core);
+    let relic_c8: Int  = payload + c8off;                   // cfg bytes, straight from the relic
+    let relic_dos: Int = payload + dosoff;
+
+    // Press UP + A. Drive CHIP-8 and DOS using the relic-supplied cfg.
+    let pad: Int = alloc_buf(16); pad_clear(pad);
+    pad_set(pad, pad_up(), 1); pad_set(pad, pad_a(), 1);
+    let keypad: Int = alloc_buf(16); bindc8_apply(pad, keypad, relic_c8);
+    let keybuf: Int = alloc_buf(16); let dn: Int = bindd_apply(pad, relic_dos, keybuf, 16);
+
+    // EDIT + RE-SEAL (versioned): user remaps CHIP-8 'A' from key 5 -> key 1, bumps gen to 2.
+    poke8(c8cfg, pad_a(), 1);
+    let relic2: Int = alloc_buf(512);
+    cr_seal2(relic2, vid, pid, 2, c8_core, c8cfg, dos_core, doscfg);
+    let payload2: Int = relic2 + cr_payload_off();
+    let c8off2: Int = rcc_find_cfg(0, payload2, c8_core);
+    let remapped_a: Int = peek8(payload2 + c8off2, pad_a());   // A's new chip8 key
+
+    var pass: Int = 0; var tot: Int = 0;
+    tot = tot + 1; pass = chk(rcc_read_class(0, relic) == 4, pass);       // it's a CONTROLLER relic
+    tot = tot + 1; pass = chk(rcc_read_vid(0, relic) == vid, pass);       // detected VID
+    tot = tot + 1; pass = chk(rcc_read_pid(0, relic) == pid, pass);       // detected PID
+    tot = tot + 1; pass = chk(rcc_num_blocks(0, payload) == 2, pass);     // 2 per-core blocks
+    tot = tot + 1; pass = chk(c8off >= 0, pass);                          // chip8 cfg found
+    tot = tot + 1; pass = chk(dosoff >= 0, pass);                         // dos cfg found
+    tot = tot + 1; pass = chk(peek8(keypad, 2) == 1, pass);              // relic cfg -> chip8 key2 (UP)
+    tot = tot + 1; pass = chk(peek8(keypad, 5) == 1, pass);              // relic cfg -> chip8 key5 (A)
+    tot = tot + 1; pass = chk(peek8(keybuf, 0) == 72, pass);             // relic cfg -> Doom forward
+    tot = tot + 1; pass = chk(peek8(keybuf, 1) == 29, pass);             // relic cfg -> Doom fire
+    tot = tot + 1; pass = chk(cr_read_gen(relic) == 1, pass);            // gen 1
+    tot = tot + 1; pass = chk(cr_read_gen(relic2) == 2, pass);           // re-seal bumped gen
+    tot = tot + 1; pass = chk(remapped_a == 1, pass);                    // user remap persisted in relic
+
+    print(1, "FORGE CONTROLLER RELICS - config lives in the relic, keyed by VID/PID\n\n");
+    print(1, "  pad 0x1209:0x0001  gen "); print(1, chr(48 + cr_read_gen(relic)));
+    print(1, "  ->  blocks: CHIP-8(#25) + DOS(#24)\n");
+    print(1, "  detected by VID/PID  ->  cfg pulled from relic  ->  drives both cores\n");
+    print(1, "    CHIP-8: key2/key5 (UP,A)   DOOM: 0x48 fwd / 0x1D fire   (keyboard-only, unmodified)\n");
+    print(1, "  user remap A->key1, re-seal -> gen "); print(1, chr(48 + cr_read_gen(relic2)));
+    print(1, " (latest updates)\n\n");
+    print(1, "  SELFTEST: ");
+    print(1, chr(48 + pass / 10 % 10)); print(1, chr(48 + pass % 10));
+    print(1, "/"); print(1, chr(48 + tot / 10 % 10)); print(1, chr(48 + tot % 10));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

@@ -1,0 +1,62 @@
+// cores/ws_video.sg — WonderSwan's mono 2bpp video pipeline (core_id, ws_tile_color,
+// ws_render_row, ws_render), split out of cores/ws.sg so cores/wsc.sg (which supplies
+// its own complete 4bpp color versions of all four for the same names) doesn't
+// collide with them. Matches cores/genesis_id.sg's precedent (sigil-Retropie#13 — cc0
+// has no first-def-wins; "First-def-wins overlay" comments elsewhere in this codebase
+// don't reflect real cc0 behavior). Link this file for the standalone WS EL0 app only
+// — el0/wsc_app.sg links cores/wsc.sg instead, which supplies every function below
+// itself. cores/ws.sg's own core_run_frame calls ws_render(m) and resolves to whichever
+// variant is linked (mirrors cores/segacd.sg reusing cores/genesis.sg's other code).
+
+// Tile data: 16 bytes/tile (2bpp, 4 rows each 2 bytes plane0+plane1).
+// ws_mem I/O shadow: VRAM at $40000-$4FFFF (64KB), regs at $00-$FF.
+// Grayscale: 0=white,1=light,2=dark,3=black.
+fn ws_tile_color(shade: Int) -> Int {
+    if shade == 0 { return 4294967295; }    // white
+    if shade == 1 { return 4289200595; }    // light gray
+    if shade == 2 { return 4283717268; }    // dark gray
+    return 4278190080;                       // black
+}
+// Render one tile-row of 8 pixels: helper keeps ws_render locals under the frame cap.
+fn ws_render_row(m: Int, fboff: Int, p0: Int, p1: Int) -> Int ! {mem} {
+    var col: Int = 0;
+    while col < 8 invariant col >= 0 {
+        let bit: Int = 7 - col;
+        var s0: Int = 0; var s1: Int = 0;
+        if bit == 7 { s0 = p0 / 128 % 2; s1 = p1 / 128 % 2; }
+        if bit == 6 { s0 = p0 / 64 % 2;  s1 = p1 / 64 % 2; }
+        if bit == 5 { s0 = p0 / 32 % 2;  s1 = p1 / 32 % 2; }
+        if bit == 4 { s0 = p0 / 16 % 2;  s1 = p1 / 16 % 2; }
+        if bit == 3 { s0 = p0 / 8 % 2;   s1 = p1 / 8 % 2; }
+        if bit == 2 { s0 = p0 / 4 % 2;   s1 = p1 / 4 % 2; }
+        if bit == 1 { s0 = p0 / 2 % 2;   s1 = p1 / 2 % 2; }
+        if bit == 0 { s0 = p0 % 2;        s1 = p1 % 2; }
+        poke32(ws_fb(m), fboff + col * 4, ws_tile_color(s0 + s1 * 2));
+        col = col + 1;
+    }
+    return 0;
+}
+fn ws_render(m: Int) -> Int ! {mem} {
+    // Locals: vram,ty,tx,tile,row,p0,p1 = 7 (well within 16-local cap).
+    // VRAM at $40000=262144: map 0..8191, tiles 8192+.
+    let vram: Int = 262144;
+    var ty: Int = 0;
+    while ty < 18 invariant ty >= 0 {
+        var tx: Int = 0;
+        while tx < 28 invariant tx >= 0 {
+            let tile: Int = ws_read16(m, vram + (ty * 32 + tx) * 2) and 511;
+            var row: Int = 0;
+            while row < 8 invariant row >= 0 {
+                let p0: Int = ws_read8(m, vram + 8192 + tile * 16 + row * 2);
+                let p1: Int = ws_read8(m, vram + 8192 + tile * 16 + row * 2 + 1);
+                ws_render_row(m, (ty * 8 + row) * 224 * 4 + tx * 8 * 4, p0, p1);
+                row = row + 1;
+            }
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    return 0;
+}
+
+fn core_id() -> Int { return 9900; }   // WS = 9900 (unique ID)

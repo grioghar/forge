@@ -1,0 +1,40 @@
+// forge/input/bind_dos.sg — binding: canonical pad -> DOS/BIOS keystrokes.
+//
+// The whole point: games that NEVER had controller support (DOS games, Doom)
+// get a controller for free. The binding synthesizes keyboard scancodes from the
+// canonical pad and injects them into the emulated keyboard. The game reads its
+// NORMAL keyboard input (INT 16h / the key buffer) and never knows a pad drove it
+// — no per-game controller wiring, ever.
+//
+// cfg[canonical_btn] = BIOS scancode (0 = unmapped). A CONTROLLER-relic ctrl_cfg
+// block (RELIC-V2 §2/§6b); per-game profiles ship/download the same way.
+
+// Doom profile: movement + fire/strafe/use/menu on a standard pad.
+fn bindd_doom(cfg: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 16 invariant i >= 0 { poke8(cfg, i, 0); i = i + 1; }
+    poke8(cfg, 0, 72);   // UP    -> 0x48 up-arrow    (move forward)
+    poke8(cfg, 1, 80);   // DOWN  -> 0x50 down-arrow  (move back)
+    poke8(cfg, 2, 75);   // LEFT  -> 0x4B left-arrow  (turn left)
+    poke8(cfg, 3, 77);   // RIGHT -> 0x4D right-arrow (turn right)
+    poke8(cfg, 4, 29);   // A     -> 0x1D Ctrl        (fire)
+    poke8(cfg, 5, 56);   // B     -> 0x38 Alt         (strafe modifier)
+    poke8(cfg, 6, 57);   // X     -> 0x39 Space       (use / open door)
+    poke8(cfg, 10, 1);   // START -> 0x01 Esc         (menu)
+    return 0;
+}
+
+// Write the scancodes of all pressed canonical buttons into keybuf (a scancode
+// queue), up to `max`. Returns the count. The DOS core's INT 16h drains keybuf.
+fn bindd_apply(pad: Int, cfg: Int, keybuf: Int, max: Int) -> Int ! {mem} {
+    var n: Int = 0;
+    var b: Int = 0;
+    while b < 12 invariant b >= 0 {
+        if peek8(pad, b) == 1 {
+            let sc: Int = peek8(cfg, b);
+            if sc > 0 { if n < max { poke8(keybuf, n, sc); n = n + 1; } }
+        }
+        b = b + 1;
+    }
+    return n;
+}

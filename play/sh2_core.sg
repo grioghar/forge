@@ -1,0 +1,188 @@
+// cores/sh2.sg — Hitachi SH-2 CPU (shared), bare-metal Sigil Int-subset.
+// Used by Sega Saturn (cores/saturn.sg) and Sega 32X. Memory hook: sh2_mem_r8/16/32,
+// sh2_mem_w8/16/32 (system-provided, first-def-wins). Prefix: sh2_.
+// All instructions are 16-bit. Registers: R0-R15, PC, SR (T flag), PR, GBR.
+// Delay-slot branches: sets sh2_dly_active + sh2_dly_tgt; next sh2_step() applies the slot.
+// Decimal literals only. SR T-flag = bit 0.
+
+fn sh2_st(m: Int) -> Int { return m + 761856; }         // SH2 zone (after s32x zone)   // 0x25000000  R0-R15 @0-60, PC@64, SR@68, PR@72, GBR@76, MACH@80, MACL@84, dly_active@88, dly_tgt@92
+
+fn sh2_r(m: Int, n: Int) -> Int ! {mem} { return peek32(sh2_st(m), (n and 15) * 4); }
+fn sh2_setr(m: Int, n: Int, v: Int) -> Int ! {mem} { poke32(sh2_st(m), (n and 15) * 4, v); return 0; }
+fn sh2_pc(m: Int) -> Int ! {mem} { return peek32(sh2_st(m), 64); }
+fn sh2_set_pc(m: Int, v: Int) -> Int ! {mem} { poke32(sh2_st(m), 64, v); return 0; }
+fn sh2_sr(m: Int) -> Int ! {mem} { return peek32(sh2_st(m), 68); }
+fn sh2_set_sr(m: Int, v: Int) -> Int ! {mem} { poke32(sh2_st(m), 68, v and 511); return 0; }
+fn sh2_t(m: Int) -> Int ! {mem} { return sh2_sr(m) and 1; }
+fn sh2_set_t(m: Int, v: Int) -> Int ! {mem} { sh2_set_sr(m, (sh2_sr(m) and 510) + (v and 1)); return 0; }
+fn sh2_pr(m: Int) -> Int ! {mem} { return peek32(sh2_st(m), 72); }
+fn sh2_set_pr(m: Int, v: Int) -> Int ! {mem} { poke32(sh2_st(m), 72, v); return 0; }
+fn sh2_gbr(m: Int) -> Int ! {mem} { return peek32(sh2_st(m), 76); }
+fn sh2_set_gbr(m: Int, v: Int) -> Int ! {mem} { poke32(sh2_st(m), 76, v); return 0; }
+fn sh2_dly(m: Int) -> Int ! {mem} { return peek32(sh2_st(m), 88) and 1; }
+fn sh2_dly_tgt(m: Int) -> Int ! {mem} { return peek32(sh2_st(m), 92); }
+fn sh2_set_dly(m: Int, tgt: Int) -> Int ! {mem} { poke32(sh2_st(m), 88, 1); poke32(sh2_st(m), 92, tgt); return 0; }
+fn sh2_clear_dly(m: Int) -> Int ! {mem} { poke32(sh2_st(m), 88, 0); return 0; }
+
+fn sh2_sign8(v: Int) -> Int {
+    let s: Int = v and 255;
+    if s >= 128 { return s - 256; }
+    return s;
+}
+fn sh2_sign12(v: Int) -> Int {
+    let s: Int = v and 4095;
+    if s >= 2048 { return s - 4096; }
+    return s;
+}
+fn sh2_sign16(v: Int) -> Int {
+    let s: Int = v and 65535;
+    if s >= 32768 { return s - 65536; }
+    return s;
+}
+
+fn sh2_reset(m: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 16 invariant i >= 0 { sh2_setr(m, i, 0); i = i + 1; }
+    sh2_set_sr(m, 0); sh2_set_pr(m, 0); sh2_set_gbr(m, 0);
+    sh2_clear_dly(m);
+    // PC from reset vector at $00000000 (VBR=0): read 32-bit big-endian from bus
+    sh2_set_pc(m, sh2_mem_r32(m, 0));
+    // SP (R15) from $00000004
+    sh2_setr(m, 15, sh2_mem_r32(m, 4));
+    return 0;
+}
+
+fn sh2_fetch16(m: Int) -> Int ! {mem} {
+    let v: Int = sh2_mem_r16(m, sh2_pc(m));
+    sh2_set_pc(m, sh2_pc(m) + 2);
+    return v;
+}
+
+fn sh2_step(m: Int) -> Int ! {mem} {
+    // Apply pending delay-slot branch BEFORE the slot instruction
+    var post_tgt: Int = 0 - 1;   // -1 = no pending jump
+    if sh2_dly(m) == 1 { post_tgt = sh2_dly_tgt(m); sh2_clear_dly(m); }
+
+    let op: Int = sh2_fetch16(m);
+    let n: Int = (op / 256) and 15;   // bits 11-8
+    let rm: Int = (op / 16) and 15;   // bits 7-4
+    let lo4: Int = op and 15;
+    let hi4: Int = (op / 4096) and 15;
+
+    // NOP ($0009)
+    if op == 9 { }
+    // RTS ($000B): return from subroutine (delay slot)
+    if op == 11 { sh2_set_dly(m, sh2_pr(m)); }
+    // CLRT ($0008)
+    if op == 8 { sh2_set_t(m, 0); }
+    // SETT ($0018)
+    if op == 24 { sh2_set_t(m, 1); }
+    // MOV Rm,Rn (0110nnnnmmmm0011)
+    if hi4 == 6 { if lo4 == 3 { sh2_setr(m, n, sh2_r(m, rm)); } }
+    // MOV.L Rm,@Rn (0010nnnnmmmm0010)
+    if hi4 == 2 { if lo4 == 2 { sh2_mem_w32(m, sh2_r(m, n), sh2_r(m, rm)); } }
+    // MOV.W Rm,@Rn (0010nnnnmmmm0001)
+    if hi4 == 2 { if lo4 == 1 { sh2_mem_w16(m, sh2_r(m, n), sh2_r(m, rm) and 65535); } }
+    // MOV.B Rm,@Rn (0010nnnnmmmm0000)
+    if hi4 == 2 { if lo4 == 0 { sh2_mem_w8(m, sh2_r(m, n), sh2_r(m, rm) and 255); } }
+    // MOV.L Rm,@-Rn (0010nnnnmmmm0110) - pre-decrement store long
+    if hi4 == 2 { if lo4 == 6 { sh2_setr(m, n, sh2_r(m, n) - 4); sh2_mem_w32(m, sh2_r(m, n), sh2_r(m, rm)); } }
+    // MOV.L @Rm,Rn (0110nnnnmmmm0010)
+    if hi4 == 6 { if lo4 == 2 { sh2_setr(m, n, sh2_mem_r32(m, sh2_r(m, rm))); } }
+    // MOV.W @Rm,Rn (0110nnnnmmmm0001) - sign-extend 16-bit
+    if hi4 == 6 { if lo4 == 1 { sh2_setr(m, n, sh2_sign16(sh2_mem_r16(m, sh2_r(m, rm)))); } }
+    // MOV.B @Rm,Rn (0110nnnnmmmm0000) - sign-extend 8-bit
+    if hi4 == 6 { if lo4 == 0 { sh2_setr(m, n, sh2_sign8(sh2_mem_r8(m, sh2_r(m, rm)))); } }
+    // MOV.L @Rm+,Rn (0110nnnnmmmm0110) - post-increment load long
+    if hi4 == 6 { if lo4 == 6 { sh2_setr(m, n, sh2_mem_r32(m, sh2_r(m, rm))); sh2_setr(m, rm, sh2_r(m, rm) + 4); } }
+    // MOV #imm,Rn (1110nnnndddddddd) - sign-extend 8-bit immediate
+    if hi4 == 14 { sh2_setr(m, n, sh2_sign8(op and 255)); }
+    // MOV.W @(d,PC),Rn (1001nnnndddddddd) - PC-relative word load, sign-extend
+    if hi4 == 9 { let ea: Int = sh2_pc(m) + sh2_sign8(op and 255) * 2; sh2_setr(m, n, sh2_sign16(sh2_mem_r16(m, ea))); }
+    // MOV.L @(d,PC),Rn (1101nnnndddddddd) - PC-relative long load (PC+4 aligned + d*4)
+    if hi4 == 13 { let ea: Int = (sh2_pc(m) and (0 - 4)) + (op and 255) * 4; sh2_setr(m, n, sh2_mem_r32(m, ea)); }
+    // MOV.L Rm,@(d,Rn) (0001nnnnmmmmddddd) - store long with displacement
+    if hi4 == 1 { let ea: Int = sh2_r(m, n) + (lo4) * 4; sh2_mem_w32(m, ea, sh2_r(m, rm)); }
+    // MOV.L @(d,Rm),Rn (0101nnnnmmmmdddd) - load long with displacement
+    if hi4 == 5 { let ea: Int = sh2_r(m, rm) + (lo4) * 4; sh2_setr(m, n, sh2_mem_r32(m, ea)); }
+    // ADD Rm,Rn (0011nnnnmmmm1100)
+    if hi4 == 3 { if lo4 == 12 { sh2_setr(m, n, sh2_r(m, n) + sh2_r(m, rm)); } }
+    // ADD #imm,Rn (0111nnnndddddddd)
+    if hi4 == 7 { sh2_setr(m, n, sh2_r(m, n) + sh2_sign8(op and 255)); }
+    // SUB Rm,Rn (0011nnnnmmmm1000)
+    if hi4 == 3 { if lo4 == 8 { sh2_setr(m, n, sh2_r(m, n) - sh2_r(m, rm)); } }
+    // AND Rm,Rn (0010nnnnmmmm1001)
+    if hi4 == 2 { if lo4 == 9 { sh2_setr(m, n, sh2_r(m, n) and sh2_r(m, rm)); } }
+    // OR Rm,Rn (0010nnnnmmmm1011)
+    if hi4 == 2 { if lo4 == 11 { sh2_setr(m, n, sh2_r(m, n) + sh2_r(m, rm) - (sh2_r(m, n) and sh2_r(m, rm))); } }
+    // XOR Rm,Rn (0010nnnnmmmm1010) — x xor y = x + y - 2*(x and y) for bits
+    if hi4 == 2 { if lo4 == 10 {
+        let xa: Int = sh2_r(m, n) and sh2_r(m, rm);
+        sh2_setr(m, n, sh2_r(m, n) + sh2_r(m, rm) - xa - xa);
+    } }
+    // NOT Rm,Rn (0110nnnnmmmm0111) — bitwise NOT: ~x = -x-1
+    if hi4 == 6 { if lo4 == 7 { sh2_setr(m, n, 0 - sh2_r(m, rm) - 1); } }
+    // CMP/EQ Rm,Rn (0011nnnnmmmm0000)
+    if hi4 == 3 { if lo4 == 0 { if sh2_r(m, n) == sh2_r(m, rm) { sh2_set_t(m, 1); } if sh2_r(m, n) != sh2_r(m, rm) { sh2_set_t(m, 0); } } }
+    // CMP/EQ #imm,R0 (10001000dddddddd)
+    if hi4 == 8 { if ((op / 256) and 15) == 8 { if sh2_r(m, 0) == sh2_sign8(op and 255) { sh2_set_t(m, 1); } if sh2_r(m, 0) != sh2_sign8(op and 255) { sh2_set_t(m, 0); } } }
+    // CMP/GE Rm,Rn (0011nnnnmmmm0011) - signed >=
+    if hi4 == 3 { if lo4 == 3 { if sh2_r(m, n) >= sh2_r(m, rm) { sh2_set_t(m, 1); } if sh2_r(m, n) < sh2_r(m, rm) { sh2_set_t(m, 0); } } }
+    // CMP/GT Rm,Rn (0011nnnnmmmm0111) - signed >
+    if hi4 == 3 { if lo4 == 7 { if sh2_r(m, n) > sh2_r(m, rm) { sh2_set_t(m, 1); } if sh2_r(m, n) <= sh2_r(m, rm) { sh2_set_t(m, 0); } } }
+    // DT Rn (0100nnnn00010000) - decrement and test
+    if hi4 == 4 { if (op and 255) == 16 { sh2_setr(m, n, sh2_r(m, n) - 1); if sh2_r(m, n) == 0 { sh2_set_t(m, 1); } if sh2_r(m, n) != 0 { sh2_set_t(m, 0); } } }
+    // SHLL Rn (0100nnnn00000000)
+    if hi4 == 4 { if (op and 255) == 0 { sh2_set_t(m, (sh2_r(m, n) / 2147483648) and 1); sh2_setr(m, n, sh2_r(m, n) * 2); } }
+    // SHLR Rn (0100nnnn00000001)
+    if hi4 == 4 { if (op and 255) == 1 { sh2_set_t(m, sh2_r(m, n) and 1); sh2_setr(m, n, (sh2_r(m, n) and 2147483646) / 2); } }
+    // SHAR Rn (0100nnnn00100001) - shift right arithmetic
+    if hi4 == 4 { if (op and 255) == 33 { sh2_set_t(m, sh2_r(m, n) and 1); sh2_setr(m, n, sh2_r(m, n) / 2); } }
+    // SHLL2 Rn (0100nnnn00001000) - shift left 2
+    if hi4 == 4 { if (op and 255) == 8 { sh2_setr(m, n, sh2_r(m, n) * 4); } }
+    // SHLR2 Rn (0100nnnn00001001)
+    if hi4 == 4 { if (op and 255) == 9 { sh2_setr(m, n, (sh2_r(m, n) and 2147483644) / 4); } }
+    // SHLL16 Rn (0100nnnn00101000)
+    if hi4 == 4 { if (op and 255) == 40 { sh2_setr(m, n, sh2_r(m, n) * 65536); } }
+    // SHLR16 Rn (0100nnnn00101001)
+    if hi4 == 4 { if (op and 255) == 41 { sh2_setr(m, n, (sh2_r(m, n) and 2147418112) / 65536); } }
+    // BRA (1010dddddddddddd) - delay branch, 12-bit signed * 2
+    if hi4 == 10 { sh2_set_dly(m, sh2_pc(m) + sh2_sign12(op and 4095) * 2); }
+    // BSR (1011dddddddddddd) - branch to subroutine with delay slot
+    if hi4 == 11 { sh2_set_pr(m, sh2_pc(m)); sh2_set_dly(m, sh2_pc(m) + sh2_sign12(op and 4095) * 2); }
+    // BT (10001001dddddddd) - branch if T=1 (NO delay slot in SH-2 base BT)
+    if (op / 256) == 137 { if sh2_t(m) == 1 { sh2_set_pc(m, sh2_pc(m) + sh2_sign8(op and 255) * 2); } }
+    // BF (10001011dddddddd) - branch if T=0
+    if (op / 256) == 139 { if sh2_t(m) == 0 { sh2_set_pc(m, sh2_pc(m) + sh2_sign8(op and 255) * 2); } }
+    // BT/S (10001101dddddddd) - branch if T=1 with delay slot
+    if (op / 256) == 141 { if sh2_t(m) == 1 { sh2_set_dly(m, sh2_pc(m) + sh2_sign8(op and 255) * 2); } if sh2_t(m) != 1 { sh2_set_pc(m, sh2_pc(m) + 2); } }
+    // BF/S (10001111dddddddd) - branch if T=0 with delay slot
+    if (op / 256) == 143 { if sh2_t(m) == 0 { sh2_set_dly(m, sh2_pc(m) + sh2_sign8(op and 255) * 2); } if sh2_t(m) != 0 { sh2_set_pc(m, sh2_pc(m) + 2); } }
+    // JMP @Rn (0100nnnn00101011) - jump register (delay slot)
+    if hi4 == 4 { if (op and 255) == 43 { sh2_set_dly(m, sh2_r(m, n)); } }
+    // JSR @Rn (0100nnnn00001011) - jump to subroutine (delay slot)
+    if hi4 == 4 { if (op and 255) == 11 { sh2_set_pr(m, sh2_pc(m)); sh2_set_dly(m, sh2_r(m, n)); } }
+    // STS PR,Rn (0000nnnn00101010)
+    if hi4 == 0 { if (op and 255) == 42 { sh2_setr(m, n, sh2_pr(m)); } }
+    // LDS Rm,PR (0100mmmm00001010)
+    if hi4 == 4 { if (op and 255) == 10 { sh2_set_pr(m, sh2_r(m, rm)); } }
+    // LDC Rm,SR (0100mmmm00001110) - though usually privileged
+    if hi4 == 4 { if (op and 255) == 14 { sh2_set_sr(m, sh2_r(m, rm)); } }
+    // STC SR,Rn (0000nnnn00000010)
+    if hi4 == 0 { if (op and 255) == 2 { sh2_setr(m, n, sh2_sr(m)); } }
+    // TRAPA #imm (11000011dddddddd) — stub: NOP in bare-metal
+    if (op / 256) == 195 { }
+    // Unknown: NOP (don't crash)
+
+    // Apply delay-slot jump (was pending before this instruction)
+    if post_tgt >= 0 { sh2_set_pc(m, post_tgt); }
+    return 0;
+}
+
+// Default flat bus stubs (sh2_mem_r8/16/32, sh2_mem_w8/16/32) split into
+// cores/sh2_stubbus.sg (sigil-Retropie#13 — cc0 has no first-def-wins, matching
+// cores/m68k.sg's own "single-definition-with-dispatch" fix for the identical
+// pattern). Both current SH-2 systems (cores/s32x.sg, cores/saturn.sg) always
+// supply their own real bus, so sh2_stubbus.sg is unused today — kept only for
+// a hypothetical future single-bus SH-2 system that needs a no-op default,
+// exactly mirroring cores/m68k_singlebus.sg's role.

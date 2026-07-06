@@ -1,0 +1,50 @@
+// forge/play/s32x_boot_test.sg — verifies the ported 32X core (SH2 CPU) executes
+// a hand-assembled program natively: exact expected register outcome.
+//
+// Links: forge/play/sh2_core.sg  forge/play/s32x_core.sg  forge/play/s32x_boot_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+fn wr32(base: Int, off: Int, v: Int) -> Int ! {mem} {
+    poke8(base, off, (v / 16777216) and 255);
+    poke8(base, off + 1, (v / 65536) and 255);
+    poke8(base, off + 2, (v / 256) and 255);
+    poke8(base, off + 3, v and 255);
+    return 0;
+}
+
+fn main() -> Int ! {mem, io.write} {
+    let rom: Int = alloc_buf(4096);
+    wr32(rom, 0, 32);            // reset PC vector = 0x20 (past the vector table)
+    wr32(rom, 4, 4096);          // reset SP vector = 0x1000
+
+    // At 0x20: MOV #0x42,R0 ; ADD #1,R0 ; ADD #1,R0 ; ADD #1,R0
+    poke8(rom, 32, 224); poke8(rom, 33, 66);   // E042: MOV #0x42,R0
+    poke8(rom, 34, 112); poke8(rom, 35, 1);    // 7001: ADD #1,R0
+    poke8(rom, 36, 112); poke8(rom, 37, 1);    // 7001: ADD #1,R0
+    poke8(rom, 38, 112); poke8(rom, 39, 1);    // 7001: ADD #1,R0
+
+    let m: Int = alloc_buf(786432);
+    core_load(m, rom, 4096);
+
+    var pass: Int = 0;
+    var tot: Int = 0;
+    tot = tot + 1; pass = chk(sh2_pc(m) == 32, pass);     // PC latched from reset vector
+    tot = tot + 1; pass = chk(sh2_r(m, 15) == 4096, pass); // SP latched from reset vector
+
+    sh2_step(m); sh2_step(m); sh2_step(m); sh2_step(m);   // MOV + 3x ADD
+
+    let r0: Int = sh2_r(m, 0);
+    let pc: Int = sh2_pc(m);
+    tot = tot + 1; pass = chk(r0 == 69, pass);    // 0x42 + 1 + 1 + 1 = 69
+    tot = tot + 1; pass = chk(pc == 40, pass);    // 4 instructions x 2 bytes = 8, 32+8=40
+
+    print(1, "32X BOOT: SH2 CPU, MOV+ADD hand-assembled program\n");
+    print(1, "  PC after load="); print(1, chr(48 + sh2_r(m, 15) / 1000 % 10)); print(1, chr(48 + sh2_r(m,15)/100%10));
+    print(1, "  after 4 steps: R0="); print(1, chr(48 + r0 / 10 % 10)); print(1, chr(48 + r0 % 10));
+    print(1, " (expect 69 = 0x42+3)  PC="); print(1, chr(48 + pc / 10 % 10)); print(1, chr(48 + pc % 10));
+    print(1, " (expect 40)\n  SELFTEST: "); print(1, chr(48 + pass)); print(1, "/"); print(1, chr(48 + tot));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

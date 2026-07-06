@@ -1,0 +1,53 @@
+// forge/app/runtime.sg — the real download->verify->run flow for the Forge thin/fat apps.
+//
+// STATUS today, per primitive:
+//   load:   REAL on macOS (pal_fs_resolve/pal_fs_read, Darwin BSD syscalls). Loads a LOCAL
+//           .sigpkg file — this is the fat-bundle path (cores already on disk) and the
+//           thin-distribution fallback once a core has been fetched by some other means.
+//           True network download needs host_https_get, which doesn't exist yet (same gap
+//           already flagged for CIPHER's relay and SRDX) — "download" degrades to "load a
+//           file already on disk" until that primitive lands.
+//   verify: REAL everywhere. sigpkg_verify.sg's spv_verify_core, proven end-to-end via a
+//           real execution test (not just compile-clean) on the Linux target: a genuine
+//           .sigpkg verifies true, and three independent single-byte tamper cases (blob,
+//           header pre-manifest, header post-tamper-restore) each correctly verify false.
+//   run:    pal_launch(app_id) exists as a dispatch stub; actually running an emulator core
+//           on a native host still needs display+input PAL (Video/Drivers own that), so
+//           "run" here means "verified, ready to hand to pal_launch" — not a playable frame.
+
+fn rt_scratch_size() -> Int { return 1200000; }   // sha256.sg's working set headroom
+fn rt_load_buf_size() -> Int { return 2097152; }  // 2 MiB — fits every shipped core's .sigpkg
+// Largest blob_len that fits BOTH buffers: the load buffer (minus the 512B header) and
+// sha256.sg's scratch (minus its K/W/H/digest-out headroom, ~592B). Load buffer is the
+// tighter constraint at current sizes (2097152-512 < 1200000-592), so it's the real limit.
+fn rt_max_blob_len() -> Int { return rt_load_buf_size() - 512; }
+
+// Load a .sigpkg by path (a NUL-terminated cstring address), verify it, report the result.
+// blob_len is the expected core blob size (from catalog.json — untrusted at this point,
+// same as the file itself: nothing is verified yet). MUST be bounds-checked before it's
+// used to size any read or hash operation — an oversized/negative blob_len would otherwise
+// overflow rt_load_buf_size()'s allocation (pal_fs_read past the buffer) and separately
+// overflow sha256.sg's scratch region (spv_check_blob's hash pass writes `len` bytes into
+// a fixed-size scratch). Same trust-boundary class as this session's netconn/cipher_relay
+// findings — an untrusted length used unchecked against a real buffer. Returns:
+//   1  = loaded + verified core, ready to run
+//   0  = load failed (file not found, short read, or blob_len out of bounds)
+//  -1  = loaded but verification failed (corrupt/tampered/wrong file)
+fn rt_load_and_verify(m: Mmio, s: Sys, path: Int, blob_len: Int) -> Int ! {mem, sys} {
+    if blob_len < 0 { return 0; }
+    if blob_len > rt_max_blob_len() { return 0; }
+
+    let fd: Int = pal_fs_resolve(s, path, 0);
+    if fd < 0 { return 0; }
+
+    let buf: Int = pal_mem_map(0, rt_load_buf_size());
+    let want: Int = 512 + blob_len;
+    let got: Int = pal_fs_read(s, fd, buf, want);
+    pal_fs_close(s, fd);
+    if got < want { return 0; }
+
+    let scratch: Int = pal_mem_map(0, rt_scratch_size());
+    let ok: Int = spv_verify_core(m, buf, blob_len, scratch);
+    if ok == 0 { return 0 - 1; }
+    return 1;
+}

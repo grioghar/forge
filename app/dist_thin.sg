@@ -1,0 +1,9 @@
+// forge/app/dist_thin.sg — the THIN distribution: public-facing, on-demand core downloads.
+// This is the site default (forge.sigilos.grio.co).
+// Link exactly one of dist_thin.sg / dist_fat.sg / dist_core.sg into main.sg.
+fn dist_mode() -> Int { return 0; }
+fn dist_label(c: Int) -> Int ! {io.write} { print(c, "Thin (on-demand cores)"); return 0; }
+fn dist_desc(c: Int) -> Int ! {io.write} {
+    print(c, "  Cores download on demand from forge.sigilos.grio.co as you launch");
+    return 0;
+}

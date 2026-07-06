@@ -1,0 +1,87 @@
+// cores/psg.sg — SN76489 PSG (the Genesis / Master System programmable sound generator),
+// Sigil Int-subset. 4 channels: 3 square-wave tone + 1 noise. The Genesis pairs this with
+// the YM2612 FM chip (next). This file: the register write-latch protocol + per-channel
+// state; the sample generator (square toggling + noise LFSR + attenuation mix) follows.
+// Prefix psg_ (asm-reg collisions, sigil#12). Decimal literals only.
+//
+// Per channel c (0-2 tone, 3 noise) in psg_st(m), 8 bytes each:
+//   VOL @c*8 (4-bit attenuation, 0=loud 15=off) · PHASE @c*8+1 · PERIOD @c*8+2 (16-bit,
+//   10-bit value) · COUNTER @c*8+4 (16-bit). Latched register byte @40, noise LFSR @42.
+
+fn psg_st(m: Int) -> Int { return m + 1271808; }        // base+1271808: PSG state (own zone for GG)
+
+fn psg_period(m: Int, c: Int) -> Int ! {mem} { return peek8(psg_st(m), c * 8 + 2) + peek8(psg_st(m), c * 8 + 3) * 256; }
+fn psg_set_period(m: Int, c: Int, v: Int) -> Int ! {mem} { poke8(psg_st(m), c * 8 + 2, v and 255); poke8(psg_st(m), c * 8 + 3, (v / 256) and 255); return 0; }
+fn psg_vol(m: Int, c: Int) -> Int ! {mem} { return peek8(psg_st(m), c * 8); }
+
+// Register write (the SN76489 latch protocol):
+//  byte bit7=1  -> LATCH: bits6-5 channel, bit4 type (1=vol,0=tone), bits3-0 data low.
+//  byte bit7=0  -> DATA:  bits5-0 high bits of the last-latched tone period (or vol).
+fn psg_write(m: Int, b: Int) -> Int ! {mem} {
+    if (b and 128) != 0 {
+        let lat: Int = (b / 16) and 7;                    // (channel<<1)|type
+        poke8(psg_st(m), 40, lat);
+        let ch: Int = (lat / 2) and 3;
+        if (lat and 1) != 0 { poke8(psg_st(m), ch * 8, b and 15); }                          // volume
+        if (lat and 1) == 0 { psg_set_period(m, ch, (psg_period(m, ch) and 1008) or (b and 15)); }  // tone low 4 bits
+    }
+    if (b and 128) == 0 {
+        let lat: Int = peek8(psg_st(m), 40);
+        let ch: Int = (lat / 2) and 3;
+        if (lat and 1) != 0 { poke8(psg_st(m), ch * 8, b and 15); }                          // volume (full byte)
+        if (lat and 1) == 0 { psg_set_period(m, ch, (psg_period(m, ch) and 15) or ((b and 63) * 16)); }  // tone high 6 bits
+    }
+    return 0;
+}
+
+// --- sample generation -----------------------------------------------------------
+// 4-bit attenuation -> amplitude: 0 = full (~8191), -2dB/step (~*13/16), 15 = silent.
+fn psg_amp(v: Int) -> Int {
+    if v >= 15 { return 0; }
+    var a: Int = 8191; var i: Int = 0;
+    while i < v invariant i >= 0 { a = a * 13 / 16; i = i + 1; }
+    return a;
+}
+// Advance one tone channel by a single PSG tick: count down, and on underflow reload the
+// period and flip the square output. Returns the channel's contribution (0 or amplitude).
+fn psg_tone(m: Int, c: Int) -> Int ! {mem} {
+    var cnt: Int = peek8(psg_st(m), c * 8 + 4) + peek8(psg_st(m), c * 8 + 5) * 256;
+    cnt = cnt - 1;
+    if cnt <= 0 {
+        cnt = psg_period(m, c);
+        poke8(psg_st(m), c * 8 + 1, 1 - peek8(psg_st(m), c * 8 + 1));      // toggle phase
+    }
+    poke8(psg_st(m), c * 8 + 4, cnt and 255); poke8(psg_st(m), c * 8 + 5, (cnt / 256) and 255);
+    return peek8(psg_st(m), c * 8 + 1) * psg_amp(peek8(psg_st(m), c * 8));  // phase (0/1) * amplitude
+}
+// Noise channel (3): control = period(3)&7 (bits1-0 rate, bit2 white/periodic). On its
+// tick the 16-bit LFSR shifts; white feedback = bit0 XOR bit3, periodic = bit0. Output =
+// LFSR bit0 * amplitude. Rate 3 reuses tone-channel-2's period.
+fn psg_noise(m: Int) -> Int ! {mem} {
+    var cnt: Int = peek8(psg_st(m), 28) + peek8(psg_st(m), 29) * 256;
+    cnt = cnt - 1;
+    if cnt <= 0 {
+        let ctrl: Int = psg_period(m, 3) and 7;
+        let r: Int = ctrl and 3;
+        var per: Int = 16; if r == 1 { per = 32; } if r == 2 { per = 64; } if r == 3 { per = psg_period(m, 2); }
+        cnt = per;
+        var lfsr: Int = peek8(psg_st(m), 42) + peek8(psg_st(m), 43) * 256;
+        var fb: Int = lfsr and 1;
+        if (ctrl and 4) != 0 { fb = ((lfsr and 1) + ((lfsr / 8) and 1)) and 1; }    // white = bit0 ^ bit3
+        lfsr = (lfsr / 2) or (fb * 32768);
+        poke8(psg_st(m), 42, lfsr and 255); poke8(psg_st(m), 43, (lfsr / 256) and 255);
+    }
+    poke8(psg_st(m), 28, cnt and 255); poke8(psg_st(m), 29, (cnt / 256) and 255);
+    return (peek8(psg_st(m), 42) and 1) * psg_amp(peek8(psg_st(m), 24));
+}
+// One mixed PSG sample (3 tone channels + the noise channel).
+fn psg_sample(m: Int) -> Int ! {mem} { return psg_tone(m, 0) + psg_tone(m, 1) + psg_tone(m, 2) + psg_noise(m); }
+
+fn psg_reset(m: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 48 invariant i >= 0 { poke8(psg_st(m), i, 0); i = i + 1; }
+    poke8(psg_st(m), 0, 15); poke8(psg_st(m), 8, 15);       // all channels silent (attenuation 15)
+    poke8(psg_st(m), 16, 15); poke8(psg_st(m), 24, 15);
+    poke8(psg_st(m), 42, 1); poke8(psg_st(m), 43, 0);       // noise LFSR seed
+    return 0;
+}

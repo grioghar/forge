@@ -1,0 +1,61 @@
+// forge/play/genesis_boot_test.sg — verifies the ported Genesis core executes a
+// real 68000 vector-table boot + a tiny hand-assembled program natively.
+//
+// Links: forge/play/m68k_core.sg forge/play/m68k_singlebus_core.sg
+//        forge/play/ym2612_core.sg forge/play/psg_core.sg
+//        forge/play/genesis_core.sg forge/play/genesis_abi_core.sg
+//        forge/play/genesis_id_core.sg forge/play/genesis_boot_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+// Big-endian 32-bit word write.
+fn wr32(base: Int, off: Int, v: Int) -> Int ! {mem} {
+    poke8(base, off, (v / 16777216) and 255);
+    poke8(base, off + 1, (v / 65536) and 255);
+    poke8(base, off + 2, (v / 256) and 255);
+    poke8(base, off + 3, v and 255);
+    return 0;
+}
+
+fn main() -> Int ! {mem, io.write} {
+    let rom: Int = alloc_buf(4096);
+    wr32(rom, 0, 16776960);      // initial SSP = 0xFFFF00
+    wr32(rom, 4, 256);           // initial PC  = 0x000100 (past the vector table)
+    // At 0x100: MOVE #$1234,D0 (303C 1234) ; ADD #1,D0 loop (0602 0001) ; BRA $-4 (60FA)
+    poke8(rom, 256, 48); poke8(rom, 257, 60); poke8(rom, 258, 18); poke8(rom, 259, 52);   // MOVE.W #$1234,D0
+    poke8(rom, 260, 6);  poke8(rom, 261, 64); poke8(rom, 262, 0);  poke8(rom, 263, 1);    // ADDI.W #1,D0
+    poke8(rom, 264, 96); poke8(rom, 265, 250);                                           // BRA -6 (loop to ADDI)
+
+    let m: Int = alloc_buf(5570560);
+    let ok: Int = core_load(m, rom, 4096);
+
+    var pass: Int = 0;
+    var tot: Int = 0;
+    tot = tot + 1; pass = chk(ok == 1, pass);
+    tot = tot + 1; pass = chk(gn_pc(m) == 256, pass);   // PC latched from vector table
+    tot = tot + 1; pass = chk(gn_a(m, 7) == 16776960, pass);   // SSP latched
+
+    core_run_frame(m);
+    let pc_after: Int = gn_pc(m);
+    let d0_after: Int = gn_d(m, 0) and 65535;
+
+    // The loop is ADDI(4 bytes @260)+BRA(2 bytes @264) = 6-byte cycle; PC should
+    // have settled inside that tiny loop, and D0 should have counted up from
+    // its initial $1234 seed (proving real instruction execution, not a stall).
+    tot = tot + 1; pass = chk(pc_after >= 260, pass);
+    tot = tot + 1; pass = chk(pc_after <= 266, pass);
+    tot = tot + 1; pass = chk(d0_after > 4660, pass);   // > initial $1234 = 4660 -> ADDI ran
+
+    print(1, "GENESIS BOOT: 68000 vector table + a hand-assembled counting loop\n");
+    print(1, "  core_load ok="); print(1, chr(48 + ok));
+    print(1, "  PC after load="); print(1, chr(48 + gn_pc(m) / 100 % 10)); print(1, chr(48 + gn_pc(m) / 10 % 10)); print(1, chr(48 + gn_pc(m) % 10));
+    print(1, "\n  after 1 frame: PC="); print(1, chr(48 + pc_after / 100 % 10)); print(1, chr(48 + pc_after / 10 % 10)); print(1, chr(48 + pc_after % 10));
+    print(1, "  D0="); print(1, chr(48 + d0_after / 10000 % 10)); print(1, chr(48 + d0_after / 1000 % 10));
+    print(1, chr(48 + d0_after / 100 % 10)); print(1, chr(48 + d0_after / 10 % 10)); print(1, chr(48 + d0_after % 10));
+    print(1, " (seeded 04660, counting up proves real execution)\n");
+    print(1, "  SELFTEST: "); print(1, chr(48 + pass / 10 % 10)); print(1, chr(48 + pass % 10));
+    print(1, "/"); print(1, chr(48 + tot / 10 % 10)); print(1, chr(48 + tot % 10));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

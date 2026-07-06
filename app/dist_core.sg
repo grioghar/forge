@@ -1,0 +1,12 @@
+// forge/app/dist_core.sg — FORGE CORE: the shell only, zero cores bundled.
+// Every core arrives on demand as an EMULATOR relic from
+// emulators.forge.sigilos.grio.co (RELIC-V2.md §6a).
+// Link exactly one of dist_thin.sg / dist_fat.sg / dist_core.sg into main.sg.
+fn dist_mode() -> Int { return 2; }
+fn dist_label(c: Int) -> Int ! {io.write} { print(c, "Forge Core (no bundled cores)"); return 0; }
+fn dist_desc(c: Int) -> Int ! {io.write} {
+    print(c, "  Shell only - each emulator core installs on demand as an");
+    print(c, chr(10));
+    print(c, "  EMULATOR relic from emulators.forge.sigilos.grio.co");
+    return 0;
+}

@@ -1,0 +1,9 @@
+// forge/app/dist_fat.sg — FORGE COMPLETE (nee fat): all 74 cores bundled in one download per platform.
+// Logged-in only, not shown on the public site.
+// Link exactly one of dist_thin.sg / dist_fat.sg / dist_core.sg into main.sg.
+fn dist_mode() -> Int { return 1; }
+fn dist_label(c: Int) -> Int ! {io.write} { print(c, "Forge Complete (all cores bundled)"); return 0; }
+fn dist_desc(c: Int) -> Int ! {io.write} {
+    print(c, "  All 74 cores are bundled in this download - no on-demand fetch needed");
+    return 0;
+}

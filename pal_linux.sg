@@ -1,0 +1,43 @@
+// forge/pal_linux.sg — Linux (x86-64 ELF) PAL backend for Forge.
+// Link FIRST so these defs win over forge/pal.sg defaults.
+// Build: cc0 default target → static x86-64 Linux ELF (no libc, no linker step).
+//
+// Current coverage (same as macOS — stubs except host ID):
+//   FS:      stubs — gated on cc0 shipping Linux open/read syscall lowering
+//   Display: stubs — gated on Video shipping X11/Vulkan display PAL
+//   Input:   stubs — gated on Drivers shipping evdev input PAL
+//   Audio:   stubs — gated on Drivers shipping ALSA/PulseAudio PAL
+//   Window:  stubs — gated on Video shipping X11 event pump
+//   Memory:  REAL — cc0's built-in bump allocator (alloc_buf), verified via Docker:
+//            a 1MiB region round-trips poke8/peek8 at offset 500000 on this target.
+//
+// Pure-compute code (library listing, launcher logic, checksums) runs today.
+
+fn pal_fs_resolve(s: Sys, path: Int, out: Int) -> Int ! {sys} { return 0 - 1; }   // stub: always "not found"
+fn pal_fs_read(s: Sys, fd: Int, buf: Int, size: Int) -> Int ! {sys} { return 0; }
+fn pal_fs_write(s: Sys, fd: Int, buf: Int, size: Int) -> Int ! {sys} { return 0; }
+fn pal_fs_close(s: Sys, fd: Int) -> Int ! {sys} { return 0; }
+
+fn pal_fb_base(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_fb_pitch(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_fb_width(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_fb_height(s: Sys) -> Int ! {sys} { return 0; }
+fn pal_present(s: Sys) -> Int ! {sys} { return 0; }
+
+fn pal_input_state(s: Sys, pad: Int) -> Int ! {sys} { return 0; }
+
+fn pal_aud_open(s: Sys, rate: Int, channels: Int, frames: Int) -> Int ! {sys} { return 0; }
+fn pal_aud_submit(s: Sys, buf: Int, frames: Int) -> Int ! {sys} { return 0; }
+fn pal_aud_volume(s: Sys, vol: Int) -> Int ! {sys} { return 0; }
+fn pal_aud_close(s: Sys) -> Int ! {sys} { return 0; }
+
+fn pal_frame_yield() -> Int { return 0; }
+fn pal_should_quit() -> Int { return 0; }
+
+// A fresh peek8/poke8-able region of `size` bytes from cc0's bump heap (alloc_buf) —
+// `base` is advisory and ignored, same contract as pal_macos.sg's real implementation.
+fn pal_mem_map(base: Int, size: Int) -> Int { return alloc_buf(size); }
+
+fn pal_launch(s: Sys, app_id: Int) -> Int ! {sys} { return 0; }   // no-op; caller reads return value
+
+fn pal_host() -> Int { return 2; }   // Linux

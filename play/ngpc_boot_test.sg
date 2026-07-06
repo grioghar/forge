@@ -1,0 +1,50 @@
+// forge/play/ngpc_boot_test.sg — deterministic hand-assembled TLCS-900H stub
+// test. The stub core's PC is only 16-bit (t9_setpc masks % 65536), so test
+// code is poked directly into ngpc_mem's low WRAM region (0-65535), the only
+// range PC can actually reach — matching how core_load's ROM copy target
+// ($200000) is out of PC's reach today (a known stub limitation, not something
+// this test invents behavior around).
+//
+// Program (poked at WRAM offset 100):
+//   100: C0 34 12        LD BC, #0x1234      (BC=reg0=4660)
+//   103: CD C8 00        CALL 0x00C8 (=200)
+//   200: 76              HALT (spins in place forever once reached)
+//
+// Expected after enough steps: reg0(BC)=4660, SP=61438 (pushed ret addr 106),
+// PC=200 (settled in the HALT spin).
+//
+// Links: forge/play/ngpc_core.sg  forge/play/ngpc_boot_test.sg
+
+fn main() -> Int ! {mem, io.write} {
+    let m: Int = alloc_buf(3145728);   // ngpc_mem(1MB) + ngpc_fb(97280B), rounded up
+
+    poke8(ngpc_mem(m), 100, 192); poke8(ngpc_mem(m), 101, 52); poke8(ngpc_mem(m), 102, 18);
+    poke8(ngpc_mem(m), 103, 205); poke8(ngpc_mem(m), 104, 200); poke8(ngpc_mem(m), 105, 0);
+    poke8(ngpc_mem(m), 200, 118);
+
+    t9_setpc(m, 100);
+    t9_setsp(m, 61440);
+
+    var i: Int = 0;
+    while i < 10 invariant i >= 0 { t9_step(m); i = i + 1; }
+
+    let bc: Int = t9_getreg(m, 0);
+    let sp: Int = t9_getsp(m);
+    let pc: Int = t9_getpc(m);
+
+    print(1, "NEO GEO POCKET BOOT: TLCS-900H stub, LD+CALL+HALT hand-assembled\n");
+    print(1, "  BC="); print(1, chr(48 + bc / 1000 % 10)); print(1, chr(48 + bc / 100 % 10));
+    print(1, chr(48 + bc / 10 % 10)); print(1, chr(48 + bc % 10));
+    print(1, " (expect 4660)");
+    print(1, "  SP="); print(1, chr(48 + sp / 10000 % 10)); print(1, chr(48 + sp / 1000 % 10));
+    print(1, chr(48 + sp / 100 % 10)); print(1, chr(48 + sp / 10 % 10)); print(1, chr(48 + sp % 10));
+    print(1, " (expect 61438)");
+    print(1, "  PC="); print(1, chr(48 + pc / 100 % 10)); print(1, chr(48 + pc / 10 % 10)); print(1, chr(48 + pc % 10));
+    print(1, " (expect 200)\n");
+
+    var pass: Int = 0;
+    if bc == 4660 { if sp == 61438 { if pc == 200 { pass = 1; } } }
+    if pass == 1 { print(1, "  SELFTEST: 3/3 PASS\n"); return 0; }
+    print(1, "  SELFTEST: FAIL\n");
+    return 1;
+}

@@ -1,0 +1,232 @@
+// cores/ym2612.sg — Yamaha YM2612 FM synthesizer (the Genesis main sound chip), Sigil
+// Int-subset. 6 FM channels x 4 operators, 4-op phase-modulation synthesis with 8
+// algorithms, per-operator envelopes, an LFO, and a DAC. Paired with the SN76489 PSG
+// (cores/psg.sg). This is a multi-part build; this file: the register interface (the two
+// address/data port banks) + the register file. Sine table, phase/EG operators, algorithm
+// mix, key on/off, and the 6-channel mixdown follow.
+// Prefix ym_ (asm-reg collisions, sigil#12). Decimal literals only.
+//
+// Two banks of 256 registers: bank 0 = channels 0-2 (+ global regs $20-$2B), bank 1 =
+// channels 3-5. Each bank is driven by an address port then a data port (Genesis maps
+// them at $A04000 addr0 / $A04001 data0 / $A04002 addr1 / $A04003 data1).
+
+fn ym_reg(m: Int) -> Int { return m + 5308416; }        // audio-zone+65536: register file
+fn ym_st(m: Int) -> Int { return m + 5373952; }         // audio-zone+131072: state
+
+fn ym_read_reg(m: Int, bank: Int, addr: Int) -> Int ! {mem} { return peek8(ym_reg(m), (bank and 1) * 256 + (addr and 255)); }
+
+// Port write: even port = latch the bank's register address; odd port = write data to the
+// last-latched address. p in 0..3 -> bank = (p>>1)&1, addr/data = p&1.
+fn ym_port_write(m: Int, p: Int, v: Int) -> Int ! {mem} {
+    if (p and 1) == 0 { poke8(ym_st(m), (p / 2) and 1, v and 255); }       // latch address
+    if (p and 1) != 0 {
+        let bank: Int = (p / 2) and 1;
+        poke8(ym_reg(m), bank * 256 + peek8(ym_st(m), bank), v and 255);    // data -> latched addr
+        if bank == 0 { if peek8(ym_st(m), 0) == 40 { poke8(ym_st(m), 12, 1); } }   // $28 key write pending
+    }
+    return 0;
+}
+
+// --- operator: sine waveform + phase accumulator -----------------------------------
+// Sine over a 1024-step cycle, parabolic approximation (4x(1-x) humps, peak +-8192 at
+// the quarter points, 0 at 0/512). The real chip uses a log-sine + exp table; this is a
+// smooth periodic stand-in for the phase/EG/algorithm scaffolding (refine later).
+fn ym_sine(p: Int) -> Int {
+    let ph: Int = p and 1023;
+    if ph < 512 { return (4 * ph * (512 - ph)) / 32; }        // positive hump, peak 8192 @256
+    let x: Int = ph - 512;
+    return 0 - (4 * x * (512 - x)) / 32;                      // negative hump, -8192 @768
+}
+// Advance operator `op` (0..23 = 6 ch x 4) by phase increment `inc` (a 20-bit accumulator;
+// the top 10 bits index the sine) and return its current sample.
+fn ym_op_sample(m: Int, op: Int, inc: Int) -> Int ! {mem} {
+    let ph: Int = (peek32(ym_st(m), 16 + op * 4) + inc) and 1048575;
+    poke32(ym_st(m), 16 + op * 4, ph);
+    return ym_sine((ph / 1024) and 1023);
+}
+
+// --- frequency: FNUM/BLOCK/MUL -> phase increment ---------------------------------
+fn ym_pow2(n: Int) -> Int { var r: Int = 1; var i: Int = 0; while i < n invariant i >= 0 { r = r * 2; i = i + 1; } return r; }
+// Phase increment for an operator from the channel's 11-bit F-number, 3-bit block (octave),
+// and the operator's 4-bit multiple: base = (fnum << block) >> 1, then MUL (0 = x0.5).
+fn ym_phase_inc(fnum: Int, block: Int, mul: Int) -> Int {
+    let base: Int = (fnum * ym_pow2(block)) / 2;
+    if mul == 0 { return base / 2; }
+    return base * mul;
+}
+
+// --- envelope generator (attenuation domain: 0 = loud, 1023 = silent) -------------
+// FM EG, the inverse of the S-DSP's volume envelope: attack drives attenuation DOWN to 0,
+// then decay/sustain rise toward the sustain level / silence, release rises to 1023.
+// One gated step per call; phases 0 attack, 1 decay, 2 sustain, 3 release, 4 off. Packed
+// return: phase*1024 + att.
+fn ym_eg_tick(att: Int, phase: Int, sl: Int) -> Int {
+    var a: Int = att; var ph: Int = phase;
+    let ph0: Int = ph;
+    if ph0 == 0 {
+        a = a - 64;
+        if a <= 0 { a = 0; ph = 1; }
+    }
+    if ph0 == 1 {
+        a = a + ((a / 16) + 1);
+        if a >= sl { ph = 2; }
+    }
+    if ph0 == 2 {
+        a = a + ((a / 16) + 1);
+    }
+    if ph0 == 3 {
+        a = a + 32;
+        if a >= 1023 { a = 1023; ph = 4; }
+    }
+    if a > 1023 { a = 1023; }
+    return ph * 1024 + a;
+}
+
+// --- FM core: phase modulation + algorithm routing --------------------------------
+// Like ym_op_sample but adds `mod` (a modulating operator's scaled output) to the phase
+// index before the sine lookup — this IS frequency/phase modulation (mod=0 = pure tone).
+fn ym_op_mod(m: Int, op: Int, inc: Int, mod: Int) -> Int ! {mem} {
+    let ph: Int = (peek32(ym_st(m), 16 + op * 4) + inc) and 1048575;
+    poke32(ym_st(m), 16 + op * 4, ph);
+    return ym_sine(((ph / 1024) + mod) and 1023);
+}
+// Operator output scaled by its attenuation (att 0 = full, 1023 = silent — the combined
+// EG envelope + TL total-level, log domain). Linear factor approximation (1023-att)/1023;
+// the real chip uses an exp table. att is what makes carriers fade and shapes FM timbre.
+fn ym_op_out(m: Int, op: Int, inc: Int, mod: Int, att: Int) -> Int ! {mem} {
+    let s: Int = ym_op_mod(m, op, inc, mod);
+    return (s * (1023 - att)) / 1023;
+}
+// The 8 algorithms select which operators are CARRIERS (summed to the channel output):
+// alg 0-3 -> op4; alg 4 -> op2+op4; alg 5-6 -> op2+op3+op4; alg 7 -> all four (additive).
+fn ym_alg_mix(alg: Int, o1: Int, o2: Int, o3: Int, o4: Int) -> Int {
+    if alg <= 3 { return o4; }
+    if alg == 4 { return o2 + o4; }
+    if alg <= 6 { return o2 + o3 + o4; }
+    return o1 + o2 + o3 + o4;
+}
+
+// --- 4-operator channel render (all 8 algorithms) ----------------------------------
+// Chain the 4 operators per the algorithm's modulation routing, then sum carriers via
+// ym_alg_mix. b = base operator index (ch*4); i0..i3 = per-op phase increments; ms = the
+// modulation scale (operator output >> into phase units). Feedback on op1 omitted (v1).
+fn ym_channel(m: Int, b: Int, i0: Int, i1: Int, i2: Int, i3: Int, a0: Int, a1: Int, a2: Int, a3: Int, alg: Int, ms: Int) -> Int ! {mem} {
+    let o1: Int = ym_op_out(m, b, i0, 0, a0);               // a0..a3 = per-op attenuation (EG+TL)
+    var o2: Int = 0; var o3: Int = 0; var o4: Int = 0;
+    if alg == 0 { o2 = ym_op_out(m, b + 1, i1, o1 / ms, a1); o3 = ym_op_out(m, b + 2, i2, o2 / ms, a2); o4 = ym_op_out(m, b + 3, i3, o3 / ms, a3); }
+    if alg == 1 { o2 = ym_op_out(m, b + 1, i1, 0, a1); o3 = ym_op_out(m, b + 2, i2, (o1 + o2) / ms, a2); o4 = ym_op_out(m, b + 3, i3, o3 / ms, a3); }
+    if alg == 2 { o2 = ym_op_out(m, b + 1, i1, 0, a1); o3 = ym_op_out(m, b + 2, i2, o2 / ms, a2); o4 = ym_op_out(m, b + 3, i3, (o1 + o3) / ms, a3); }
+    if alg == 3 { o2 = ym_op_out(m, b + 1, i1, o1 / ms, a1); o3 = ym_op_out(m, b + 2, i2, 0, a2); o4 = ym_op_out(m, b + 3, i3, (o2 + o3) / ms, a3); }
+    if alg == 4 { o2 = ym_op_out(m, b + 1, i1, o1 / ms, a1); o3 = ym_op_out(m, b + 2, i2, 0, a2); o4 = ym_op_out(m, b + 3, i3, o3 / ms, a3); }
+    if alg == 5 { o2 = ym_op_out(m, b + 1, i1, o1 / ms, a1); o3 = ym_op_out(m, b + 2, i2, o1 / ms, a2); o4 = ym_op_out(m, b + 3, i3, o1 / ms, a3); }
+    if alg == 6 { o2 = ym_op_out(m, b + 1, i1, o1 / ms, a1); o3 = ym_op_out(m, b + 2, i2, 0, a2); o4 = ym_op_out(m, b + 3, i3, 0, a3); }
+    if alg == 7 { o2 = ym_op_out(m, b + 1, i1, 0, a1); o3 = ym_op_out(m, b + 2, i2, 0, a2); o4 = ym_op_out(m, b + 3, i3, 0, a3); }
+    return ym_alg_mix(alg, o1, o2, o3, o4);
+}
+
+// --- per-operator EG state + key on/off ($28) --------------------------------------
+// EG state per operator (24) in ym_st(m)+128: att @+0 (16-bit, 0=loud 1023=silent),
+// egphase @+2 (0 attack..4 off). Key-on starts attack from silent; key-off -> release.
+fn ym_att(m: Int, op: Int) -> Int ! {mem} { return peek8(ym_st(m), 128 + op * 4) + peek8(ym_st(m), 128 + op * 4 + 1) * 256; }
+fn ym_set_att(m: Int, op: Int, v: Int) -> Int ! {mem} { poke8(ym_st(m), 128 + op * 4, v and 255); poke8(ym_st(m), 128 + op * 4 + 1, (v / 256) and 255); return 0; }
+fn ym_egph(m: Int, op: Int) -> Int ! {mem} { return peek8(ym_st(m), 128 + op * 4 + 2); }
+fn ym_set_egph(m: Int, op: Int, v: Int) -> Int ! {mem} { poke8(ym_st(m), 128 + op * 4 + 2, v and 255); return 0; }
+// $28 write: bits0-2 channel (0-2 = bank0, 4-6 = bank1 ch3-5), bits4-7 = per-op key mask.
+// Each op with its bit set is keyed ON (attack from silent), cleared = keyed OFF (release).
+fn ym_key_write(m: Int, v: Int) -> Int ! {mem} {
+    let c: Int = v and 7;
+    var ch: Int = c; if c >= 4 { ch = c - 1; }            // 0,1,2,4,5,6 -> 0,1,2,3,4,5
+    var k: Int = 0;
+    while k < 4 invariant k >= 0 {
+        let op: Int = ch * 4 + k;
+        if ((v / ym_pow2(k + 4)) and 1) == 1 { ym_set_att(m, op, 1023); ym_set_egph(m, op, 0); }   // key on -> attack
+        if ((v / ym_pow2(k + 4)) and 1) != 1 { ym_set_egph(m, op, 3); }                        // key off -> release
+        k = k + 1;
+    }
+    return 0;
+}
+
+// Advance one operator's EG one step (ym_eg_tick over its stored att/phase) and return the
+// new attenuation — the live value ym_op_out applies. Called per output sample per op.
+fn ym_op_eg(m: Int, op: Int, sl: Int) -> Int ! {mem} {
+    let packed: Int = ym_eg_tick(ym_att(m, op), ym_egph(m, op), sl);
+    ym_set_att(m, op, packed % 1024);
+    ym_set_egph(m, op, packed / 1024);
+    return packed % 1024;
+}
+
+// --- register-driven channel render ------------------------------------------------
+// Operator register slot order is S1,S3,S2,S4: physical op 0/1/2/3 -> reg slot 0/2/1/3.
+fn ym_slot(op: Int) -> Int { if op == 1 { return 2; } if op == 2 { return 1; } return op; }
+// Phase increment for op `op` of a channel from its MUL reg ($30 + slot*4 + cb) + freq.
+fn ym_op_inc(m: Int, bank: Int, cb: Int, op: Int, fnum: Int, block: Int) -> Int ! {mem} {
+    let mul: Int = ym_read_reg(m, bank, 48 + ym_slot(op) * 4 + cb) and 15;
+    return ym_phase_inc(fnum, block, mul);
+}
+// Live attenuation for op `op`: advance its EG (sustain level from $80 bits4-7) + TL
+// ($40 bits0-6, <<3 into the 10-bit attenuation), clamped.
+fn ym_op_att(m: Int, ch: Int, bank: Int, cb: Int, op: Int) -> Int ! {mem} {
+    let slot: Int = ym_slot(op);
+    let tl: Int = ym_read_reg(m, bank, 64 + slot * 4 + cb) and 127;
+    let sl: Int = (ym_read_reg(m, bank, 128 + slot * 4 + cb) / 16) and 15;
+    let att: Int = ym_op_eg(m, ch * 4 + op, sl * 64) + tl * 8;
+    if att > 1023 { return 1023; }
+    return att;
+}
+// Render one channel from its registers: FNUM/BLOCK ($A0/$A4), ALG ($B0), per-op MUL/TL/EG.
+fn ym_render_channel(m: Int, ch: Int, ms: Int) -> Int ! {mem} {
+    let bank: Int = ch / 3; let cb: Int = ch - bank * 3;
+    let fnum: Int = ym_read_reg(m, bank, 160 + cb) + (ym_read_reg(m, bank, 164 + cb) and 7) * 256;
+    let block: Int = (ym_read_reg(m, bank, 164 + cb) / 8) and 7;
+    let b: Int = ch * 4;
+    return ym_channel(m, b,
+        ym_op_inc(m, bank, cb, 0, fnum, block), ym_op_inc(m, bank, cb, 1, fnum, block),
+        ym_op_inc(m, bank, cb, 2, fnum, block), ym_op_inc(m, bank, cb, 3, fnum, block),
+        ym_op_att(m, ch, bank, cb, 0), ym_op_att(m, ch, bank, cb, 1),
+        ym_op_att(m, ch, bank, cb, 2), ym_op_att(m, ch, bank, cb, 3),
+        ym_read_reg(m, bank, 176 + cb) and 7, ms);
+}
+
+// --- channel 6 DAC ($2A data / $2B enable) -----------------------------------------
+// When $2B bit7 is set, channel 6 outputs an 8-bit PCM sample written to $2A instead of
+// FM — the path games use for drums / voice (e.g. Sonic). Centered + scaled to s16.
+fn ym_dac_on(m: Int) -> Int ! {mem} { return (ym_read_reg(m, 0, 43) / 128) and 1; }
+fn ym_dac_sample(m: Int) -> Int ! {mem} { return (ym_read_reg(m, 0, 42) - 128) * 256; }
+fn ym_ch6(m: Int, ms: Int) -> Int ! {mem} { if ym_dac_on(m) == 1 { return ym_dac_sample(m); } return ym_render_channel(m, 5, ms); }
+
+// --- 6-channel STEREO mixdown ($28 key trigger + per-channel L/R pan) ---------------
+fn ym_out(m: Int) -> Int { return m + 5439488; }        // audio-zone+196608: FM mix output
+fn ym_pan(m: Int, ch: Int) -> Int ! {mem} { return ym_read_reg(m, ch / 3, 180 + ch - (ch / 3) * 3); }   // $B4+cb: bit7 L, bit6 R
+fn ym_chsmp(m: Int, ch: Int) -> Int ! {mem} { if ch == 5 { return ym_ch6(m, 32); } return ym_render_channel(m, ch, 32); }
+fn ym_store(m: Int, off: Int, v: Int) -> Int ! {mem} {
+    var s: Int = v; if s > 32767 { s = 32767; } if s < (0 - 32768) { s = 0 - 32768; }
+    poke8(ym_out(m), off, s and 255); poke8(ym_out(m), off + 1, (s and 65535) / 256);
+    return 0;
+}
+// Produce `count` STEREO frames: apply a pending $28 key write, then per sample render
+// each channel once and route it to L (pan bit7) and/or R (pan bit6) per its $B4 register.
+fn ym_audio(m: Int, count: Int) -> Int ! {mem} {
+    if peek8(ym_st(m), 12) == 1 { ym_key_write(m, ym_read_reg(m, 0, 40)); poke8(ym_st(m), 12, 0); }
+    var i: Int = 0;
+    while i < count invariant i >= 0 {
+        var l: Int = 0; var r: Int = 0; var ch: Int = 0;
+        while ch < 6 invariant ch >= 0 {
+            let smp: Int = ym_chsmp(m, ch);
+            let pan: Int = ym_pan(m, ch);
+            if (pan and 128) != 0 { l = l + smp; }
+            if (pan and 64) != 0 { r = r + smp; }
+            ch = ch + 1;
+        }
+        ym_store(m, i * 4, l); ym_store(m, i * 4 + 2, r);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ym_reset(m: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 512 invariant i >= 0 { poke8(ym_reg(m), i, 0); i = i + 1; }
+    var j: Int = 0;
+    while j < 256 invariant j >= 0 { poke8(ym_st(m), j, 0); j = j + 1; }    // latches + phase accumulators + EG state
+    return 0;
+}

@@ -1,0 +1,90 @@
+// forge/play/chip8_play.sg — interactive CHIP-8 play, driven by the canonical pad
+// + controller-relic abstraction, native on macOS arm64.
+//
+// TOOLCHAIN NOTE (found + verified during this build): cc0's raw sys1/2/3/4/6
+// syscall builtins codegen the arm-EL0/bare-metal convention (x8=num, svc #0)
+// for ctx.target=="arm" — including the `macho` (host arm64 Darwin) target — but
+// real Darwin arm64 syscalls need x16=num, svc #0x80 (a different ABI). So sys3
+// CANNOT make real host syscalls on arm64 macOS today; an early version of this
+// file that read stdin via raw sys3 read()-with-Linux-numbers, then Darwin
+// syscall numbers, silently "succeeded" without reading real bytes and spun
+// forever. `read_line` is the one I/O builtin with a hand-coded, CORRECT arm64
+// Darwin read loop (`macho_read_line_seq` in cc0.sg) — verified working here.
+// It reads one LINE (blocks for '\n'), not a single raw byte, so per-keystroke
+// raw-mode input isn't available via cc0 today on this arch; this build uses a
+// turn-based model instead: type a sequence of moves, press Enter, watch them
+// play out. Each character in that line drives ONE canonical-pad event through
+// the SAME binding a controller relic would use — the abstraction is real, only
+// the keystroke delivery granularity is coarser than raw mode.
+//
+// Links: forge/input/pad.sg forge/input/bind_chip8.sg forge/play/chip8_core.sg
+//        forge/play/chip8_play.sg
+
+fn bake_move_demo(src: Int) -> Int ! {mem} {
+    poke8(src,0,0);   poke8(src,1,224);   // 0x200 00E0  CLS
+    poke8(src,2,96);  poke8(src,3,0);     // 0x202 6000  V0=0 (x)
+    poke8(src,4,97);  poke8(src,5,0);     // 0x204 6100  V1=0 (y)
+    poke8(src,6,0);   poke8(src,7,224);   // 0x206 00E0  CLS (loop, redraw)
+    poke8(src,8,162); poke8(src,9,38);    // 0x208 A226  I=0x226 (sprite)
+    poke8(src,10,208);poke8(src,11,17);   // 0x20A D011  DRW V0,V1,1
+    poke8(src,12,98); poke8(src,13,2);    // 0x20C 6202  V2=2 (key UP)
+    poke8(src,14,226);poke8(src,15,161);  // 0x20E E2A1  skip if key V2 NOT down
+    poke8(src,16,113);poke8(src,17,255);  // 0x210 71FF  V1 -= 1
+    poke8(src,18,98); poke8(src,19,8);    // 0x212 6208  V2=8 (key DOWN)
+    poke8(src,20,226);poke8(src,21,161);  // 0x214 E2A1
+    poke8(src,22,113);poke8(src,23,1);    // 0x216 7101  V1 += 1
+    poke8(src,24,98); poke8(src,25,4);    // 0x218 6204  V2=4 (key LEFT)
+    poke8(src,26,226);poke8(src,27,161);  // 0x21A E2A1
+    poke8(src,28,112);poke8(src,29,255);  // 0x21C 70FF  V0 -= 1
+    poke8(src,30,98); poke8(src,31,6);    // 0x21E 6206  V2=6 (key RIGHT)
+    poke8(src,32,226);poke8(src,33,161);  // 0x220 E2A1
+    poke8(src,34,112);poke8(src,35,1);    // 0x222 7001  V0 += 1
+    poke8(src,36,18); poke8(src,37,6);    // 0x224 1206  JMP 0x206
+    poke8(src,38,128);                    // 0x226 sprite byte (10000000 = one lit pixel)
+    return 39;
+}
+
+fn render_live(b: Int) -> Int ! {mem, io.write} {
+    print(1, chr(27)); print(1, "[H"); print(1, chr(27)); print(1, "[J");   // ANSI home+clear
+    print(1, "  FORGE CHIP-8 - LIVE. Type moves (wasd) + Enter; 'q' quits.\n");
+    render_term(b);
+    return 0;
+}
+
+fn code_at(s: Text, i: Int) -> Int { return ord(slice(s, i, i + 1)); }
+
+fn main() -> Int ! {mem, io.write, io.read} {
+    let b: Int    = alloc_buf(6464);
+    let src: Int  = alloc_buf(64);
+    let n: Int    = bake_move_demo(src);
+    chip8_init(b);
+    chip8_load(b, src, n);
+
+    let pad: Int  = alloc_buf(16);
+    let c8cfg: Int = alloc_buf(16); bindc8_default(c8cfg);
+
+    chip8_run(b, 12);
+    render_live(b);
+
+    var running: Int = 1;
+    while running == 1 invariant running >= 0 {
+        let line: Text = read_line(0);
+        let ll: Int = len(line);   // blank Enter (or a closed stdin) just re-prompts; 'q' is the quit path
+        var i: Int = 0;
+        while i < ll invariant i >= 0 {
+            let ch: Int = code_at(line, i);
+            if ch == 113 { running = 0; }   // 'q' quits
+            if running == 1 {
+                pad_clear(pad);
+                let btn: Int = kbd_btn(ch);
+                pad_set(pad, btn, 1);
+                bindc8_apply(pad, b + kp_off(), c8cfg);
+                chip8_run(b, 13);   // one full loop iteration with the move applied
+                render_live(b);
+            }
+            i = i + 1;
+        }
+    }
+    print(1, "\n  [OK] session ended.\n");
+    return 0;
+}

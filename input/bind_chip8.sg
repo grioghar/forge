@@ -1,0 +1,33 @@
+// forge/input/bind_chip8.sg — binding: canonical pad -> CHIP-8 16-key keypad.
+//
+// CHIP-8 is a native-keypad core (it reads a 16-key hex pad). The binding maps
+// each canonical button to a CHIP-8 key. cfg[canonical_btn] = chip8_key (255 = unmapped).
+// This cfg IS a CONTROLLER-relic per-core ctrl_cfg block (RELIC-V2 §2/§6b) — a
+// plugged-in pad supplies its own cfg; edits publish back to controllers.forge...
+
+fn bindc8_default(cfg: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 16 invariant i >= 0 { poke8(cfg, i, 255); i = i + 1; }
+    poke8(cfg, 0, 2);   // UP    -> key 2
+    poke8(cfg, 1, 8);   // DOWN  -> key 8
+    poke8(cfg, 2, 4);   // LEFT  -> key 4
+    poke8(cfg, 3, 6);   // RIGHT -> key 6
+    poke8(cfg, 4, 5);   // A     -> key 5
+    poke8(cfg, 5, 0);   // B     -> key 0
+    return 0;
+}
+
+// Rebuild the CHIP-8 keypad (16 bytes, 0/1) from the canonical pad via cfg.
+fn bindc8_apply(pad: Int, keypad: Int, cfg: Int) -> Int ! {mem} {
+    var k: Int = 0;
+    while k < 16 invariant k >= 0 { poke8(keypad, k, 0); k = k + 1; }
+    var b: Int = 0;
+    while b < 12 invariant b >= 0 {
+        if peek8(pad, b) == 1 {
+            let key: Int = peek8(cfg, b);
+            if key < 16 { poke8(keypad, key, 1); }
+        }
+        b = b + 1;
+    }
+    return 0;
+}

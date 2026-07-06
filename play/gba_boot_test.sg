@@ -1,0 +1,47 @@
+// forge/play/gba_boot_test.sg — verifies the ported GBA core (ARM7TDMI) executes
+// a hand-assembled program natively: exact expected register outcome.
+//
+// Links: forge/play/gba_core.sg  forge/play/gba_boot_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+// little-endian 32-bit word write (ARM is LE).
+fn wrle32(base: Int, off: Int, v: Int) -> Int ! {mem} {
+    poke8(base, off, v and 255);
+    poke8(base, off + 1, (v / 256) and 255);
+    poke8(base, off + 2, (v / 65536) and 255);
+    poke8(base, off + 3, (v / 16777216) and 255);
+    return 0;
+}
+
+fn main() -> Int ! {mem, io.write} {
+    let rom: Int = alloc_buf(65536);
+    wrle32(rom, 0, 3818913808);    // 0xE3A00010: MOV R0,#0x10
+    wrle32(rom, 4, 3800039425);    // 0xE2800001: ADD R0,R0,#1
+    wrle32(rom, 8, 3800039425);    // 0xE2800001: ADD R0,R0,#1
+    wrle32(rom, 12, 3800039425);   // 0xE2800001: ADD R0,R0,#1
+
+    let m: Int = alloc_buf(9437184);
+    core_load(m, rom, 65536);
+
+    var pass: Int = 0;
+    var tot: Int = 0;
+    tot = tot + 1; pass = chk(gba_pc(m) == 134217728, pass);   // PC = ROM base ($08000000)
+    tot = tot + 1; pass = chk(gba_r(m, 0) == 0, pass);         // R0 cleared by reset
+
+    gba_step(m); gba_step(m); gba_step(m); gba_step(m);   // MOV + 3x ADD
+
+    let r0: Int = gba_r(m, 0);
+    let pc: Int = gba_pc(m);
+    tot = tot + 1; pass = chk(r0 == 19, pass);              // 0x10 + 1 + 1 + 1 = 19
+    tot = tot + 1; pass = chk(pc == 134217744, pass);       // 4 instrs x 4 bytes = 16, +$08000000
+
+    print(1, "GBA BOOT: ARM7TDMI CPU, MOV+ADD hand-assembled program\n");
+    print(1, "  PC at ROM base ok, R0 cleared ok\n");
+    print(1, "  after 4 steps: R0="); print(1, chr(48 + r0 / 10 % 10)); print(1, chr(48 + r0 % 10));
+    print(1, " (expect 19 = 0x10+3)  PC delta from base="); print(1, chr(48 + (pc - 134217728)));
+    print(1, " (expect 16)\n  SELFTEST: "); print(1, chr(48 + pass)); print(1, "/"); print(1, chr(48 + tot));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

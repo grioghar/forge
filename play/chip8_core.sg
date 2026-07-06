@@ -1,0 +1,262 @@
+// forge/play/chip8_core.sg — shared CHIP-8 interpreter + terminal renderer + IBM ROM.
+// alloc_buf-threaded base (no mem_map/globals/fixed addrs). Linked by the thin mains:
+//   chip8_term.sg (IBM demo)  and  chip8_relic.sg (load + play a sealed RELIC-V2 ROM).
+
+//
+// A full CHIP-8 interpreter that runs a ROM and renders the 64x32 display to
+// the terminal. Unlike cores/chip8.sg (fixed low bases 0x400000 that collide
+// with macOS __PAGEZERO, and needing the Linux-only mem_map builtin), this
+// threads a single alloc_buf() base `b` through every accessor — so it runs on
+// a plain Darwin heap with no mem_map, no globals, no fixed addresses.
+//
+// State layout inside one alloc_buf(6448):
+//   b +    0 .. 4095   RAM (program loads at +512 = 0x200)
+//   b + 4096 .. 6143   display (64*32 bytes, one per pixel, 0/1)
+//   b + 6144 .. 6447   registers: V0..15 @+k*8, PC@+128, I@+136, SP@+144,
+//                      stack@+152+j*8, DT@+280, ST@+288, RNG@+296
+//
+// Build (runnable arm64 on this Mac):
+//   printf 'OUT\nforge/play/chip8_term.sg\n\nmacho\n' | cc0_mac      # -> object
+//   ld -o OUT OUT.o -e _main -lSystem -syslibroot "$(xcrun --show-sdk-path)"
+
+fn c8_ram()  -> Int { return 0; }
+fn c8_disp() -> Int { return 4096; }
+fn c8_reg()  -> Int { return 6144; }
+
+// ---- accessors (base-relative) ----
+fn mem_rd(b: Int, i: Int) -> Int ! {mem} { return peek8(b, c8_ram() + i); }
+fn mem_wr(b: Int, i: Int, v: Int) -> Int ! {mem} { poke8(b, c8_ram() + i, v); return 0; }
+fn px_rd(b: Int, i: Int) -> Int ! {mem} { return peek8(b, c8_disp() + i); }
+fn px_wr(b: Int, i: Int, v: Int) -> Int ! {mem} { poke8(b, c8_disp() + i, v); return 0; }
+fn v_rd(b: Int, i: Int) -> Int ! {mem} { return peek64(b, c8_reg() + i * 8); }
+fn v_wr(b: Int, i: Int, v: Int) -> Int ! {mem} { poke64(b, c8_reg() + i * 8, v); return 0; }
+fn pc_rd(b: Int) -> Int ! {mem} { return peek64(b, c8_reg() + 128); }
+fn pc_wr(b: Int, v: Int) -> Int ! {mem} { poke64(b, c8_reg() + 128, v); return 0; }
+fn i_rd(b: Int) -> Int ! {mem} { return peek64(b, c8_reg() + 136); }
+fn i_wr(b: Int, v: Int) -> Int ! {mem} { poke64(b, c8_reg() + 136, v); return 0; }
+fn sp_rd(b: Int) -> Int ! {mem} { return peek64(b, c8_reg() + 144); }
+fn sp_wr(b: Int, v: Int) -> Int ! {mem} { poke64(b, c8_reg() + 144, v); return 0; }
+fn stk_rd(b: Int, j: Int) -> Int ! {mem} { return peek64(b, c8_reg() + 152 + j * 8); }
+fn stk_wr(b: Int, j: Int, v: Int) -> Int ! {mem} { poke64(b, c8_reg() + 152 + j * 8, v); return 0; }
+fn dt_rd(b: Int) -> Int ! {mem} { return peek64(b, c8_reg() + 280); }
+fn dt_wr(b: Int, v: Int) -> Int ! {mem} { poke64(b, c8_reg() + 280, v); return 0; }
+fn st_rd(b: Int) -> Int ! {mem} { return peek64(b, c8_reg() + 288); }
+fn st_wr(b: Int, v: Int) -> Int ! {mem} { poke64(b, c8_reg() + 288, v); return 0; }
+
+// Bitwise via arithmetic (kind: 0 AND, 1 OR, 2 XOR).
+fn b_op(a: Int, c: Int, kind: Int) -> Int {
+    var r: Int = 0;
+    var p: Int = 1;
+    var i: Int = 0;
+    while i < 8 invariant i >= 0 {
+        let ba: Int = (a / p) % 2;
+        let bb: Int = (c / p) % 2;
+        var bit: Int = 0;
+        if kind == 0 { if ba == 1 { if bb == 1 { bit = 1; } } }
+        if kind == 1 { if ba + bb > 0 { bit = 1; } }
+        if kind == 2 { bit = (ba + bb) % 2; }
+        r = r + bit * p;
+        p = p * 2;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn clear_disp(b: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 2048 invariant i >= 0 { px_wr(b, i, 0); i = i + 1; }
+    return 0;
+}
+
+fn chip8_init(b: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 4096 invariant i >= 0 { mem_wr(b, i, 0); i = i + 1; }
+    clear_disp(b);
+    var k: Int = 0;
+    while k < 16 invariant k >= 0 { v_wr(b, k, 0); stk_wr(b, k, 0); k = k + 1; }
+    pc_wr(b, 512);
+    i_wr(b, 0); sp_wr(b, 0); dt_wr(b, 0); st_wr(b, 0);
+    poke64(b, c8_reg() + 296, 305419896);
+    kp_clear(b);
+    return 0;
+}
+
+fn chip8_load(b: Int, src: Int, len: Int) -> Int ! {mem} {
+    var n: Int = len; if n > 3584 { n = 3584; }
+    var i: Int = 0;
+    while i < n invariant i >= 0 { mem_wr(b, 512 + i, peek8(src, i)); i = i + 1; }
+    return 0;
+}
+
+fn draw_row(b: Int, sb: Int, sx: Int, sy: Int, r: Int) -> Int ! {mem} {
+    var c: Int = 0;
+    var mask: Int = 128;
+    while c < 8 invariant c >= 0 {
+        if (sb / mask) % 2 == 1 {
+            let idx: Int = ((sy + r) % 32) * 64 + (sx + c) % 64;
+            let pv: Int = px_rd(b, idx);
+            if pv == 1 { px_wr(b, idx, 0); v_wr(b, 15, 1); }
+            if pv != 1 { px_wr(b, idx, 1); }
+        }
+        mask = mask / 2;
+        c = c + 1;
+    }
+    return 0;
+}
+
+fn draw(b: Int, xr: Int, yr: Int, n: Int) -> Int ! {mem} {
+    let sx: Int = v_rd(b, xr);
+    let sy: Int = v_rd(b, yr);
+    v_wr(b, 15, 0);
+    var r: Int = 0;
+    while r < n invariant r >= 0 {
+        let sb: Int = mem_rd(b, (i_rd(b) + r) % 4096);
+        draw_row(b, sb, sx, sy, r);
+        r = r + 1;
+    }
+    return 0;
+}
+
+fn alu(b: Int, xr: Int, yr: Int, n: Int) -> Int ! {mem} {
+    let vx: Int = v_rd(b, xr);
+    let vy: Int = v_rd(b, yr);
+    if n == 0 { v_wr(b, xr, vy); }
+    if n == 1 { v_wr(b, xr, b_op(vx, vy, 1)); }
+    if n == 2 { v_wr(b, xr, b_op(vx, vy, 0)); }
+    if n == 3 { v_wr(b, xr, b_op(vx, vy, 2)); }
+    if n == 4 { let s: Int = vx + vy; v_wr(b, 15, s / 256); v_wr(b, xr, s % 256); }
+    if n == 5 {
+        if vx >= vy { v_wr(b, 15, 1); }
+        if vx < vy { v_wr(b, 15, 0); }
+        v_wr(b, xr, (vx - vy + 256) % 256);
+    }
+    if n == 6 { v_wr(b, 15, vx % 2); v_wr(b, xr, vx / 2); }
+    if n == 7 {
+        if vy >= vx { v_wr(b, 15, 1); }
+        if vy < vx { v_wr(b, 15, 0); }
+        v_wr(b, xr, (vy - vx + 256) % 256);
+    }
+    if n == 14 { v_wr(b, 15, vx / 128); v_wr(b, xr, (vx * 2) % 256); }
+    return 0;
+}
+
+fn fop(b: Int, xr: Int, nn: Int) -> Int ! {mem} {
+    let vx: Int = v_rd(b, xr);
+    if nn == 7 { v_wr(b, xr, dt_rd(b)); }
+    if nn == 21 { dt_wr(b, vx); }
+    if nn == 24 { st_wr(b, vx); }
+    if nn == 30 { i_wr(b, i_rd(b) + vx); }
+    if nn == 41 { i_wr(b, 80 + vx * 5); }
+    if nn == 51 {
+        mem_wr(b, i_rd(b) % 4096, vx / 100);
+        mem_wr(b, (i_rd(b) + 1) % 4096, (vx / 10) % 10);
+        mem_wr(b, (i_rd(b) + 2) % 4096, vx % 10);
+    }
+    if nn == 85 { var i: Int = 0; while i <= xr invariant i >= 0 { mem_wr(b, (i_rd(b) + i) % 4096, v_rd(b, i)); i = i + 1; } }
+    if nn == 101 { var j: Int = 0; while j <= xr invariant j >= 0 { v_wr(b, j, mem_rd(b, (i_rd(b) + j) % 4096)); j = j + 1; } }
+    return 0;
+}
+
+fn chip8_cycle(b: Int) -> Int ! {mem} {
+    let pc: Int = pc_rd(b);
+    let op: Int = mem_rd(b, pc) * 256 + mem_rd(b, pc + 1);
+    pc_wr(b, pc + 2);
+    let o: Int = op / 4096;
+    let x: Int = (op / 256) % 16;
+    let y: Int = (op / 16) % 16;
+    let n: Int = op % 16;
+    let nn: Int = op % 256;
+    let nnn: Int = op % 4096;
+    if op == 224 { clear_disp(b); }
+    if op == 238 { if sp_rd(b) > 0 { sp_wr(b, sp_rd(b) - 1); pc_wr(b, stk_rd(b, sp_rd(b))); } }
+    if o == 1 { pc_wr(b, nnn); }
+    if o == 2 { if sp_rd(b) < 16 { stk_wr(b, sp_rd(b), pc_rd(b)); sp_wr(b, sp_rd(b) + 1); pc_wr(b, nnn); } }
+    if o == 3 { if v_rd(b, x) == nn { pc_wr(b, pc_rd(b) + 2); } }
+    if o == 4 { if v_rd(b, x) != nn { pc_wr(b, pc_rd(b) + 2); } }
+    if o == 5 { if v_rd(b, x) == v_rd(b, y) { pc_wr(b, pc_rd(b) + 2); } }
+    if o == 6 { v_wr(b, x, nn); }
+    if o == 7 { v_wr(b, x, (v_rd(b, x) + nn) % 256); }
+    if o == 8 { alu(b, x, y, n); }
+    if o == 9 { if v_rd(b, x) != v_rd(b, y) { pc_wr(b, pc_rd(b) + 2); } }
+    if o == 10 { i_wr(b, nnn); }
+    if o == 11 { pc_wr(b, nnn + v_rd(b, 0)); }
+    if o == 12 { v_wr(b, x, nn); }
+    if o == 13 { draw(b, x, y, n); }
+    if o == 14 {
+        if nn == 158 { if kp_rd(b, v_rd(b, x)) == 1 { pc_wr(b, pc_rd(b) + 2); } }   // Ex9E skip if key VX down
+        if nn == 161 { if kp_rd(b, v_rd(b, x)) == 0 { pc_wr(b, pc_rd(b) + 2); } }   // ExA1 skip if key VX up
+    }
+    if o == 15 {
+        if nn == 10 {   // Fx0A: wait for a keypress (blocks by not advancing PC until one is down)
+            var found: Int = 0 - 1;
+            var k: Int = 0;
+            while k < 16 invariant k >= 0 { if kp_rd(b, k) == 1 { if found < 0 { found = k; } } k = k + 1; }
+            if found >= 0 { v_wr(b, x, found); }
+            if found < 0 { pc_wr(b, pc_rd(b) - 2); }
+        }
+        if nn != 10 { fop(b, x, nn); }
+    }
+    return 0;
+}
+
+// ---- keypad (16 keys, one CHIP-8 core-state extension byte each) ----
+// Lives just past the 6448-byte save-state block; callers must alloc_buf(6464).
+fn kp_off() -> Int { return 6448; }
+fn kp_rd(b: Int, k: Int) -> Int ! {mem} { return peek8(b, kp_off() + k); }
+fn kp_wr(b: Int, k: Int, v: Int) -> Int ! {mem} { poke8(b, kp_off() + k, v); return 0; }
+fn kp_clear(b: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 16 invariant i >= 0 { kp_wr(b, i, 0); i = i + 1; }
+    return 0;
+}
+
+fn chip8_run(b: Int, cycles: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < cycles invariant i >= 0 { chip8_cycle(b); i = i + 1; }
+    return 0;
+}
+
+// ---- terminal renderer: 64x32 display, on-pixel = "##" block, off = "  " ----
+fn render_term(b: Int) -> Int ! {mem, io.write} {
+    print(1, chr(10));
+    var y: Int = 0;
+    while y < 32 invariant y >= 0 {
+        var x: Int = 0;
+        while x < 64 invariant x >= 0 {
+            if px_rd(b, y * 64 + x) == 1 { print(1, chr(226)); print(1, chr(150)); print(1, chr(136)); print(1, chr(226)); print(1, chr(150)); print(1, chr(136)); }
+            if px_rd(b, y * 64 + x) != 1 { print(1, "  "); }
+            x = x + 1;
+        }
+        print(1, chr(10));
+        y = y + 1;
+    }
+    return 0;
+}
+
+// Embedded IBM-logo ROM (132 bytes) — a real CHIP-8 program (clear + draw + jump).
+fn load_ibm(src: Int) -> Int ! {mem} {
+    poke8(src,0,0);poke8(src,1,224);poke8(src,2,162);poke8(src,3,42);poke8(src,4,96);poke8(src,5,12);
+    poke8(src,6,97);poke8(src,7,8);poke8(src,8,208);poke8(src,9,31);poke8(src,10,112);poke8(src,11,9);
+    poke8(src,12,162);poke8(src,13,57);poke8(src,14,208);poke8(src,15,31);poke8(src,16,162);poke8(src,17,72);
+    poke8(src,18,112);poke8(src,19,8);poke8(src,20,208);poke8(src,21,31);poke8(src,22,112);poke8(src,23,4);
+    poke8(src,24,162);poke8(src,25,87);poke8(src,26,208);poke8(src,27,31);poke8(src,28,112);poke8(src,29,8);
+    poke8(src,30,162);poke8(src,31,102);poke8(src,32,208);poke8(src,33,31);poke8(src,34,112);poke8(src,35,8);
+    poke8(src,36,162);poke8(src,37,117);poke8(src,38,208);poke8(src,39,31);poke8(src,40,18);poke8(src,41,40);
+    poke8(src,42,255);poke8(src,43,0);poke8(src,44,255);poke8(src,45,0);poke8(src,46,60);poke8(src,47,0);
+    poke8(src,48,60);poke8(src,49,0);poke8(src,50,60);poke8(src,51,0);poke8(src,52,60);poke8(src,53,0);
+    poke8(src,54,255);poke8(src,55,0);poke8(src,56,255);poke8(src,57,255);poke8(src,58,0);poke8(src,59,255);
+    poke8(src,60,0);poke8(src,61,56);poke8(src,62,0);poke8(src,63,63);poke8(src,64,0);poke8(src,65,63);
+    poke8(src,66,0);poke8(src,67,56);poke8(src,68,0);poke8(src,69,255);poke8(src,70,0);poke8(src,71,255);
+    poke8(src,72,128);poke8(src,73,0);poke8(src,74,224);poke8(src,75,0);poke8(src,76,224);poke8(src,77,0);
+    poke8(src,78,128);poke8(src,79,0);poke8(src,80,128);poke8(src,81,0);poke8(src,82,224);poke8(src,83,0);
+    poke8(src,84,224);poke8(src,85,0);poke8(src,86,128);poke8(src,87,248);poke8(src,88,0);poke8(src,89,252);
+    poke8(src,90,0);poke8(src,91,62);poke8(src,92,0);poke8(src,93,63);poke8(src,94,0);poke8(src,95,59);
+    poke8(src,96,0);poke8(src,97,57);poke8(src,98,0);poke8(src,99,248);poke8(src,100,0);poke8(src,101,248);
+    poke8(src,102,3);poke8(src,103,0);poke8(src,104,7);poke8(src,105,0);poke8(src,106,15);poke8(src,107,0);
+    poke8(src,108,191);poke8(src,109,0);poke8(src,110,251);poke8(src,111,0);poke8(src,112,243);poke8(src,113,0);
+    poke8(src,114,227);poke8(src,115,0);poke8(src,116,67);poke8(src,117,224);poke8(src,118,0);poke8(src,119,224);
+    poke8(src,120,0);poke8(src,121,128);poke8(src,122,0);poke8(src,123,128);poke8(src,124,0);poke8(src,125,128);
+    poke8(src,126,0);poke8(src,127,128);poke8(src,128,0);poke8(src,129,224);poke8(src,130,0);poke8(src,131,224);
+    return 132;
+}
+

@@ -1,0 +1,580 @@
+// cores/spc700.sg — Sony SPC700 (the SNES APU CPU), Sigil Int-subset.
+// The SPC700 is an 8-bit CPU with a 64KB address space that drives the S-DSP for
+// SNES audio. This is the CPU foundation (registers + a first opcode batch + flags);
+// the S-DSP (voices/BRR/echo) and the $2140-$2143 <-> $00F4-$00F7 port handshake with
+// the main 65816 come next, then it wires into cores/snes.sg's APU stub.
+// Prefix sp_ (avoids asm register-name collisions, sigil#12). Decimal literals only.
+//
+// Registers: A (acc), X, Y (index), SP (stack page $01xx), PSW (flags), PC (16-bit).
+// PSW bits: N=128 V=64 P=32 (direct-page select) B=16 H=8 I=4 Z=2 C=1.
+
+fn sp_ram(m: Int) -> Int { return m + 1638400; }        // SPC zone+0: 64KB APU RAM
+fn sp_st(m: Int) -> Int { return m + 1900544; }        // SPC zone+262144: register file
+fn sp_dsp(m: Int) -> Int { return m + 1966080; }       // SPC zone+327680: S-DSP register file (128B)
+fn sp_pcm(m: Int) -> Int { return m + 2031616; }       // SPC zone+393216: decoded PCM scratch (s16)
+
+fn sp_a(m: Int) -> Int ! {mem} { return peek8(sp_st(m), 0); }
+fn sp_x(m: Int) -> Int ! {mem} { return peek8(sp_st(m), 1); }
+fn sp_y(m: Int) -> Int ! {mem} { return peek8(sp_st(m), 2); }
+fn sp_sp(m: Int) -> Int ! {mem} { return peek8(sp_st(m), 3); }
+fn sp_psw(m: Int) -> Int ! {mem} { return peek8(sp_st(m), 4); }
+fn sp_pc(m: Int) -> Int ! {mem} { return peek32(sp_st(m), 8); }
+fn sp_set_a(m: Int, v: Int) -> Int ! {mem} { poke8(sp_st(m), 0, v and 255); return 0; }
+fn sp_set_x(m: Int, v: Int) -> Int ! {mem} { poke8(sp_st(m), 1, v and 255); return 0; }
+fn sp_set_y(m: Int, v: Int) -> Int ! {mem} { poke8(sp_st(m), 2, v and 255); return 0; }
+fn sp_set_sp(m: Int, v: Int) -> Int ! {mem} { poke8(sp_st(m), 3, v and 255); return 0; }
+fn sp_set_psw(m: Int, v: Int) -> Int ! {mem} { poke8(sp_st(m), 4, v and 255); return 0; }
+fn sp_set_pc(m: Int, v: Int) -> Int ! {mem} { poke32(sp_st(m), 8, v and 65535); return 0; }
+
+// --- hardware registers $00F0-$00FF -------------------------------------------------
+// IO state in sp_st(m): in-latches $F4-7 (main->SPC) @16-19; out-latches (SPC->main)
+// @20-23; $F1 control @24; $F2 DSP addr @25; timer targets $FA-FC @26-28; timer
+// counters $FD-FF (4-bit, read-clears) @29-31. DSP regs live in sp_dsp(m).
+fn sp_io_rd(m: Int, reg: Int) -> Int ! {mem} {                          // reg = 0..15 ($F0..$FF)
+    if reg >= 4 { if reg <= 7 { return peek8(sp_st(m), 16 + (reg - 4)); } }       // F4-7 input latch
+    if (reg == 1) { return peek8(sp_st(m), 24); }                                 // F1 control
+    if (reg == 2) { return peek8(sp_st(m), 25); }                                 // F2 DSP addr
+    if (reg == 3) { return peek8(sp_dsp(m), peek8(sp_st(m), 25) and 127); }        // F3 DSP data
+    if reg >= 13 { if reg <= 15 {                                                 // FD-FF timer ctr (read-clears)
+        let v: Int = peek8(sp_st(m), 29 + (reg - 13)) and 15;
+        poke8(sp_st(m), 29 + (reg - 13), 0);
+        return v;
+    } }
+    return 0;
+}
+fn sp_io_wr(m: Int, reg: Int, v: Int) -> Int ! {mem} {
+    if reg >= 4 { if reg <= 7 { poke8(sp_st(m), 20 + (reg - 4), v and 255); return 0; } }   // F4-7 out latch
+    if (reg == 1) {                                                              // F1 control + port clears
+        poke8(sp_st(m), 24, v and 255);
+        if ((v and 16) != 0) { poke8(sp_st(m), 16, 0); poke8(sp_st(m), 17, 0); }   // clear in-ports 0,1
+        if ((v and 32) != 0) { poke8(sp_st(m), 18, 0); poke8(sp_st(m), 19, 0); }   // clear in-ports 2,3
+        return 0;
+    }
+    if (reg == 2) { poke8(sp_st(m), 25, v and 255); return 0; }                   // F2 DSP addr
+    if (reg == 3) { poke8(sp_dsp(m), peek8(sp_st(m), 25) and 127, v and 255); return 0; }   // F3 DSP data
+    if reg >= 10 { if reg <= 12 { poke8(sp_st(m), 26 + (reg - 10), v and 255); return 0; } }   // FA-FC targets
+    return 0;
+}
+// Host (main 65816) seams: main writes a port the SPC reads at $F4+n; main reads a
+// port the SPC wrote at $F4+n. These are the $2140-3 <-> $00F4-7 mailbox endpoints.
+fn sp_port_in(m: Int, n: Int, v: Int) -> Int ! {mem} { poke8(sp_st(m), 16 + (n and 3), v and 255); return 0; }
+fn sp_port_out(m: Int, n: Int) -> Int ! {mem} { return peek8(sp_st(m), 20 + (n and 3)); }
+
+// --- memory bus ($00F0-$00FF hit the hardware registers; flat RAM otherwise) ---
+fn sp_rd(m: Int, a: Int) -> Int ! {mem} {
+    let x: Int = a and 65535;
+    if x >= 240 { if x <= 255 { return sp_io_rd(m, x - 240); } }
+    return peek8(sp_ram(m), x);
+}
+fn sp_wr(m: Int, a: Int, v: Int) -> Int ! {mem} {
+    let x: Int = a and 65535;
+    if x >= 240 { if x <= 255 { return sp_io_wr(m, x - 240, v and 255); } }
+    poke8(sp_ram(m), x, v and 255);
+    return 0;
+}
+fn sp_fetch(m: Int) -> Int ! {mem} { let v: Int = sp_rd(m, sp_pc(m)); sp_set_pc(m, (sp_pc(m) + 1) and 65535); return v; }
+
+fn sp_xor(a: Int, b: Int) -> Int { return (a or b) - (a and b); }
+fn sp_dp(m: Int, off: Int) -> Int ! {mem} { return ((sp_psw(m) / 32) and 1) * 256 + (off and 255); }   // P-flag page
+fn sp_abs(m: Int) -> Int ! {mem} { let lo: Int = sp_fetch(m); let hi: Int = sp_fetch(m); return hi * 256 + lo; }
+fn sp_rel(off: Int) -> Int { if off >= 128 { return off - 256; } return off; }         // signed branch disp
+
+// --- flags ---
+fn sp_flag(m: Int, mask: Int, on: Int) -> Int ! {mem} {
+    var p: Int = sp_psw(m);
+    if on != 0 { p = p or mask; }
+    if on == 0 { p = p and (255 - mask); }
+    sp_set_psw(m, p);
+    return 0;
+}
+fn sp_setnz(m: Int, v: Int) -> Int ! {mem} {
+    if (v and 128) != 0 { sp_flag(m, 128, 1); }
+    if (v and 128) == 0 { sp_flag(m, 128, 0); }
+    if (v and 255) == 0 { sp_flag(m, 2, 1); }
+    if (v and 255) != 0 { sp_flag(m, 2, 0); }
+    return 0;
+}
+
+// --- ALU ---
+fn sp_adc(m: Int, b: Int) -> Int ! {mem} {
+    let a: Int = sp_a(m); let c: Int = sp_psw(m) and 1; let r: Int = a + b + c;
+    if r > 255 { sp_flag(m, 1, 1); }
+    if r <= 255 { sp_flag(m, 1, 0); }
+    if ((a and 15) + (b and 15) + c) > 15 { sp_flag(m, 8, 1); }
+    if ((a and 15) + (b and 15) + c) <= 15 { sp_flag(m, 8, 0); }
+    var ov: Int = 0;
+    if (sp_xor(a, b) and 128) == 0 { if (sp_xor(a, r) and 128) != 0 { ov = 1; } }
+    sp_flag(m, 64, ov);
+    sp_set_a(m, r and 255); sp_setnz(m, r);
+    return 0;
+}
+fn sp_sbc(m: Int, b: Int) -> Int ! {mem} {
+    let a: Int = sp_a(m); let c: Int = sp_psw(m) and 1; let r: Int = a - b - (1 - c);
+    if r >= 0 { sp_flag(m, 1, 1); }
+    if r < 0 { sp_flag(m, 1, 0); }
+    if ((a and 15) - (b and 15) - (1 - c)) >= 0 { sp_flag(m, 8, 1); }
+    if ((a and 15) - (b and 15) - (1 - c)) < 0 { sp_flag(m, 8, 0); }
+    var ov: Int = 0;
+    if (sp_xor(a, b) and 128) != 0 { if (sp_xor(a, r) and 128) != 0 { ov = 1; } }
+    sp_flag(m, 64, ov);
+    sp_set_a(m, r and 255); sp_setnz(m, r);
+    return 0;
+}
+fn sp_cmp(m: Int, x: Int, b: Int) -> Int ! {mem} {                      // sets N,Z,C only
+    if x >= b { sp_flag(m, 1, 1); }
+    if x < b { sp_flag(m, 1, 0); }
+    sp_setnz(m, x - b);
+    return 0;
+}
+fn sp_and(m: Int, b: Int) -> Int ! {mem} { let r: Int = sp_a(m) and b; sp_set_a(m, r); sp_setnz(m, r); return 0; }
+fn sp_or(m: Int, b: Int) -> Int ! {mem} { let r: Int = sp_a(m) or b; sp_set_a(m, r); sp_setnz(m, r); return 0; }
+fn sp_eor(m: Int, b: Int) -> Int ! {mem} { let r: Int = sp_xor(sp_a(m), b); sp_set_a(m, r); sp_setnz(m, r); return 0; }
+
+// --- stack (page $01xx) + branches ---
+fn sp_push(m: Int, v: Int) -> Int ! {mem} { sp_wr(m, 256 + sp_sp(m), v); sp_set_sp(m, (sp_sp(m) - 1) and 255); return 0; }
+fn sp_pull(m: Int) -> Int ! {mem} { sp_set_sp(m, (sp_sp(m) + 1) and 255); return sp_rd(m, 256 + sp_sp(m)); }
+fn sp_br(m: Int, cond: Int) -> Int ! {mem} {
+    let off: Int = sp_fetch(m);
+    if cond != 0 { sp_set_pc(m, (sp_pc(m) + sp_rel(off)) and 65535); }
+    return 2;
+}
+
+// --- shifts/rotates on A (C = bit shifted out) ---
+fn sp_rmw_a(m: Int, r: Int, carryout: Int) -> Int ! {mem} {
+    if carryout != 0 { sp_flag(m, 1, 1); }
+    if carryout == 0 { sp_flag(m, 1, 0); }
+    sp_set_a(m, r and 255); sp_setnz(m, r and 255);
+    return 2;
+}
+fn sp_asl_a(m: Int) -> Int ! {mem} { let a: Int = sp_a(m); return sp_rmw_a(m, a * 2, a and 128); }
+fn sp_lsr_a(m: Int) -> Int ! {mem} { let a: Int = sp_a(m); return sp_rmw_a(m, a / 2, a and 1); }
+fn sp_rol_a(m: Int) -> Int ! {mem} { let a: Int = sp_a(m); return sp_rmw_a(m, a * 2 + (sp_psw(m) and 1), a and 128); }
+fn sp_ror_a(m: Int) -> Int ! {mem} { let a: Int = sp_a(m); return sp_rmw_a(m, a / 2 + (sp_psw(m) and 1) * 128, a and 1); }
+
+// --- 16-bit word ops on YA / direct page (Y:A, dp:dp+1, little-endian) ---
+fn sp_setnz16(m: Int, w: Int) -> Int ! {mem} {
+    if (w and 32768) != 0 { sp_flag(m, 128, 1); }
+    if (w and 32768) == 0 { sp_flag(m, 128, 0); }
+    if (w and 65535) == 0 { sp_flag(m, 2, 1); }
+    if (w and 65535) != 0 { sp_flag(m, 2, 0); }
+    return 0;
+}
+fn sp_movw_ld(m: Int) -> Int ! {mem} {                                  // BA MOVW YA,dp
+    let d: Int = sp_dp(m, sp_fetch(m)); let w: Int = sp_rd(m, d) + sp_rd(m, (d + 1) and 65535) * 256;
+    sp_set_a(m, w and 255); sp_set_y(m, (w / 256) and 255); sp_setnz16(m, w);
+    return 5;
+}
+fn sp_movw_st(m: Int) -> Int ! {mem} {                                  // DA MOVW dp,YA
+    let d: Int = sp_dp(m, sp_fetch(m)); sp_wr(m, d, sp_a(m)); sp_wr(m, (d + 1) and 65535, sp_y(m));
+    return 5;
+}
+fn sp_incw(m: Int, delta: Int) -> Int ! {mem} {                         // 3A INCW / 1A DECW
+    let d: Int = sp_dp(m, sp_fetch(m));
+    let w: Int = (sp_rd(m, d) + sp_rd(m, (d + 1) and 65535) * 256 + delta) and 65535;
+    sp_wr(m, d, w and 255); sp_wr(m, (d + 1) and 65535, (w / 256) and 255); sp_setnz16(m, w);
+    return 6;
+}
+fn sp_dbnz_dp(m: Int) -> Int ! {mem} {                                  // 6E DBNZ dp,rel
+    let d: Int = sp_dp(m, sp_fetch(m)); sp_wr(m, d, (sp_rd(m, d) - 1) and 255);
+    return sp_br(m, sp_rd(m, d) != 0);
+}
+
+// --- indexed / indirect address helpers + 16-bit multiply/divide ---
+fn sp_dpx(m: Int) -> Int ! {mem} { return sp_dp(m, (sp_fetch(m) + sp_x(m)) and 255); }      // dp+X (wraps in page)
+fn sp_absx(m: Int) -> Int ! {mem} { return (sp_abs(m) + sp_x(m)) and 65535; }            // !abs+X
+fn sp_absy(m: Int) -> Int ! {mem} { return (sp_abs(m) + sp_y(m)) and 65535; }            // !abs+Y
+fn sp_iiy(m: Int) -> Int ! {mem} { let p: Int = sp_dp(m, sp_fetch(m)); return (sp_rd(m, p) + sp_rd(m, (p + 1) and 65535) * 256 + sp_y(m)) and 65535; }   // [dp]+Y
+fn sp_iix(m: Int) -> Int ! {mem} { let p: Int = sp_dp(m, (sp_fetch(m) + sp_x(m)) and 255); return (sp_rd(m, p) + sp_rd(m, (p + 1) and 65535) * 256) and 65535; }  // [dp+X]
+fn sp_mul(m: Int) -> Int ! {mem} { let r: Int = sp_y(m) * sp_a(m); sp_set_a(m, r and 255); sp_set_y(m, (r / 256) and 255); sp_setnz(m, sp_y(m)); return 9; }   // CF MUL YA
+fn sp_div(m: Int) -> Int ! {mem} {                                      // 9E DIV YA,X
+    let ya: Int = sp_y(m) * 256 + sp_a(m); let x: Int = sp_x(m);
+    if x == 0 { sp_set_a(m, 255); }
+    if x != 0 { sp_set_a(m, (ya / x) and 255); sp_set_y(m, (ya % x) and 255); }
+    sp_setnz(m, sp_a(m));
+    return 12;
+}
+
+// Extended opcode dispatch (third batch; reached when sp_ext falls through).
+fn sp_ext2(m: Int, op: Int) -> Int ! {mem} {
+    // indexed / indirect MOV
+    if op == 244 { sp_set_a(m, sp_rd(m, sp_dpx(m))); sp_setnz(m, sp_a(m)); return 4; }    // F4 MOV A,dp+X
+    if op == 212 { sp_wr(m, sp_dpx(m), sp_a(m)); return 5; }                        // D4 MOV dp+X,A
+    if op == 245 { sp_set_a(m, sp_rd(m, sp_absx(m))); sp_setnz(m, sp_a(m)); return 5; }   // F5 MOV A,!abs+X
+    if op == 246 { sp_set_a(m, sp_rd(m, sp_absy(m))); sp_setnz(m, sp_a(m)); return 5; }   // F6 MOV A,!abs+Y
+    if op == 213 { sp_wr(m, sp_absx(m), sp_a(m)); return 6; }                       // D5 MOV !abs+X,A
+    if op == 214 { sp_wr(m, sp_absy(m), sp_a(m)); return 6; }                       // D6 MOV !abs+Y,A
+    if op == 247 { sp_set_a(m, sp_rd(m, sp_iiy(m))); sp_setnz(m, sp_a(m)); return 6; }    // F7 MOV A,[dp]+Y
+    if op == 231 { sp_set_a(m, sp_rd(m, sp_iix(m))); sp_setnz(m, sp_a(m)); return 6; }    // E7 MOV A,[dp+X]
+    // multiply / divide
+    if op == 207 { return sp_mul(m); }                                          // CF MUL YA
+    if op == 158 { return sp_div(m); }                                          // 9E DIV YA,X
+    // ALU A,dp+X
+    if op == 148 { sp_adc(m, sp_rd(m, sp_dpx(m))); return 4; }                        // 94 ADC A,dp+X
+    if op == 180 { sp_sbc(m, sp_rd(m, sp_dpx(m))); return 4; }                        // B4 SBC A,dp+X
+    if op == 116 { sp_cmp(m, sp_a(m), sp_rd(m, sp_dpx(m))); return 4; }                // 74 CMP A,dp+X
+    if op == 52  { sp_and(m, sp_rd(m, sp_dpx(m))); return 4; }                        // 34 AND A,dp+X
+    if op == 20  { sp_or(m, sp_rd(m, sp_dpx(m))); return 4; }                         // 14 OR  A,dp+X
+    if op == 84  { sp_eor(m, sp_rd(m, sp_dpx(m))); return 4; }                        // 54 EOR A,dp+X
+    return 2;                                                                  // truly unimplemented -> NOP
+}
+
+// Extended opcode dispatch (second batch; reached when sp_step falls through).
+fn sp_ext(m: Int, op: Int) -> Int ! {mem} {
+    // shifts / rotates
+    if op == 28  { return sp_asl_a(m); }                                  // 1C ASL A
+    if op == 92  { return sp_lsr_a(m); }                                  // 5C LSR A
+    if op == 60  { return sp_rol_a(m); }                                  // 3C ROL A
+    if op == 124 { return sp_ror_a(m); }                                  // 7C ROR A
+    // 16-bit word
+    if op == 186 { return sp_movw_ld(m); }                               // BA MOVW YA,dp
+    if op == 218 { return sp_movw_st(m); }                               // DA MOVW dp,YA
+    if op == 58  { return sp_incw(m, 1); }                                  // 3A INCW dp
+    if op == 26  { return sp_incw(m, 0 - 1); }                             // 1A DECW dp
+    // carry / status flags
+    if op == 96  { sp_flag(m, 1, 0); return 2; }                           // 60 CLRC
+    if op == 128 { sp_flag(m, 1, 1); return 2; }                           // 80 SETC
+    if op == 237 { sp_flag(m, 1, (sp_psw(m) and 1) == 0); return 3; }       // ED NOTC
+    if op == 224 { sp_flag(m, 64, 0); sp_flag(m, 8, 0); return 2; }           // E0 CLRV (V+H)
+    if op == 32  { sp_flag(m, 32, 0); return 2; }                          // 20 CLRP
+    if op == 64  { sp_flag(m, 32, 1); return 2; }                          // 40 SETP
+    // push / pop (page $01xx)
+    if op == 45  { sp_push(m, sp_a(m)); return 4; }                         // 2D PUSH A
+    if op == 77  { sp_push(m, sp_x(m)); return 4; }                         // 4D PUSH X
+    if op == 109 { sp_push(m, sp_y(m)); return 4; }                         // 6D PUSH Y
+    if op == 13  { sp_push(m, sp_psw(m)); return 4; }                       // 0D PUSH PSW
+    if op == 174 { sp_set_a(m, sp_pull(m)); return 4; }                     // AE POP A
+    if op == 206 { sp_set_x(m, sp_pull(m)); return 4; }                     // CE POP X
+    if op == 238 { sp_set_y(m, sp_pull(m)); return 4; }                     // EE POP Y
+    if op == 142 { sp_set_psw(m, sp_pull(m)); return 4; }                   // 8E POP PSW
+    // (X) indirect
+    if op == 230 { sp_set_a(m, sp_rd(m, sp_dp(m, sp_x(m)))); sp_setnz(m, sp_a(m)); return 3; }              // E6 MOV A,(X)
+    if op == 198 { sp_wr(m, sp_dp(m, sp_x(m)), sp_a(m)); return 4; }                                  // C6 MOV (X),A
+    if op == 191 { sp_set_a(m, sp_rd(m, sp_dp(m, sp_x(m)))); sp_set_x(m, (sp_x(m) + 1) and 255); sp_setnz(m, sp_a(m)); return 4; }  // BF MOV A,(X)+
+    // ALU A,dp
+    if op == 132 { sp_adc(m, sp_rd(m, sp_dp(m, sp_fetch(m)))); return 3; }        // 84 ADC A,dp
+    if op == 164 { sp_sbc(m, sp_rd(m, sp_dp(m, sp_fetch(m)))); return 3; }        // A4 SBC A,dp
+    if op == 100 { sp_cmp(m, sp_a(m), sp_rd(m, sp_dp(m, sp_fetch(m)))); return 3; }// 64 CMP A,dp
+    if op == 36  { sp_and(m, sp_rd(m, sp_dp(m, sp_fetch(m)))); return 3; }        // 24 AND A,dp
+    if op == 4   { sp_or(m, sp_rd(m, sp_dp(m, sp_fetch(m)))); return 3; }         // 04 OR  A,dp
+    if op == 68  { sp_eor(m, sp_rd(m, sp_dp(m, sp_fetch(m)))); return 3; }        // 44 EOR A,dp
+    // ALU A,!abs
+    if op == 133 { sp_adc(m, sp_rd(m, sp_abs(m))); return 4; }                 // 85 ADC A,!abs
+    if op == 165 { sp_sbc(m, sp_rd(m, sp_abs(m))); return 4; }                 // A5 SBC A,!abs
+    if op == 101 { sp_cmp(m, sp_a(m), sp_rd(m, sp_abs(m))); return 4; }         // 65 CMP A,!abs
+    if op == 37  { sp_and(m, sp_rd(m, sp_abs(m))); return 4; }                 // 25 AND A,!abs
+    if op == 5   { sp_or(m, sp_rd(m, sp_abs(m))); return 4; }                  // 05 OR  A,!abs
+    if op == 69  { sp_eor(m, sp_rd(m, sp_abs(m))); return 4; }                 // 45 EOR A,!abs
+    // decrement-and-branch
+    if op == 254 { sp_set_y(m, (sp_y(m) - 1) and 255); return sp_br(m, sp_y(m) != 0); }   // FE DBNZ Y,rel
+    if op == 110 { return sp_dbnz_dp(m); }                              // 6E DBNZ dp,rel
+    return sp_ext2(m, op);                                                 // third opcode batch
+}
+
+fn sp_step(m: Int) -> Int ! {mem} {
+    let op: Int = sp_fetch(m);
+    if op == 0 { return 2; }                                              // NOP
+    // immediate loads
+    if op == 232 { sp_set_a(m, sp_fetch(m)); sp_setnz(m, sp_a(m)); return 2; }    // E8 MOV A,#i
+    if op == 205 { sp_set_x(m, sp_fetch(m)); sp_setnz(m, sp_x(m)); return 2; }    // CD MOV X,#i
+    if op == 141 { sp_set_y(m, sp_fetch(m)); sp_setnz(m, sp_y(m)); return 2; }    // 8D MOV Y,#i
+    // inc / dec
+    if op == 188 { sp_set_a(m, (sp_a(m) + 1) and 255); sp_setnz(m, sp_a(m)); return 2; }   // BC INC A
+    if op == 61  { sp_set_x(m, (sp_x(m) + 1) and 255); sp_setnz(m, sp_x(m)); return 2; }   // 3D INC X
+    if op == 252 { sp_set_y(m, (sp_y(m) + 1) and 255); sp_setnz(m, sp_y(m)); return 2; }   // FC INC Y
+    if op == 156 { sp_set_a(m, (sp_a(m) - 1) and 255); sp_setnz(m, sp_a(m)); return 2; }   // 9C DEC A
+    if op == 29  { sp_set_x(m, (sp_x(m) - 1) and 255); sp_setnz(m, sp_x(m)); return 2; }   // 1D DEC X
+    if op == 220 { sp_set_y(m, (sp_y(m) - 1) and 255); sp_setnz(m, sp_y(m)); return 2; }   // DC DEC Y
+    // register transfers (set N,Z)
+    if op == 125 { sp_set_a(m, sp_x(m)); sp_setnz(m, sp_a(m)); return 2; }        // 7D MOV A,X
+    if op == 93  { sp_set_x(m, sp_a(m)); sp_setnz(m, sp_x(m)); return 2; }        // 5D MOV X,A
+    if op == 221 { sp_set_a(m, sp_y(m)); sp_setnz(m, sp_a(m)); return 2; }        // DD MOV A,Y
+    if op == 253 { sp_set_y(m, sp_a(m)); sp_setnz(m, sp_y(m)); return 2; }        // FD MOV Y,A
+    // ALU immediate
+    if op == 136 { sp_adc(m, sp_fetch(m)); return 2; }                       // 88 ADC A,#i
+    if op == 168 { sp_sbc(m, sp_fetch(m)); return 2; }                       // A8 SBC A,#i
+    if op == 104 { sp_cmp(m, sp_a(m), sp_fetch(m)); return 2; }               // 68 CMP A,#i
+    if op == 200 { sp_cmp(m, sp_x(m), sp_fetch(m)); return 2; }               // C8 CMP X,#i
+    if op == 173 { sp_cmp(m, sp_y(m), sp_fetch(m)); return 2; }               // AD CMP Y,#i
+    if op == 40  { sp_and(m, sp_fetch(m)); return 2; }                       // 28 AND A,#i
+    if op == 8   { sp_or(m, sp_fetch(m)); return 2; }                        // 08 OR  A,#i
+    if op == 72  { sp_eor(m, sp_fetch(m)); return 2; }                       // 48 EOR A,#i
+    // direct-page moves
+    if op == 228 { sp_set_a(m, sp_rd(m, sp_dp(m, sp_fetch(m)))); sp_setnz(m, sp_a(m)); return 3; }   // E4 MOV A,dp
+    if op == 196 { sp_wr(m, sp_dp(m, sp_fetch(m)), sp_a(m)); return 4; }                       // C4 MOV dp,A
+    if op == 248 { sp_set_x(m, sp_rd(m, sp_dp(m, sp_fetch(m)))); sp_setnz(m, sp_x(m)); return 3; }   // F8 MOV X,dp
+    if op == 216 { sp_wr(m, sp_dp(m, sp_fetch(m)), sp_x(m)); return 4; }                       // D8 MOV dp,X
+    if op == 235 { sp_set_y(m, sp_rd(m, sp_dp(m, sp_fetch(m)))); sp_setnz(m, sp_y(m)); return 3; }   // EB MOV Y,dp
+    if op == 203 { sp_wr(m, sp_dp(m, sp_fetch(m)), sp_y(m)); return 4; }                       // CB MOV dp,Y
+    if op == 143 { let v: Int = sp_fetch(m); sp_wr(m, sp_dp(m, sp_fetch(m)), v); return 5; }   // 8F MOV dp,#i
+    // absolute moves
+    if op == 229 { sp_set_a(m, sp_rd(m, sp_abs(m))); sp_setnz(m, sp_a(m)); return 4; }            // E5 MOV A,!abs
+    if op == 197 { sp_wr(m, sp_abs(m), sp_a(m)); return 5; }                                // C5 MOV !abs,A
+    // branches
+    if op == 47  { return sp_br(m, 1); }                                    // 2F BRA
+    if op == 240 { return sp_br(m, (sp_psw(m) and 2) != 0); }                // F0 BEQ
+    if op == 208 { return sp_br(m, (sp_psw(m) and 2) == 0); }                // D0 BNE
+    if op == 176 { return sp_br(m, (sp_psw(m) and 1) != 0); }                // B0 BCS
+    if op == 144 { return sp_br(m, (sp_psw(m) and 1) == 0); }                // 90 BCC
+    if op == 48  { return sp_br(m, (sp_psw(m) and 128) != 0); }              // 30 BMI
+    if op == 16  { return sp_br(m, (sp_psw(m) and 128) == 0); }              // 10 BPL
+    // jumps / calls
+    if op == 95  { sp_set_pc(m, sp_abs(m)); return 3; }                      // 5F JMP !abs
+    if op == 63  { let t: Int = sp_abs(m); sp_push(m, (sp_pc(m) / 256) and 255); sp_push(m, sp_pc(m) and 255); sp_set_pc(m, t); return 8; }  // 3F CALL
+    if op == 111 { let lo: Int = sp_pull(m); sp_set_pc(m, sp_pull(m) * 256 + lo); return 5; }   // 6F RET
+    return sp_ext(m, op);                                                   // extended opcode batch
+}
+
+// --- S-DSP: BRR sample decode (the SNES audio decompression) ------------------------
+// BRR = 9-byte blocks: header (bits7-4 range/shift, 3-2 filter, 1 loop, 0 end) + 8
+// data bytes = 16 signed-4-bit nibbles (high nibble first). Each sample is shifted by
+// range then run through one of 4 IIR predictors over the previous two samples.
+fn sp_asrd(x: Int, d: Int) -> Int {                 // arithmetic shift right (floor div; Sigil / truncates)
+    if x >= 0 { return x / d; }
+    return 0 - (((0 - x) + d - 1) / d);
+}
+fn sp_pow2(n: Int) -> Int { var r: Int = 1; var i: Int = 0; while i < n invariant i >= 0 { r = r * 2; i = i + 1; } return r; }
+fn sp_sx4(n: Int) -> Int { if n >= 8 { return n - 16; } return n; }     // sign-extend 4-bit
+fn sp_clamp16(x: Int) -> Int { if x > 32767 { return 32767; } if x < (0 - 32768) { return 0 - 32768; } return x; }
+fn sp_pcm_w(m: Int, off: Int, v: Int) -> Int ! {mem} { poke8(sp_pcm(m), off, v and 255); poke8(sp_pcm(m), off + 1, (v and 65535) / 256); return 0; }
+// one BRR sample: apply shift then the selected predictor over p0 (prev), p1 (prev2)
+fn sp_brr_sample(nib: Int, shift: Int, filt: Int, p0: Int, p1: Int) -> Int {
+    var s: Int = nib;
+    if shift <= 12 { s = sp_asrd(nib * sp_pow2(shift), 2); }
+    if shift > 12 { if nib < 0 { s = 0 - 2048; } }
+    if shift > 12 { if nib >= 0 { s = 0; } }
+    if filt == 1 { s = s + p0 + sp_asrd(0 - p0, 16); }
+    if filt == 2 { s = s + p0 * 2 + sp_asrd(0 - p0 * 3, 32) - p1 + sp_asrd(p1, 16); }
+    if filt == 3 { s = s + p0 * 2 + sp_asrd(0 - p0 * 13, 64) - p1 + sp_asrd(p1 * 3, 16); }
+    return sp_clamp16(s);
+}
+// Decode a whole BRR sample: 9-byte blocks from sp_ram(m)[src] until a header with the
+// END flag (bit 0), chaining the predictor state (p0/p1) across blocks, writing 16 s16
+// samples per block to sp_pcm(m)[out]. Returns the number of samples decoded.
+fn sp_brr_decode(m: Int, src: Int, out: Int) -> Int ! {mem} {
+    var p0: Int = 0; var p1: Int = 0;
+    var s: Int = src; var o: Int = out; var go: Int = 1;
+    while go == 1 invariant go >= 0 {
+        let hdr: Int = peek8(sp_ram(m), s);
+        let shift: Int = hdr / 16; let filt: Int = (hdr / 4) and 3;
+        var i: Int = 0;
+        while i < 8 invariant i >= 0 {
+            let byte: Int = peek8(sp_ram(m), s + 1 + i);
+            var smp: Int = sp_brr_sample(sp_sx4(byte / 16), shift, filt, p0, p1);
+            p1 = p0; p0 = smp; sp_pcm_w(m, o, smp); o = o + 2;
+            smp = sp_brr_sample(sp_sx4(byte and 15), shift, filt, p0, p1);
+            p1 = p0; p0 = smp; sp_pcm_w(m, o, smp); o = o + 2;
+            i = i + 1;
+        }
+        if (hdr and 1) == 1 { go = 0; }              // END flag terminates the sample
+        s = s + 9;
+    }
+    return (o - out) / 2;                            // s16 samples decoded
+}
+
+// --- S-DSP: per-voice pitch resample + stereo volume mix -----------------------------
+// Voices read decoded PCM at their own rate (pitch: 14-bit, $1000 = 1.0 = native), scale
+// by signed L/R volume (>>7), and SUM into a shared stereo s16 accumulator (sp_mix(m)),
+// so calling it per voice mixes them. Nearest-neighbour resample (Gaussian later).
+fn sp_mix(m: Int) -> Int { return m + 2097152; }       // SPC zone+458752: stereo s16 mix accumulator
+fn sp_pcm_r(m: Int, off: Int) -> Int ! {mem} { let v: Int = peek8(sp_pcm(m), off) + peek8(sp_pcm(m), off + 1) * 256; if v >= 32768 { return v - 65536; } return v; }
+fn sp_mix_rd(m: Int, off: Int) -> Int ! {mem} { let v: Int = peek8(sp_mix(m), off) + peek8(sp_mix(m), off + 1) * 256; if v >= 32768 { return v - 65536; } return v; }
+fn sp_mix_add(m: Int, off: Int, delta: Int) -> Int ! {mem} {
+    let s: Int = sp_clamp16(sp_mix_rd(m, off) + delta);
+    poke8(sp_mix(m), off, s and 255); poke8(sp_mix(m), off + 1, (s and 65535) / 256);
+    return 0;
+}
+fn sp_voice_mix(m: Int, pcmoff: Int, nsamp: Int, pitch: Int, vl: Int, vr: Int, outoff: Int, count: Int) -> Int ! {mem} {
+    var pos: Int = 0; var i: Int = 0;
+    while i < count invariant i >= 0 {
+        let idx: Int = pos / 4096;                       // 12-bit fractional pitch ($1000 = 1.0)
+        var smp: Int = 0;
+        if idx < nsamp { smp = sp_pcm_r(m, pcmoff + idx * 2); }
+        sp_mix_add(m, outoff + i * 4, (smp * vl) / 128);     // L (volume >>7)
+        sp_mix_add(m, outoff + i * 4 + 2, (smp * vr) / 128); // R
+        pos = pos + pitch;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- S-DSP: ADSR envelope (per-step) -------------------------------------------------
+// The 11-bit (0-2047) volume envelope advances one step per gated tick: attack rises
+// linearly (+32) to full, decay/sustain fall exponentially (-= ((e-1)>>8)+1) toward the
+// sustain level ((SL+1)<<8), release falls linearly (-8) to 0. (The ADSR rate fields
+// gate HOW OFTEN this is called; the per-step math is fixed.) Phases: 0 attack, 1 decay,
+// 2 sustain, 3 release, 4 off. Packed return: phase*2048 + env.
+fn sp_env_tick(env: Int, phase: Int, sl: Int) -> Int {
+    var e: Int = env; var ph: Int = phase;
+    let ph0: Int = ph;
+    if ph0 == 0 {
+        e = e + 32;
+        if e >= 2047 { e = 2047; ph = 1; }
+    }
+    if ph0 == 1 {
+        e = e - (((e - 1) / 256) + 1);
+        if e <= (sl + 1) * 256 { ph = 2; }
+    }
+    if ph0 == 2 {
+        e = e - (((e - 1) / 256) + 1);
+    }
+    if ph0 == 3 {
+        e = e - 8;
+        if e < 0 { e = 0; ph = 4; }
+    }
+    if e < 0 { e = 0; }
+    return ph * 2048 + e;
+}
+
+// --- S-DSP: voice control (KON/KOF + per-voice state) --------------------------------
+// Per-voice state in sp_vst(m) (16B/voice): ENV @0 (16-bit 0-2047), PHASE @2, ACTIVE @3,
+// POS @4 (16.16 pitch position), LEN @8 (decoded sample count). Each voice decodes its
+// BRR sample into a 4096-sample slice of sp_pcm(m) at v*8192 bytes on key-on.
+fn sp_vst(m: Int) -> Int { return m + 2162688; }       // SPC zone+524288: per-voice state (8x16B)
+fn sp_dreg(m: Int, n: Int) -> Int ! {mem} { return peek8(sp_dsp(m), n and 127); }     // S-DSP register read
+// Voice sample start address via the sample directory ($5D DIR page, SRCN x 4-byte entry)
+fn sp_voice_start(m: Int, v: Int) -> Int ! {mem} {
+    let e: Int = (sp_dreg(m, 93) * 256 + sp_dreg(m, v * 16 + 4) * 4) and 65535;
+    return peek8(sp_ram(m), e) + peek8(sp_ram(m), (e + 1) and 65535) * 256;
+}
+fn sp_kon(m: Int, mask: Int) -> Int ! {mem} {                // $4C KON: per-bit key on -> decode + attack
+    var v: Int = 0;
+    while v < 8 invariant v >= 0 {
+        if (mask and sp_pow2(v)) != 0 {
+            let db: Int = (sp_dreg(m, 93) * 256 + sp_dreg(m, v * 16 + 4) * 4) and 65535;   // dir entry
+            let start: Int = peek8(sp_ram(m), db) + peek8(sp_ram(m), (db + 1) and 65535) * 256;
+            let n: Int = sp_brr_decode(m, start, v * 8192);
+            let loopaddr: Int = peek8(sp_ram(m), (db + 2) and 65535) + peek8(sp_ram(m), (db + 3) and 65535) * 256;
+            let lidx: Int = ((loopaddr - start) / 9) * 16;            // loop point in samples
+            poke8(sp_vst(m), v * 16 + 8, n and 255); poke8(sp_vst(m), v * 16 + 9, (n / 256) and 255);  // LEN
+            poke8(sp_vst(m), v * 16 + 10, lidx and 255); poke8(sp_vst(m), v * 16 + 11, (lidx / 256) and 255);  // LOOPIDX
+            poke8(sp_vst(m), v * 16 + 12, (peek8(sp_ram(m), (start + (n / 16 - 1) * 9) and 65535) / 2) and 1); // LOOP flag (END block bit1)
+            poke8(sp_vst(m), v * 16 + 2, 0);                            // PHASE = attack
+            poke8(sp_vst(m), v * 16 + 3, 1);                            // ACTIVE
+            poke8(sp_vst(m), v * 16, 0); poke8(sp_vst(m), v * 16 + 1, 0);// ENV = 0
+            poke32(sp_vst(m), v * 16 + 4, 0);                           // POS = 0
+        }
+        v = v + 1;
+    }
+    return 0;
+}
+fn sp_kof(m: Int, mask: Int) -> Int ! {mem} {                // $5C KOF: per-bit key off -> release phase
+    var v: Int = 0;
+    while v < 8 invariant v >= 0 {
+        if (mask and sp_pow2(v)) != 0 { poke8(sp_vst(m), v * 16 + 2, 3); }
+        v = v + 1;
+    }
+    return 0;
+}
+
+// --- S-DSP: frame render (the 8-voice mixdown -> stereo PCM) --------------------------
+// Produces `count` stereo s16 frames into sp_mix(m): each active voice is resampled at its
+// pitch, scaled by its ADSR envelope (advanced per sample) and signed L/R volume, and
+// summed. The OS audio service consumes this via write(buf,stream,len) (HAL_CONTRACTS.md);
+// the EL0 submit wiring mirrors the scene transport. (Master volume / echo: later.)
+fn sp_sx8(n: Int) -> Int { if n >= 128 { return n - 256; } return n; }     // sign-extend 8-bit (VOL)
+fn sp_vmix1(m: Int, v: Int, idx: Int, env: Int, vl: Int, vr: Int, outoff: Int) -> Int ! {mem} {
+    let s: Int = (sp_pcm_r(m, v * 8192 + idx * 2) * env) / 2047;              // envelope scale (0..2047)
+    sp_mix_add(m, outoff, (s * vl) / 128);
+    sp_mix_add(m, outoff + 2, (s * vr) / 128);
+    return 0;
+}
+// When playback reaches the sample end: if the voice loops (END block had the loop
+// flag) return pos wrapped back by (len - loopidx) samples, else -1 to deactivate.
+fn sp_loop_wrap(m: Int, vb: Int, pos: Int, len: Int) -> Int ! {mem} {
+    if peek8(sp_vst(m), vb + 12) != 1 { return 0 - 1; }
+    let lidx: Int = peek8(sp_vst(m), vb + 10) + peek8(sp_vst(m), vb + 11) * 256;
+    if lidx >= len { return 0 - 1; }
+    return pos - (len - lidx) * 4096;
+}
+fn sp_render_voice(m: Int, v: Int, count: Int) -> Int ! {mem} {
+    let vb: Int = v * 16;
+    let pitch: Int = sp_dreg(m, vb + 2) + (sp_dreg(m, vb + 3) and 63) * 256;     // 14-bit PITCH
+    let vl: Int = sp_sx8(sp_dreg(m, vb)); let vr: Int = sp_sx8(sp_dreg(m, vb + 1));
+    let len: Int = peek8(sp_vst(m), vb + 8) + peek8(sp_vst(m), vb + 9) * 256;
+    var pos: Int = peek32(sp_vst(m), vb + 4);
+    var env: Int = peek8(sp_vst(m), vb) + peek8(sp_vst(m), vb + 1) * 256;
+    var ph: Int = peek8(sp_vst(m), vb + 2);
+    var i: Int = 0;
+    while i < count invariant i >= 0 {
+        let idx: Int = pos / 4096;
+        if idx >= len {                                                   // reached sample end
+            pos = sp_loop_wrap(m, vb, pos, len);                             // wrap if looping
+            if pos < 0 { poke8(sp_vst(m), vb + 3, 0); i = count; }         // deactivate
+            if pos >= 0 { if (pos / 4096) >= len { poke8(sp_vst(m), vb + 3, 0); i = count; } }
+        }
+        if idx < len {
+            sp_vmix1(m, v, idx, env, vl, vr, i * 4);
+            let packed: Int = sp_env_tick(env, ph, (sp_dreg(m, vb + 6) / 32) and 7);
+            env = packed % 2048; ph = packed / 2048;
+            pos = pos + pitch;
+            i = i + 1;
+        }
+    }
+    poke8(sp_vst(m), vb, env and 255); poke8(sp_vst(m), vb + 1, (env / 256) and 255);
+    poke8(sp_vst(m), vb + 2, ph); poke32(sp_vst(m), vb + 4, pos);
+    return 0;
+}
+fn sp_mix_wr(m: Int, off: Int, v: Int) -> Int ! {mem} { poke8(sp_mix(m), off, v and 255); poke8(sp_mix(m), off + 1, (v and 65535) / 256); return 0; }
+fn sp_ram_r16(m: Int, off: Int) -> Int ! {mem} { let v: Int = peek8(sp_ram(m), off) + peek8(sp_ram(m), (off + 1) and 65535) * 256; if v >= 32768 { return v - 65536; } return v; }
+fn sp_ram_w16(m: Int, off: Int, v: Int) -> Int ! {mem} { poke8(sp_ram(m), off, v and 255); poke8(sp_ram(m), (off + 1) and 65535, (v and 65535) / 256); return 0; }
+fn sp_echo_pos(m: Int) -> Int ! {mem} { return peek32(sp_st(m), 40); }
+// --- S-DSP: echo (delay line + feedback) ---------------------------------------------
+// Per frame: out = main*MVOL + delayed*EVOL; the echo ring (ESA*256, EDL*512 frames in
+// APU RAM) is fed back main + delayed*EFB (unless FLG bit5 disables echo writes), all
+// signed >>7 with clamp. (Single-tap; the 8-tap FIR is a follow-up.)
+fn sp_echo(m: Int, outoff: Int, ml: Int, mr: Int) -> Int ! {mem} {
+    let edl: Int = sp_dreg(m, 125) and 15;
+    var rl: Int = edl * 512; if rl < 1 { rl = 1; }                       // echo ring length (frames)
+    let pos: Int = sp_echo_pos(m);
+    let slot: Int = (sp_dreg(m, 109) * 256 + pos * 4) and 65535;            // $6D ESA page + ring pos
+    let dl: Int = sp_ram_r16(m, slot); let dr: Int = sp_ram_r16(m, (slot + 2) and 65535);
+    let ol: Int = sp_mix_rd(m, outoff); let omr: Int = sp_mix_rd(m, outoff + 2);
+    sp_mix_wr(m, outoff, sp_clamp16((ol * ml) / 128 + (dl * sp_sx8(sp_dreg(m, 44))) / 128));    // +EVOL L
+    sp_mix_wr(m, outoff + 2, sp_clamp16((omr * mr) / 128 + (dr * sp_sx8(sp_dreg(m, 60))) / 128));// +EVOL R
+    if (sp_dreg(m, 108) and 32) == 0 {                                      // $6C FLG bit5 = echo-write disable
+        sp_ram_w16(m, slot, sp_clamp16(ol + (dl * sp_sx8(sp_dreg(m, 13))) / 128));              // feedback EFB
+        sp_ram_w16(m, (slot + 2) and 65535, sp_clamp16(omr + (dr * sp_sx8(sp_dreg(m, 13))) / 128));
+    }
+    poke32(sp_st(m), 40, (pos + 1) % rl);
+    return 0;
+}
+fn core_audio_fill(m: Int, count: Int) -> Int ! {mem} {
+    let kon: Int = sp_dreg(m, 76); if kon != 0 { sp_kon(m, kon); poke8(sp_dsp(m), 76, 0); }   // $4C KON edge
+    let kof: Int = sp_dreg(m, 92); if kof != 0 { sp_kof(m, kof); poke8(sp_dsp(m), 92, 0); }   // $5C KOF edge
+    var c: Int = 0;                                                       // clear the stereo accumulator
+    while c < count invariant c >= 0 {
+        poke8(sp_mix(m), c * 4, 0); poke8(sp_mix(m), c * 4 + 1, 0);
+        poke8(sp_mix(m), c * 4 + 2, 0); poke8(sp_mix(m), c * 4 + 3, 0);
+        c = c + 1;
+    }
+    var v: Int = 0;
+    while v < 8 invariant v >= 0 {
+        if peek8(sp_vst(m), v * 16 + 3) == 1 { sp_render_voice(m, v, count); }
+        v = v + 1;
+    }
+    let ml: Int = sp_sx8(sp_dreg(m, 12)); let mr: Int = sp_sx8(sp_dreg(m, 28)); // $0C/$1C MVOL L/R
+    var f: Int = 0;
+    while f < count invariant f >= 0 {
+        sp_echo(m, f * 4, ml, mr);                                          // master vol + echo per frame
+        f = f + 1;
+    }
+    return 0;
+}
+
+// Reset the SPC700 without loading a program (the SNES uploads its driver via the
+// $2140-3 port handshake at runtime). Clears registers + IO state.
+fn sp_reset(m: Int) -> Int ! {mem} {
+    var s: Int = 0;
+    while s < 48 invariant s >= 0 { poke8(sp_st(m), s, 0); s = s + 1; }
+    sp_set_sp(m, 255); sp_set_pc(m, 0);
+    return 1;
+}
+// --- load helper (test/integration): copy program to APU RAM, reset registers ---
+fn sp_load(m: Int, rom: Int, len: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < len invariant i >= 0 { poke8(sp_ram(m), i, peek8(rom, i)); i = i + 1; }
+    var s: Int = 0;
+    while s < 48 invariant s >= 0 { poke8(sp_st(m), s, 0); s = s + 1; }   // regs + IO state
+    sp_set_sp(m, 255); sp_set_pc(m, 0);
+    return 1;
+}

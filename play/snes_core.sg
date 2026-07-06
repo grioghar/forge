@@ -1,0 +1,923 @@
+// snes.sg — SNES (WDC 65C816) core for sigil-Retropie, bare-metal Sigil Int-subset.
+// Fifth core (after CHIP-8, 8080, GB, NES), per the Director's backlog. THIS
+// INCREMENT: the 65816 CPU foundation — the defining feature is runtime 8/16-bit
+// width (M flag = accumulator, X flag = index; REP/SEP toggle them; XCE swaps
+// emulation/native). Registers are 16-bit; reads/writes/immediates size on the
+// flags. NEXT: the rest of the opcode set + 24-bit addressing/banks + the SNES
+// PPU (modes 0-7, Mode 7) + SPC700 audio + DMA/HDMA + LoROM/HiROM. Function names
+// s9_*-prefixed (avoids asm register-name collisions, sigil#12).
+//
+// Fixed RAM: SMEM 0x1000000 (24-bit space, sparse), ST 0x2100000 (regs),
+// FB 0x2200000 (256x224 ARGB), ROM 0x2300000.
+
+// Regions relocated into the EL0 data window (0x400000-0x6FFFFF) so the core is
+// fs-loadable as a cc0 arm-el0 app (like the NES core). Compact layout leaves
+// 0x5A0000+ for snes_app's ROM read buffer + path string.
+fn s9_mem(m: Int) -> Int { return m + 0; }             // base+0: WRAM (128KB, banks 7E/7F)
+fn s9_st(m: Int) -> Int { return m + 131072; }         // base+131072: state + ppureg shadow (4KB)
+fn s9_vram(m: Int) -> Int { return m + 196608; }        // base+196608: VRAM (64KB)
+fn s9_cgram(m: Int) -> Int { return m + 262144; }       // base+262144: CGRAM (512B)
+fn s9_oam(m: Int) -> Int { return m + 266240; }         // base+266240: OAM (1KB)
+fn s9_fb(m: Int) -> Int { return m + 327680; }          // base+327680: framebuffer (256x224x4=224KB)
+fn s9_rom(m: Int) -> Int { return m + 589824; }        // base+589824: ROM (cap 1MB)
+
+fn s9_pow2(n: Int) -> Int { var p: Int = 1; var i: Int = 0; while i < n invariant i >= 0 { p = p * 2; i = i + 1; } return p; }
+fn s9_xor(a: Int, b: Int) -> Int {
+    var r: Int = 0; var i: Int = 0;
+    while i < 8 invariant i >= 0 { r = r + (a / s9_pow2(i) % 2 + b / s9_pow2(i) % 2) % 2 * s9_pow2(i); i = i + 1; }
+    return r;
+}
+
+// ST: A@0 X@4 Y@8 SP@12 PC@16 D@20 (16-bit, 32-bit slots); P@24 E@28 DBR@32 PBR@36 (bytes/flags).
+fn s9_a(m: Int) -> Int ! {mem} { return peek32(s9_st(m), 0); }
+fn s9_set_a(m: Int, v: Int) -> Int ! {mem} { poke32(s9_st(m), 0, v and 65535); return 0; }
+fn s9_x(m: Int) -> Int ! {mem} { return peek32(s9_st(m), 4); }
+fn s9_set_x(m: Int, v: Int) -> Int ! {mem} { poke32(s9_st(m), 4, v and 65535); return 0; }
+fn s9_y(m: Int) -> Int ! {mem} { return peek32(s9_st(m), 8); }
+fn s9_set_y(m: Int, v: Int) -> Int ! {mem} { poke32(s9_st(m), 8, v and 65535); return 0; }
+fn s9_sp(m: Int) -> Int ! {mem} { return peek32(s9_st(m), 12); }
+fn s9_set_sp(m: Int, v: Int) -> Int ! {mem} { poke32(s9_st(m), 12, v and 65535); return 0; }
+fn s9_pc(m: Int) -> Int ! {mem} { return peek32(s9_st(m), 16); }
+fn s9_set_pc(m: Int, v: Int) -> Int ! {mem} { poke32(s9_st(m), 16, v and 65535); return 0; }
+fn s9_d(m: Int) -> Int ! {mem} { return peek32(s9_st(m), 20); }
+fn s9_p(m: Int) -> Int ! {mem} { return peek8(s9_st(m), 24); }
+fn s9_set_p(m: Int, v: Int) -> Int ! {mem} { poke8(s9_st(m), 24, v and 255); return 0; }
+fn s9_pbr(m: Int) -> Int ! {mem} { return peek8(s9_st(m), 36); }
+
+// flags: C0 Z1 I2 D3 X4 M5 V6 N7 ; E (emulation) @28.
+fn s9_getf(m: Int, bit: Int) -> Int ! {mem} { return s9_p(m) / s9_pow2(bit) % 2; }
+fn s9_setf(m: Int, bit: Int, val: Int) -> Int ! {mem} {
+    let cur: Int = s9_p(m) / s9_pow2(bit) % 2;
+    if val == 1 { if cur == 0 { s9_set_p(m, s9_p(m) + s9_pow2(bit)); } }
+    if val == 0 { if cur == 1 { s9_set_p(m, s9_p(m) - s9_pow2(bit)); } }
+    return 0;
+}
+fn s9_mwide(m: Int) -> Int ! {mem} { if s9_getf(m, 5) == 0 { return 1; } return 0; }   // M=0 -> 16-bit accumulator
+fn s9_xwide(m: Int) -> Int ! {mem} { if s9_getf(m, 4) == 0 { return 1; } return 0; }   // X=0 -> 16-bit index
+
+// set Z/N for a value of the given width (matches s9_mwide(m)/s9_xwide(m): 1=16bit, 0=8bit)
+fn s9_setzn(m: Int, v: Int, wide: Int) -> Int ! {mem} {
+    if wide == 1 {
+        if (v and 65535) == 0 { s9_setf(m, 1, 1); }
+        if (v and 65535) != 0 { s9_setf(m, 1, 0); }
+        s9_setf(m, 7, v / 32768 % 2);
+    }
+    if wide != 1 {
+        if (v and 255) == 0 { s9_setf(m, 1, 1); }
+        if (v and 255) != 0 { s9_setf(m, 1, 0); }
+        s9_setf(m, 7, v / 128 % 2);
+    }
+    return 0;
+}
+
+// --- memory map (LoROM) ---
+// WRAM: first 128KB of s9_mem (banks $7E/$7F; banks $00-$3F/$80-$BF mirror the
+// low 8KB). PPU/APU regs $2100-$21FF shadowed at ST+256. ROM (LoROM): banks
+// $00-$7D / $80-$FF, addr $8000-$FFFF -> ROM[(bank&$7F)*$8000 + (addr-$8000)].
+fn s9_wram(m: Int) -> Int { return s9_mem(m); }
+fn s9_ppureg(m: Int) -> Int { return s9_st(m) + 256; }   // $2100-$21FF shadow (off = reg-$2100)
+fn s9_dmareg(m: Int) -> Int { return s9_st(m) + 512; }   // $4200-$43FF shadow (off = reg-$4200)
+
+// PPU register write with port side effects. `off` is reg-$2100 (0..255), `b` a byte.
+// Handles the VRAM port ($2116/17 addr, $2118/19 data, word auto-increment) and
+// the CGRAM palette port ($2121 addr, $2122 data, byte auto-increment). Other
+// regs (INIDISP $2100, BGMODE $2105, BGxSC/BGxNBA, etc.) just latch in the shadow.
+fn s9_ppu_write(m: Int, off: Int, b: Int) -> Int ! {mem} {
+    poke8(s9_ppureg(m), off, b);                                  // latch the register
+    if off == 24 {                                              // $2118 VMDATAL
+        let wl: Int = (peek8(s9_ppureg(m), 22) + peek8(s9_ppureg(m), 23) * 256) and 32767;
+        poke8(s9_vram(m), wl * 2, b); return 0;
+    }
+    if off == 25 {                                              // $2119 VMDATAH (+increment word)
+        let wh: Int = (peek8(s9_ppureg(m), 22) + peek8(s9_ppureg(m), 23) * 256) and 32767;
+        poke8(s9_vram(m), wh * 2 + 1, b);
+        let nx: Int = (wh + 1) and 32767;
+        poke8(s9_ppureg(m), 22, nx and 255); poke8(s9_ppureg(m), 23, (nx / 256) and 255);
+        return 0;
+    }
+    if off == 33 { poke8(s9_st(m), 48, 0); return 0; }          // $2121 CGADD: index latched; reset lo/hi
+    if off == 34 {                                             // $2122 CGDATA: lo byte buffered, hi commits
+        var cghi: Int = peek8(s9_st(m), 48);
+        if cghi == 0 {
+            poke8(s9_st(m), 52, b);                             // buffer low byte
+            poke8(s9_st(m), 48, 1);
+        }
+        if cghi != 0 {
+            let idx: Int = peek8(s9_ppureg(m), 33) and 255;     // color index (0..255)
+            poke8(s9_cgram(m), idx * 2, peek8(s9_st(m), 52));
+            poke8(s9_cgram(m), idx * 2 + 1, b);
+            poke8(s9_ppureg(m), 33, (idx + 1) and 255);         // auto-increment color index
+            poke8(s9_st(m), 48, 0);
+        }
+        return 0;
+    }
+    if off == 4 {                                              // $2104 OAMDATA (+increment byte)
+        let oa: Int = (peek8(s9_ppureg(m), 2) + (peek8(s9_ppureg(m), 3) and 1) * 256) and 1023;
+        poke8(s9_oam(m), oa, b);
+        let n: Int = (oa + 1) and 1023;
+        poke8(s9_ppureg(m), 2, n and 255); poke8(s9_ppureg(m), 3, (n / 256) and 1);
+        return 0;
+    }
+    if off >= 27 { if off <= 32 {                              // $211B-$2120 Mode-7 matrix/center
+        let v: Int = (b * 256 + peek8(s9_st(m), 58)) and 65535;  // (byte<<8) | prev (write-twice latch)
+        poke8(s9_st(m), 58, b);                                  // latch = this byte
+        let slot: Int = 60 + (off - 27) * 2;                    // M7A@60 B@62 C@64 D@66 X@68 Y@70
+        poke8(s9_st(m), slot, v and 255); poke8(s9_st(m), slot + 1, (v / 256) and 255);
+        return 0;
+    } }
+    return 0;
+}
+fn s9_issys(bank: Int) -> Int {
+    if bank <= 63 { return 1; }
+    if bank >= 128 { if bank <= 191 { return 1; } }
+    return 0;
+}
+fn s9_read(m: Int, a: Int) -> Int ! {mem} {
+    let bank: Int = (a / 65536) and 255;
+    let off: Int = a and 65535;
+    if bank == 126 { return peek8(s9_wram(m), off); }
+    if bank == 127 { return peek8(s9_wram(m), 65536 + off); }
+    if s9_issys(bank) == 1 {
+        if off < 8192 { return peek8(s9_wram(m), off); }                       // low WRAM mirror
+        if off >= 8512 { if off <= 8515 { return sp_port_out(m, off - 8512); } }     // $2140-3 APU read (SPC->main)
+        if off >= 8448 { if off <= 8703 { return peek8(s9_ppureg(m), off - 8448); } }  // $2100-$21FF
+        if off == 16912 {                                                    // $4210 RDNMI: read clears bit7
+            let rv: Int = peek8(s9_dmareg(m), 16);
+            poke8(s9_dmareg(m), 16, rv and 127);
+            return rv;
+        }
+        if off >= 16896 { if off <= 17407 { return peek8(s9_dmareg(m), off - 16896); } }  // $4200-$43FF
+    }
+    if off >= 32768 { return peek8(s9_rom(m), ((bank and 127) * 32768) + (off - 32768)); }
+    return 0;
+}
+fn s9_write(m: Int, a: Int, v: Int) -> Int ! {mem} {
+    let bank: Int = (a / 65536) and 255;
+    let off: Int = a and 65535;
+    let b: Int = v and 255;
+    if bank == 126 { poke8(s9_wram(m), off, b); return 0; }
+    if bank == 127 { poke8(s9_wram(m), 65536 + off, b); return 0; }
+    if s9_issys(bank) == 1 {
+        if off < 8192 { poke8(s9_wram(m), off, b); return 0; }                 // low WRAM mirror
+        if off >= 8512 { if off <= 8515 { sp_port_in(m, off - 8512, b); return 0; } }    // $2140-3 APU write (main->SPC)
+        if off >= 8448 { if off <= 8703 { s9_ppu_write(m, off - 8448, b); return 0; } }  // $2100-$21FF
+        if off >= 16896 { if off <= 17407 {                                    // $4200-$43FF
+            poke8(s9_dmareg(m), off - 16896, b);
+            if off == 16907 { s9_dma_run(m, b); }                                // $420B MDMAEN -> transfer
+            return 0;
+        } }
+    }
+    return 0;
+}
+// --- DMA: general-purpose A-bus -> B-bus (the path real ROMs use to fill VRAM/
+// CGRAM/OAM). Channel regs $43x0.. shadowed in dmareg; $420B (MDMAEN) triggers.
+// A-bus auto-increments (fixed/decrement modes are a follow-up). Transfer modes:
+// 0 = 1 reg (e.g. $2122/$2104), 1 = 2 regs alternating (e.g. $2118/$2119).
+fn s9_dma(m: Int, ch: Int) -> Int ! {mem} {
+    let base: Int = 256 + ch * 16;                 // $4300+ch*16 in dmareg ($4300-$4200=256)
+    let bbad: Int = peek8(s9_dmareg(m), base + 1);
+    let mode: Int = peek8(s9_dmareg(m), base) and 7;
+    var a: Int = peek8(s9_dmareg(m), base + 2) + peek8(s9_dmareg(m), base + 3) * 256 + peek8(s9_dmareg(m), base + 4) * 65536;
+    var size: Int = peek8(s9_dmareg(m), base + 5) + peek8(s9_dmareg(m), base + 6) * 256;
+    if size == 0 { size = 65536; }
+    var step: Int = 0;
+    while size > 0 invariant size >= 0 {
+        var bb: Int = 8448 + bbad;                 // $2100 + B-bus addr
+        if mode == 1 { if step == 1 { bb = 8448 + bbad + 1; } }
+        s9_write(m, bb, s9_read(m, a));
+        a = a + 1; size = size - 1;
+        if mode == 1 { step = 1 - step; }
+    }
+    return 0;
+}
+fn s9_dma_run(m: Int, mask: Int) -> Int ! {mem} {
+    var ch: Int = 0;
+    while ch < 8 invariant ch >= 0 {
+        if (mask / s9_pow2(ch)) % 2 == 1 { s9_dma(m, ch); }
+        ch = ch + 1;
+    }
+    return 0;
+}
+fn s9_pcaddr(m: Int) -> Int ! {mem} { return s9_pbr(m) * 65536 + s9_pc(m); }
+fn s9_fetch(m: Int) -> Int ! {mem} { let v: Int = s9_read(m, s9_pcaddr(m)); s9_set_pc(m, s9_pc(m) + 1); return v; }
+fn s9_fetch16(m: Int) -> Int ! {mem} { let lo: Int = s9_fetch(m); let hi: Int = s9_fetch(m); return hi * 256 + lo; }
+
+// fetch an immediate sized by the M flag (for A ops) or X flag (for index ops)
+fn s9_imm_m(m: Int) -> Int ! {mem} { if s9_mwide(m) == 1 { return s9_fetch16(m); } return s9_fetch(m); }
+fn s9_imm_x(m: Int) -> Int ! {mem} { if s9_xwide(m) == 1 { return s9_fetch16(m); } return s9_fetch(m); }
+
+// write A respecting width (8-bit keeps the high byte)
+fn s9_put_a(m: Int, v: Int) -> Int ! {mem} {
+    if s9_mwide(m) == 1 { s9_set_a(m, v and 65535); }
+    if s9_mwide(m) != 1 { s9_set_a(m, (s9_a(m) and 65280) + (v and 255)); }
+    return 0;
+}
+
+fn s9_adc(m: Int, val: Int) -> Int ! {mem} {
+    let wide: Int = s9_mwide(m);
+    var mask: Int = 255; if wide == 1 { mask = 65535; }
+    let a: Int = s9_a(m) and mask;
+    let r: Int = a + val + s9_getf(m, 0);
+    if r > mask { s9_setf(m, 0, 1); }
+    if r <= mask { s9_setf(m, 0, 0); }
+    s9_put_a(m, r); s9_setzn(m, r and mask, wide);
+    return 0;
+}
+
+fn s9_dbr(m: Int) -> Int ! {mem} { return peek8(s9_st(m), 32); }
+
+// width-aware (M flag) memory access of A
+fn s9_read_m(m: Int, addr: Int) -> Int ! {mem} {
+    if s9_mwide(m) == 1 { return s9_read(m, addr) + s9_read(m, addr + 1) * 256; }
+    return s9_read(m, addr);
+}
+fn s9_read_x(m: Int, addr: Int) -> Int ! {mem} {
+    if s9_xwide(m) == 1 { return s9_read(m, addr) + s9_read(m, addr + 1) * 256; }
+    return s9_read(m, addr);
+}
+fn s9_store_a(m: Int, addr: Int) -> Int ! {mem} {
+    s9_write(m, addr, s9_a(m) and 255);
+    if s9_mwide(m) == 1 { s9_write(m, addr + 1, (s9_a(m) / 256) and 255); }
+    return 0;
+}
+fn s9_store_z(m: Int, addr: Int) -> Int ! {mem} {
+    s9_write(m, addr, 0);
+    if s9_mwide(m) == 1 { s9_write(m, addr + 1, 0); }
+    return 0;
+}
+// store an index register (X/Y), width per the X flag
+fn s9_store_idx(m: Int, addr: Int, v: Int) -> Int ! {mem} {
+    s9_write(m, addr, v and 255);
+    if s9_xwide(m) == 1 { s9_write(m, addr + 1, (v / 256) and 255); }
+    return 0;
+}
+
+// addressing modes -> 24-bit effective address
+fn s9_dp(m: Int) -> Int ! {mem} { return (s9_d(m) + s9_fetch(m)) and 65535; }
+fn s9_dpx(m: Int) -> Int ! {mem} { return (s9_d(m) + s9_fetch(m) + s9_x(m)) and 65535; }
+fn s9_abs(m: Int) -> Int ! {mem} { return s9_dbr(m) * 65536 + s9_fetch16(m); }
+fn s9_absx(m: Int) -> Int ! {mem} { return (s9_dbr(m) * 65536 + s9_fetch16(m) + s9_x(m)) and 16777215; }
+fn s9_absy(m: Int) -> Int ! {mem} { return (s9_dbr(m) * 65536 + s9_fetch16(m) + s9_y(m)) and 16777215; }
+fn s9_absl(m: Int) -> Int ! {mem} { let lo: Int = s9_fetch16(m); let bank: Int = s9_fetch(m); return bank * 65536 + lo; }
+// direct-page indirect modes -> 24-bit effective (pointer is in bank 0, target in DBR)
+fn s9_idp(m: Int) -> Int ! {mem} {
+    let p: Int = (s9_d(m) + s9_fetch(m)) and 65535;
+    return s9_dbr(m) * 65536 + s9_read(m, p) + s9_read(m, (p + 1) and 65535) * 256;
+}
+fn s9_idpy(m: Int) -> Int ! {mem} {
+    let p: Int = (s9_d(m) + s9_fetch(m)) and 65535;
+    return (s9_dbr(m) * 65536 + s9_read(m, p) + s9_read(m, (p + 1) and 65535) * 256 + s9_y(m)) and 16777215;
+}
+fn s9_idpx(m: Int) -> Int ! {mem} {
+    let p: Int = (s9_d(m) + s9_fetch(m) + s9_x(m)) and 65535;
+    return s9_dbr(m) * 65536 + s9_read(m, p) + s9_read(m, (p + 1) and 65535) * 256;
+}
+// long (24-bit) direct-page indirect: [dp] and [dp],Y — pointer is 3 bytes in bank 0
+fn s9_ildp(m: Int) -> Int ! {mem} {
+    let p: Int = (s9_d(m) + s9_fetch(m)) and 65535;
+    return s9_read(m, p) + s9_read(m, (p + 1) and 65535) * 256 + s9_read(m, (p + 2) and 65535) * 65536;
+}
+fn s9_ildpy(m: Int) -> Int ! {mem} {
+    let p: Int = (s9_d(m) + s9_fetch(m)) and 65535;
+    return (s9_read(m, p) + s9_read(m, (p + 1) and 65535) * 256 + s9_read(m, (p + 2) and 65535) * 65536 + s9_y(m)) and 16777215;
+}
+
+// stack (bank 0; SP is 16-bit in native mode)
+fn s9_push8(m: Int, v: Int) -> Int ! {mem} { s9_write(m, s9_sp(m), v and 255); s9_set_sp(m, s9_sp(m) - 1); return 0; }
+fn s9_pop8(m: Int) -> Int ! {mem} { s9_set_sp(m, s9_sp(m) + 1); return s9_read(m, s9_sp(m)); }
+fn s9_push_a(m: Int) -> Int ! {mem} {
+    if s9_mwide(m) == 1 { s9_push8(m, (s9_a(m) / 256) and 255); }
+    s9_push8(m, s9_a(m) and 255); return 0;
+}
+fn s9_pull_a(m: Int) -> Int ! {mem} {
+    let lo: Int = s9_pop8(m);
+    if s9_mwide(m) == 1 { let hi: Int = s9_pop8(m); s9_put_a(m, hi * 256 + lo); }
+    if s9_mwide(m) != 1 { s9_put_a(m, lo); }
+    s9_setzn(m, s9_a(m), s9_mwide(m)); return 0;
+}
+
+fn s9_mmask(m: Int) -> Int ! {mem} { if s9_mwide(m) == 1 { return 65535; } return 255; }
+fn s9_xmask(m: Int) -> Int ! {mem} { if s9_xwide(m) == 1 { return 65535; } return 255; }
+fn s9_store_w(m: Int, addr: Int, v: Int) -> Int ! {mem} {
+    s9_write(m, addr, v and 255);
+    if s9_mwide(m) == 1 { s9_write(m, addr + 1, (v / 256) and 255); }
+    return 0;
+}
+fn s9_xorw(a: Int, b: Int) -> Int {
+    return s9_xor(a and 255, b and 255) + s9_xor((a / 256) and 255, (b / 256) and 255) * 256;
+}
+fn s9_branch(m: Int, cond: Int) -> Int ! {mem} {
+    let off: Int = s9_fetch(m);
+    if cond == 1 { var d: Int = off; if off > 127 { d = off - 256; } s9_set_pc(m, (s9_pc(m) + d) and 65535); }
+    return 0;
+}
+fn s9_cmp_a(m: Int, val: Int) -> Int ! {mem} {
+    let a: Int = s9_a(m) and s9_mmask(m); let d: Int = a - val;
+    if a >= val { s9_setf(m, 0, 1); }
+    if a < val { s9_setf(m, 0, 0); }
+    s9_setzn(m, d and s9_mmask(m), s9_mwide(m)); return 0;
+}
+fn s9_cmp_x(m: Int, val: Int) -> Int ! {mem} {
+    let r: Int = s9_x(m) and s9_xmask(m); let d: Int = r - val;
+    if r >= val { s9_setf(m, 0, 1); }
+    if r < val { s9_setf(m, 0, 0); }
+    s9_setzn(m, d and s9_xmask(m), s9_xwide(m)); return 0;
+}
+fn s9_cmp_y(m: Int, val: Int) -> Int ! {mem} {
+    let r: Int = s9_y(m) and s9_xmask(m); let d: Int = r - val;
+    if r >= val { s9_setf(m, 0, 1); }
+    if r < val { s9_setf(m, 0, 0); }
+    s9_setzn(m, d and s9_xmask(m), s9_xwide(m)); return 0;
+}
+fn s9_logic(m: Int, kind: Int, val: Int) -> Int ! {mem} {     // 0 AND 1 ORA 2 EOR
+    let a: Int = s9_a(m) and s9_mmask(m);
+    var r: Int = a and val;
+    if kind == 1 { r = a or val; }
+    if kind == 2 { r = s9_xorw(a, val) and s9_mmask(m); }
+    s9_put_a(m, r); s9_setzn(m, r, s9_mwide(m)); return 0;
+}
+fn s9_inc_mem(m: Int, addr: Int, delta: Int) -> Int ! {mem} {
+    let v: Int = (s9_read_m(m, addr) + delta) and s9_mmask(m);
+    s9_store_w(m, addr, v); s9_setzn(m, v, s9_mwide(m)); return 0;
+}
+fn s9_sbc(m: Int, val: Int) -> Int ! {mem} {
+    let wide: Int = s9_mwide(m);
+    var mask: Int = 255; if wide == 1 { mask = 65535; }
+    let r: Int = (s9_a(m) and mask) - (val and mask) - (1 - s9_getf(m, 0));
+    if r >= 0 { s9_setf(m, 0, 1); }
+    if r < 0 { s9_setf(m, 0, 0); }                                    // C = no borrow
+    s9_put_a(m, r and mask); s9_setzn(m, r and mask, wide);
+    return 0;
+}
+// shift/rotate a value (width per M). kind: 0 ASL, 1 LSR, 2 ROL, 3 ROR. Sets C,Z,N.
+fn s9_shift(m: Int, kind: Int, val: Int) -> Int ! {mem} {
+    let wide: Int = s9_mwide(m);
+    var mask: Int = 255; var hib: Int = 128;
+    if wide == 1 { mask = 65535; hib = 32768; }
+    let v: Int = val and mask;
+    let cin: Int = s9_getf(m, 0);
+    var r: Int = 0;
+    if kind == 0 { s9_setf(m, 0, (v / hib) % 2); r = v * 2; }
+    if kind == 2 { s9_setf(m, 0, (v / hib) % 2); r = v * 2 + cin; }
+    if kind == 1 { s9_setf(m, 0, v and 1); r = v / 2; }
+    if kind == 3 { s9_setf(m, 0, v and 1); r = v / 2 + cin * hib; }
+    r = r and mask;
+    s9_setzn(m, r, wide);
+    return r;
+}
+fn s9_shift_a(m: Int, kind: Int) -> Int ! {mem} { s9_put_a(m, s9_shift(m, kind, s9_a(m))); return 0; }
+fn s9_shift_m(m: Int, kind: Int, addr: Int) -> Int ! {mem} { s9_store_w(m, addr, s9_shift(m, kind, s9_read_m(m, addr))); return 0; }
+// BIT: Z = (A & val)==0; non-immediate also sets N=hi bit, V=next bit of val.
+fn s9_bit(m: Int, val: Int, imm: Int) -> Int ! {mem} {
+    let wide: Int = s9_mwide(m);
+    var mask: Int = 255; var nb: Int = 128; var vb: Int = 64;
+    if wide == 1 { mask = 65535; nb = 32768; vb = 16384; }
+    let v: Int = val and mask;
+    if ((s9_a(m) and mask) and v) == 0 { s9_setf(m, 1, 1); }
+    if ((s9_a(m) and mask) and v) != 0 { s9_setf(m, 1, 0); }
+    if imm == 0 { s9_setf(m, 7, (v / nb) % 2); s9_setf(m, 6, (v / vb) % 2); }
+    return 0;
+}
+fn s9_push_x(m: Int, v: Int) -> Int ! {mem} { if s9_xwide(m) == 1 { s9_push8(m, (v / 256) and 255); } s9_push8(m, v and 255); return 0; }
+fn s9_pull_x(m: Int) -> Int ! {mem} {
+    let lo: Int = s9_pop8(m);
+    if s9_xwide(m) == 1 { let hi: Int = s9_pop8(m); return hi * 256 + lo; }
+    return lo;
+}
+
+// --- one instruction (foundation subset) ---
+fn s9_step(m: Int) -> Int ! {mem} {
+    let op: Int = s9_fetch(m);
+    if op == 24 { s9_setf(m, 0, 0); return 2; }                       // CLC
+    if op == 56 { s9_setf(m, 0, 1); return 2; }                       // SEC
+    if op == 251 {                                                 // XCE (swap C and E)
+        let c: Int = s9_getf(m, 0); let e: Int = peek8(s9_st(m), 28);
+        s9_setf(m, 0, e); poke8(s9_st(m), 28, c); return 2;
+    }
+    if op == 194 { s9_set_p(m, s9_p(m) and (255 - s9_fetch(m))); return 3; }   // REP #imm (clear bits)
+    if op == 226 { s9_set_p(m, s9_p(m) or s9_fetch(m)); return 3; }            // SEP #imm (set bits)
+    if op == 169 { s9_put_a(m, s9_imm_m(m)); s9_setzn(m, s9_a(m), s9_mwide(m)); return 2; }   // LDA #
+    if op == 162 { s9_set_x(m, s9_imm_x(m)); s9_setzn(m, s9_x(m), s9_xwide(m)); return 2; }   // LDX #
+    if op == 160 { s9_set_y(m, s9_imm_x(m)); s9_setzn(m, s9_y(m), s9_xwide(m)); return 2; }   // LDY #
+    if op == 105 { s9_adc(m, s9_imm_m(m)); return 2; }                // ADC #
+    if op == 170 { s9_set_x(m, s9_a(m)); s9_setzn(m, s9_x(m), s9_xwide(m)); return 2; }       // TAX
+    if op == 168 { s9_set_y(m, s9_a(m)); s9_setzn(m, s9_y(m), s9_xwide(m)); return 2; }       // TAY
+    if op == 138 { s9_put_a(m, s9_x(m)); s9_setzn(m, s9_a(m), s9_mwide(m)); return 2; }       // TXA
+    if op == 232 { s9_set_x(m, s9_x(m) + 1); s9_setzn(m, s9_x(m), s9_xwide(m)); return 2; }   // INX
+    if op == 200 { s9_set_y(m, s9_y(m) + 1); s9_setzn(m, s9_y(m), s9_xwide(m)); return 2; }   // INY
+    if op == 202 { s9_set_x(m, s9_x(m) - 1); s9_setzn(m, s9_x(m), s9_xwide(m)); return 2; }   // DEX
+    // LDA mem (width-aware)
+    if op == 165 { s9_put_a(m, s9_read_m(m, s9_dp(m)));   s9_setzn(m, s9_a(m), s9_mwide(m)); return 3; }   // LDA dp
+    if op == 173 { s9_put_a(m, s9_read_m(m, s9_abs(m)));  s9_setzn(m, s9_a(m), s9_mwide(m)); return 4; }   // LDA abs
+    if op == 175 { s9_put_a(m, s9_read_m(m, s9_absl(m))); s9_setzn(m, s9_a(m), s9_mwide(m)); return 5; }   // LDA long
+    if op == 181 { s9_put_a(m, s9_read_m(m, s9_dpx(m)));  s9_setzn(m, s9_a(m), s9_mwide(m)); return 4; }   // LDA dp,X
+    if op == 189 { s9_put_a(m, s9_read_m(m, s9_absx(m))); s9_setzn(m, s9_a(m), s9_mwide(m)); return 4; }   // LDA abs,X
+    if op == 185 { s9_put_a(m, s9_read_m(m, s9_absy(m))); s9_setzn(m, s9_a(m), s9_mwide(m)); return 4; }   // LDA abs,Y
+    // STA mem
+    if op == 133 { s9_store_a(m, s9_dp(m));   return 3; }             // STA dp
+    if op == 141 { s9_store_a(m, s9_abs(m));  return 4; }             // STA abs
+    if op == 143 { s9_store_a(m, s9_absl(m)); return 5; }             // STA long
+    if op == 149 { s9_store_a(m, s9_dpx(m));  return 4; }             // STA dp,X
+    if op == 157 { s9_store_a(m, s9_absx(m)); return 5; }             // STA abs,X
+    if op == 153 { s9_store_a(m, s9_absy(m)); return 5; }             // STA abs,Y
+    // ADC mem
+    if op == 101 { s9_adc(m, s9_read_m(m, s9_dp(m)));  return 3; }       // ADC dp
+    if op == 109 { s9_adc(m, s9_read_m(m, s9_abs(m))); return 4; }       // ADC abs
+    // LDX / LDY mem (width-aware)
+    if op == 166 { s9_set_x(m, s9_read_x(m, s9_dp(m)));  s9_setzn(m, s9_x(m), s9_xwide(m)); return 3; }   // LDX dp
+    if op == 174 { s9_set_x(m, s9_read_x(m, s9_abs(m))); s9_setzn(m, s9_x(m), s9_xwide(m)); return 4; }   // LDX abs
+    if op == 164 { s9_set_y(m, s9_read_x(m, s9_dp(m)));  s9_setzn(m, s9_y(m), s9_xwide(m)); return 3; }   // LDY dp
+    if op == 172 { s9_set_y(m, s9_read_x(m, s9_abs(m))); s9_setzn(m, s9_y(m), s9_xwide(m)); return 4; }   // LDY abs
+    // STX / STY mem
+    if op == 134 { s9_store_idx(m, s9_dp(m),  s9_x(m)); return 3; }    // STX dp
+    if op == 142 { s9_store_idx(m, s9_abs(m), s9_x(m)); return 4; }    // STX abs
+    if op == 132 { s9_store_idx(m, s9_dp(m),  s9_y(m)); return 3; }    // STY dp
+    if op == 140 { s9_store_idx(m, s9_abs(m), s9_y(m)); return 4; }    // STY abs
+    // STZ
+    if op == 100 { s9_store_z(m, s9_dp(m));  return 3; }              // STZ dp
+    if op == 156 { s9_store_z(m, s9_abs(m)); return 4; }              // STZ abs
+    // stack
+    if op == 72 { s9_push_a(m); return 3; }                        // PHA
+    if op == 104 { s9_pull_a(m); return 4; }                       // PLA
+    // JSR / RTS (16-bit return in bank 0)
+    if op == 32 { let t: Int = s9_fetch16(m); let r: Int = (s9_pc(m) - 1) and 65535;
+        s9_push8(m, (r / 256) and 255); s9_push8(m, r and 255); s9_set_pc(m, t); return 6; }
+    if op == 96 { let lo: Int = s9_pop8(m); let hi: Int = s9_pop8(m); s9_set_pc(m, ((hi * 256 + lo) + 1) and 65535); return 6; }
+    if op == 76 { s9_set_pc(m, s9_fetch16(m)); return 3; }            // JMP abs
+    // branches (rel8)
+    if op == 128 { s9_branch(m, 1); return 3; }                      // BRA
+    if op == 240 { s9_branch(m, s9_getf(m, 1)); return 2; }             // BEQ
+    if op == 208 { s9_branch(m, 1 - s9_getf(m, 1)); return 2; }         // BNE
+    if op == 176 { s9_branch(m, s9_getf(m, 0)); return 2; }             // BCS
+    if op == 144 { s9_branch(m, 1 - s9_getf(m, 0)); return 2; }         // BCC
+    if op == 48 { s9_branch(m, s9_getf(m, 7)); return 2; }              // BMI
+    if op == 16 { s9_branch(m, 1 - s9_getf(m, 7)); return 2; }          // BPL
+    if op == 112 { s9_branch(m, s9_getf(m, 6)); return 2; }             // BVS
+    if op == 80 { s9_branch(m, 1 - s9_getf(m, 6)); return 2; }          // BVC
+    // CMP / CPX / CPY
+    if op == 201 { s9_cmp_a(m, s9_imm_m(m)); return 2; }              // CMP #
+    if op == 197 { s9_cmp_a(m, s9_read_m(m, s9_dp(m))); return 3; }      // CMP dp
+    if op == 205 { s9_cmp_a(m, s9_read_m(m, s9_abs(m))); return 4; }     // CMP abs
+    if op == 224 { s9_cmp_x(m, s9_imm_x(m)); return 2; }              // CPX #
+    if op == 192 { s9_cmp_y(m, s9_imm_x(m)); return 2; }              // CPY #
+    // AND / ORA / EOR
+    if op == 41 { s9_logic(m, 0, s9_imm_m(m)); return 2; }            // AND #
+    if op == 45 { s9_logic(m, 0, s9_read_m(m, s9_abs(m))); return 4; }   // AND abs
+    if op == 9 { s9_logic(m, 1, s9_imm_m(m)); return 2; }             // ORA #
+    if op == 13 { s9_logic(m, 1, s9_read_m(m, s9_abs(m))); return 4; }   // ORA abs
+    if op == 73 { s9_logic(m, 2, s9_imm_m(m)); return 2; }            // EOR #
+    // INC / DEC (A + memory)
+    if op == 26 { s9_put_a(m, (s9_a(m) + 1) and s9_mmask(m)); s9_setzn(m, s9_a(m), s9_mwide(m)); return 2; }   // INC A
+    if op == 58 { s9_put_a(m, (s9_a(m) - 1) and s9_mmask(m)); s9_setzn(m, s9_a(m), s9_mwide(m)); return 2; }   // DEC A
+    if op == 230 { s9_inc_mem(m, s9_dp(m), 1); return 5; }            // INC dp
+    if op == 198 { s9_inc_mem(m, s9_dp(m), 0 - 1); return 5; }        // DEC dp
+    if op == 238 { s9_inc_mem(m, s9_abs(m), 1); return 6; }           // INC abs
+    if op == 206 { s9_inc_mem(m, s9_abs(m), 0 - 1); return 6; }       // DEC abs
+    if op == 136 { s9_set_y(m, s9_y(m) - 1); s9_setzn(m, s9_y(m), s9_xwide(m)); return 2; }   // DEY
+    // transfers + stack regs
+    if op == 154 { s9_set_sp(m, s9_x(m)); return 2; }                 // TXS
+    if op == 186 { s9_set_x(m, s9_sp(m)); s9_setzn(m, s9_x(m), s9_xwide(m)); return 2; }      // TSX
+    // flag ops
+    if op == 120 { s9_setf(m, 2, 1); return 2; }                     // SEI
+    if op == 88 { s9_setf(m, 2, 0); return 2; }                      // CLI
+    if op == 248 { s9_setf(m, 3, 1); return 2; }                     // SED
+    if op == 216 { s9_setf(m, 3, 0); return 2; }                     // CLD
+    if op == 184 { s9_setf(m, 6, 0); return 2; }                     // CLV
+    // SBC
+    if op == 233 { s9_sbc(m, s9_imm_m(m)); return 2; }                // SBC #
+    if op == 229 { s9_sbc(m, s9_read_m(m, s9_dp(m)));   return 3; }      // SBC dp
+    if op == 237 { s9_sbc(m, s9_read_m(m, s9_abs(m)));  return 4; }      // SBC abs
+    if op == 253 { s9_sbc(m, s9_read_m(m, s9_absx(m))); return 4; }      // SBC abs,X
+    if op == 249 { s9_sbc(m, s9_read_m(m, s9_absy(m))); return 4; }      // SBC abs,Y
+    // shifts/rotates on A
+    if op == 10 { s9_shift_a(m, 0); return 2; }                      // ASL A
+    if op == 74 { s9_shift_a(m, 1); return 2; }                      // LSR A
+    if op == 42 { s9_shift_a(m, 2); return 2; }                      // ROL A
+    if op == 106 { s9_shift_a(m, 3); return 2; }                     // ROR A
+    // shifts/rotates on memory (dp/abs)
+    if op == 6 { s9_shift_m(m, 0, s9_dp(m));   return 5; }            // ASL dp
+    if op == 14 { s9_shift_m(m, 0, s9_abs(m)); return 6; }            // ASL abs
+    if op == 70 { s9_shift_m(m, 1, s9_dp(m));   return 5; }           // LSR dp
+    if op == 78 { s9_shift_m(m, 1, s9_abs(m)); return 6; }            // LSR abs
+    if op == 38 { s9_shift_m(m, 2, s9_dp(m));   return 5; }           // ROL dp
+    if op == 46 { s9_shift_m(m, 2, s9_abs(m)); return 6; }            // ROL abs
+    if op == 102 { s9_shift_m(m, 3, s9_dp(m));   return 5; }          // ROR dp
+    if op == 110 { s9_shift_m(m, 3, s9_abs(m)); return 6; }           // ROR abs
+    // BIT
+    if op == 137 { s9_bit(m, s9_imm_m(m), 1); return 2; }            // BIT #
+    if op == 36 { s9_bit(m, s9_read_m(m, s9_dp(m)), 0);  return 3; }    // BIT dp
+    if op == 44 { s9_bit(m, s9_read_m(m, s9_abs(m)), 0); return 4; }    // BIT abs
+    // stack: P and index regs
+    if op == 8 { s9_push8(m, s9_p(m)); return 3; }                    // PHP
+    if op == 40 { s9_set_p(m, s9_pop8(m)); return 4; }                // PLP
+    if op == 218 { s9_push_x(m, s9_x(m)); return 3; }                 // PHX
+    if op == 250 { s9_set_x(m, s9_pull_x(m)); s9_setzn(m, s9_x(m), s9_xwide(m)); return 4; }   // PLX
+    if op == 90 { s9_push_x(m, s9_y(m)); return 3; }                  // PHY
+    if op == 122 { s9_set_y(m, s9_pull_x(m)); s9_setzn(m, s9_y(m), s9_xwide(m)); return 4; }   // PLY
+    if op == 152 { s9_put_a(m, s9_y(m)); s9_setzn(m, s9_a(m), s9_mwide(m)); return 2; }        // TYA
+    // direct-page indirect: LDA/STA/ADC/SBC/CMP/AND/ORA/EOR  (dp,X)/(dp),Y/(dp)
+    if op == 161 { s9_put_a(m, s9_read_m(m, s9_idpx(m))); s9_setzn(m, s9_a(m), s9_mwide(m)); return 6; }  // LDA (dp,X)
+    if op == 177 { s9_put_a(m, s9_read_m(m, s9_idpy(m))); s9_setzn(m, s9_a(m), s9_mwide(m)); return 5; }  // LDA (dp),Y
+    if op == 178 { s9_put_a(m, s9_read_m(m, s9_idp(m)));  s9_setzn(m, s9_a(m), s9_mwide(m)); return 5; }  // LDA (dp)
+    if op == 129 { s9_store_a(m, s9_idpx(m)); return 6; }            // STA (dp,X)
+    if op == 145 { s9_store_a(m, s9_idpy(m)); return 6; }            // STA (dp),Y
+    if op == 146 { s9_store_a(m, s9_idp(m));  return 5; }            // STA (dp)
+    if op == 97 { s9_adc(m, s9_read_m(m, s9_idpx(m))); return 6; }      // ADC (dp,X)
+    if op == 113 { s9_adc(m, s9_read_m(m, s9_idpy(m))); return 5; }     // ADC (dp),Y
+    if op == 114 { s9_adc(m, s9_read_m(m, s9_idp(m)));  return 5; }     // ADC (dp)
+    if op == 225 { s9_sbc(m, s9_read_m(m, s9_idpx(m))); return 6; }     // SBC (dp,X)
+    if op == 241 { s9_sbc(m, s9_read_m(m, s9_idpy(m))); return 5; }     // SBC (dp),Y
+    if op == 242 { s9_sbc(m, s9_read_m(m, s9_idp(m)));  return 5; }     // SBC (dp)
+    if op == 193 { s9_cmp_a(m, s9_read_m(m, s9_idpx(m))); return 6; }   // CMP (dp,X)
+    if op == 209 { s9_cmp_a(m, s9_read_m(m, s9_idpy(m))); return 5; }   // CMP (dp),Y
+    if op == 210 { s9_cmp_a(m, s9_read_m(m, s9_idp(m)));  return 5; }   // CMP (dp)
+    if op == 33 { s9_logic(m, 0, s9_read_m(m, s9_idpx(m))); return 6; } // AND (dp,X)
+    if op == 49 { s9_logic(m, 0, s9_read_m(m, s9_idpy(m))); return 5; } // AND (dp),Y
+    if op == 50 { s9_logic(m, 0, s9_read_m(m, s9_idp(m)));  return 5; } // AND (dp)
+    if op == 1 { s9_logic(m, 1, s9_read_m(m, s9_idpx(m))); return 6; }  // ORA (dp,X)
+    if op == 17 { s9_logic(m, 1, s9_read_m(m, s9_idpy(m))); return 5; } // ORA (dp),Y
+    if op == 18 { s9_logic(m, 1, s9_read_m(m, s9_idp(m)));  return 5; } // ORA (dp)
+    if op == 65 { s9_logic(m, 2, s9_read_m(m, s9_idpx(m))); return 6; } // EOR (dp,X)
+    if op == 81 { s9_logic(m, 2, s9_read_m(m, s9_idpy(m))); return 5; } // EOR (dp),Y
+    if op == 82 { s9_logic(m, 2, s9_read_m(m, s9_idp(m)));  return 5; } // EOR (dp)
+    // long indirect [dp] / [dp],Y for LDA/STA
+    if op == 167 { s9_put_a(m, s9_read_m(m, s9_ildp(m)));  s9_setzn(m, s9_a(m), s9_mwide(m)); return 6; }  // LDA [dp]
+    if op == 183 { s9_put_a(m, s9_read_m(m, s9_ildpy(m))); s9_setzn(m, s9_a(m), s9_mwide(m)); return 6; }  // LDA [dp],Y
+    if op == 135 { s9_store_a(m, s9_ildp(m));  return 6; }           // STA [dp]
+    if op == 151 { s9_store_a(m, s9_ildpy(m)); return 6; }           // STA [dp],Y
+    // JSL / RTL (24-bit subroutine, used to call across banks)
+    if op == 34 {                                                // JSL abslong
+        let t: Int = s9_fetch16(m); let bank: Int = s9_fetch(m);
+        let r: Int = (s9_pc(m) - 1) and 65535;
+        s9_push8(m, s9_pbr(m)); s9_push8(m, (r / 256) and 255); s9_push8(m, r and 255);
+        poke8(s9_st(m), 36, bank); s9_set_pc(m, t); return 8;
+    }
+    if op == 107 {                                               // RTL
+        let lo: Int = s9_pop8(m); let hi: Int = s9_pop8(m); let bk: Int = s9_pop8(m);
+        s9_set_pc(m, ((hi * 256 + lo) + 1) and 65535); poke8(s9_st(m), 36, bk); return 6;
+    }
+    if op == 64 {                                                // RTI
+        s9_set_p(m, s9_pop8(m));
+        let rl: Int = s9_pop8(m); let rh: Int = s9_pop8(m);
+        s9_set_pc(m, rh * 256 + rl);
+        if peek8(s9_st(m), 28) == 0 { poke8(s9_st(m), 36, s9_pop8(m)); }   // native: pull PBR
+        return 6;
+    }
+    if op == 203 { return 3; }                                   // WAI (no-op in this timing model)
+    if op == 219 { return 3; }                                   // STP (treated as no-op)
+    // NOP / not-yet-implemented
+    return 2;
+}
+
+// --- core ABI (CPU foundation; PPU/APU/DMA/mappers next) ---
+fn core_id() -> Int { return 65816; }
+fn core_rom_max() -> Int { return 1048576; }     // 1 MB (EL0-window cap; larger ROMs need a bigger window)
+fn core_fb(m: Int) -> Int { return s9_fb(m); }
+fn core_fb_w() -> Int { return 256; }
+fn core_fb_h() -> Int { return 224; }
+
+fn core_load(m: Int, rom: Int, len: Int) -> Int ! {mem} {
+    var hdr: Int = 0;
+    if (len % 1024) == 512 { hdr = 512; }         // skip SMC copier header if present
+    let n: Int = len - hdr;
+    var i: Int = 0;
+    while i < n invariant i >= 0 { poke8(s9_rom(m), i, peek8(rom, i + hdr)); i = i + 1; }
+    var s: Int = 0;                               // clear CPU state + scratch + PPU/DMA register shadow
+    while s < 1024 invariant s >= 0 { poke8(s9_st(m), s, 0); s = s + 1; }
+    var k: Int = 0;                               // park all 128 sprites off-screen (Y=240)
+    while k < 128 invariant k >= 0 { poke8(s9_oam(m), k * 4 + 1, 240); k = k + 1; }
+    sp_reset(m);                                   // bring up the SPC700 (APU CPU)
+    poke8(sp_st(m), 20, 170);                       // SPC out port 0 = $AA  } IPL "ready" signal real
+    poke8(sp_st(m), 21, 187);                       // SPC out port 1 = $BB  } ROMs wait on at $2140/1.
+    s9_set_p(m, 52);                                 // M=1,X=1 (8-bit) on reset; I set
+    poke8(s9_st(m), 28, 1);                         // E=1 (emulation) on reset
+    s9_set_sp(m, 511);
+    let lo: Int = peek8(s9_rom(m), 32764);         // LoROM reset vector @ ROM $7FFC
+    let hi: Int = peek8(s9_rom(m), 32765);
+    s9_set_pc(m, hi * 256 + lo);                      // PBR=0 (cleared above)
+    return 1;
+}
+// Multi-port input ABI (sigil-Retropie#4). SNES has 2 controller ports (P1 @ ST@40,
+// P2 @ ST@44); auto-joypad read wiring for P2 is a follow-up.
+fn core_set_input_port(m: Int, port: Int, buttons: Int) -> Int ! {mem} {
+    if port == 0 { poke32(s9_st(m), 40, buttons); }
+    if port == 1 { poke32(s9_st(m), 44, buttons); }
+    return 0;
+}
+fn core_set_input(m: Int, buttons: Int) -> Int ! {mem} { return core_set_input_port(m, 0, buttons); }
+fn core_max_players() -> Int { return 2; }
+
+// --- PPU: BG1 tilemap render (Mode 0/1, 4bpp, 32x32 map, no scroll) ---
+// CGRAM holds 256 BGR555 colors; convert one to ARGB (low byte R, alpha=0xFF).
+fn s9_bgr(c: Int) -> Int {
+    let r: Int = (c and 31) * 8;
+    let g: Int = ((c / 32) and 31) * 8;
+    let b: Int = ((c / 1024) and 31) * 8;
+    return r + g * 256 + b * 65536 + 4278190080;
+}
+fn s9_cgcolor(m: Int, idx: Int) -> Int ! {mem} {
+    let i: Int = (idx and 255) * 2;
+    return peek8(s9_cgram(m), i) + peek8(s9_cgram(m), i + 1) * 256;
+}
+// draw one 8px row clipped to the screen: `rowbase` = (dsty)*256 (row start pixel),
+// `dstx` = leftmost dest x (may be <0 or near 256). 4bpp; halving divisor; color 0
+// -> backdrop. Only pixels with 0<=dx<256 are written (edge tiles when scrolling).
+fn s9_bg_row_clip(m: Int, rowbase: Int, dstx: Int, a: Int, palb: Int) -> Int ! {mem} {
+    let p0: Int = peek8(s9_vram(m), a);      let p1: Int = peek8(s9_vram(m), a + 1);
+    let p2: Int = peek8(s9_vram(m), a + 16); let p3: Int = peek8(s9_vram(m), a + 17);
+    var d: Int = 128;
+    var col: Int = 0;
+    while col < 8 invariant col >= 0 {
+        let dx: Int = dstx + col;
+        if dx >= 0 { if dx < 256 {
+            let v: Int = ((p0 / d) and 1) + ((p1 / d) and 1) * 2 + ((p2 / d) and 1) * 4 + ((p3 / d) and 1) * 8;
+            if v != 0 { poke32(s9_fb(m), (rowbase + dx) * 4, s9_bgr(s9_cgcolor(m, palb + v))); }  // color 0 transparent
+        } }
+        d = d / 2; col = col + 1;
+    }
+    return 0;
+}
+// draw one 8x8 BG tile at dest (dstx,dsty), clipped to the 256x224 screen. Color 0
+// is transparent (the lower layer / backdrop shows through) — required for layering.
+fn s9_bg_tile_clip(m: Int, dstx: Int, dsty: Int, ent: Int, charbyte: Int) -> Int ! {mem} {
+    let entry: Int = peek8(s9_vram(m), ent) + peek8(s9_vram(m), ent + 1) * 256;
+    let palb: Int = ((entry / 1024) and 7) * 16;
+    let base: Int = charbyte + (entry and 1023) * 32;
+    var row: Int = 0;
+    while row < 8 invariant row >= 0 {
+        let py: Int = dsty + row;
+        if py >= 0 { if py < 224 { s9_bg_row_clip(m, py * 256, dstx, base + row * 2, palb); } }
+        row = row + 1;
+    }
+    return 0;
+}
+// Generic scroll-aware BG layer render (used by BG1 and BG2). 8-bit offset wraps in
+// the 32x32 = 256px map; coarse = /8 (tile), fine = %8; 33x29 tiles, edge-clipped.
+fn s9_render_bg(m: Int, tmbyte: Int, charbyte: Int, cx: Int, fx: Int, cy: Int, fy: Int) -> Int ! {mem} {
+    var ty: Int = 0;
+    while ty < 29 invariant ty >= 0 {
+        let sty: Int = (cy + ty) and 31;
+        var tx: Int = 0;
+        while tx < 33 invariant tx >= 0 {
+            let stx: Int = (cx + tx) and 31;
+            s9_bg_tile_clip(m, tx * 8 - fx, ty * 8 - fy, tmbyte + (sty * 32 + stx) * 2, charbyte);
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    return 0;
+}
+fn s9_render_bg1(m: Int) -> Int ! {mem} {                                                // BG1SC $2107, BG12NBA lo, $210D/E
+    s9_render_bg(m, (((peek8(s9_ppureg(m), 7) / 4) and 63) * 1024) * 2,
+                 ((peek8(s9_ppureg(m), 11) and 15) * 4096) * 2,
+                 peek8(s9_ppureg(m), 13) / 8, peek8(s9_ppureg(m), 13) and 7,
+                 peek8(s9_ppureg(m), 14) / 8, peek8(s9_ppureg(m), 14) and 7);
+    return 0;
+}
+fn s9_render_bg2(m: Int) -> Int ! {mem} {                                                // BG2SC $2108, BG12NBA hi, $210F/10
+    s9_render_bg(m, (((peek8(s9_ppureg(m), 8) / 4) and 63) * 1024) * 2,
+                 (((peek8(s9_ppureg(m), 11) / 16) and 15) * 4096) * 2,
+                 peek8(s9_ppureg(m), 15) / 8, peek8(s9_ppureg(m), 15) and 7,
+                 peek8(s9_ppureg(m), 16) / 8, peek8(s9_ppureg(m), 16) and 7);
+    return 0;
+}
+// BG3 is 2bpp (4 colors/tile, 16-byte tiles, palette = pal*4). Color 0 transparent.
+fn s9_bg3_row_clip(m: Int, rowbase: Int, dstx: Int, a: Int, palb: Int) -> Int ! {mem} {
+    let p0: Int = peek8(s9_vram(m), a); let p1: Int = peek8(s9_vram(m), a + 1);
+    var d: Int = 128;
+    var col: Int = 0;
+    while col < 8 invariant col >= 0 {
+        let dx: Int = dstx + col;
+        if dx >= 0 { if dx < 256 {
+            let v: Int = ((p0 / d) and 1) + ((p1 / d) and 1) * 2;
+            if v != 0 { poke32(s9_fb(m), (rowbase + dx) * 4, s9_bgr(s9_cgcolor(m, palb + v))); }
+        } }
+        d = d / 2; col = col + 1;
+    }
+    return 0;
+}
+fn s9_bg3_tile_clip(m: Int, dstx: Int, dsty: Int, ent: Int, charbyte: Int) -> Int ! {mem} {
+    let entry: Int = peek8(s9_vram(m), ent) + peek8(s9_vram(m), ent + 1) * 256;
+    let palb: Int = ((entry / 1024) and 7) * 4;                            // 2bpp: 4 colors/palette
+    let base: Int = charbyte + (entry and 1023) * 16;                      // 2bpp tile = 16 bytes
+    var row: Int = 0;
+    while row < 8 invariant row >= 0 {
+        let py: Int = dsty + row;
+        if py >= 0 { if py < 224 { s9_bg3_row_clip(m, py * 256, dstx, base + row * 2, palb); } }
+        row = row + 1;
+    }
+    return 0;
+}
+fn s9_render_bg3(m: Int) -> Int ! {mem} {                                                // BG3SC $2109, BG34NBA lo, $2111/12
+    let tmbyte: Int = (((peek8(s9_ppureg(m), 9) / 4) and 63) * 1024) * 2;
+    let charbyte: Int = ((peek8(s9_ppureg(m), 12) and 15) * 4096) * 2;
+    let cx: Int = peek8(s9_ppureg(m), 17) / 8; let fx: Int = peek8(s9_ppureg(m), 17) and 7;
+    let cy: Int = peek8(s9_ppureg(m), 18) / 8; let fy: Int = peek8(s9_ppureg(m), 18) and 7;
+    var ty: Int = 0;
+    while ty < 29 invariant ty >= 0 {
+        let sty: Int = (cy + ty) and 31;
+        var tx: Int = 0;
+        while tx < 33 invariant tx >= 0 {
+            s9_bg3_tile_clip(m, tx * 8 - fx, ty * 8 - fy, tmbyte + ((cx + tx) and 31) * 2 + sty * 64, charbyte);
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    return 0;
+}
+// --- PPU: OBJ (sprites), 8x8 4bpp, transparency + H/V flip ---
+// One sprite row: fbofs = (py+row)*256+px; sprite palette base palb = 128+pal*16;
+// color 0 is transparent (skipped). hflip mirrors columns.
+fn s9_obj_row(m: Int, fbofs: Int, a: Int, palb: Int, hflip: Int) -> Int ! {mem} {
+    let p0: Int = peek8(s9_vram(m), a);      let p1: Int = peek8(s9_vram(m), a + 1);
+    let p2: Int = peek8(s9_vram(m), a + 16); let p3: Int = peek8(s9_vram(m), a + 17);
+    var d: Int = 128;
+    var col: Int = 0;
+    while col < 8 invariant col >= 0 {
+        let v: Int = ((p0 / d) and 1) + ((p1 / d) and 1) * 2 + ((p2 / d) and 1) * 4 + ((p3 / d) and 1) * 8;
+        if v != 0 {
+            var dx: Int = col;
+            if hflip == 1 { dx = 7 - col; }
+            poke32(s9_fb(m), (fbofs + dx) * 4, s9_bgr(s9_cgcolor(m, palb + v)));
+        }
+        d = d / 2; col = col + 1;
+    }
+    return 0;
+}
+fn s9_obj_tile(m: Int, px: Int, py: Int, base: Int, pal: Int, attr: Int) -> Int ! {mem} {
+    let palb: Int = 128 + pal * 16;
+    let hflip: Int = (attr / 64) and 1;
+    let vflip: Int = (attr / 128) and 1;
+    var row: Int = 0;
+    while row < 8 invariant row >= 0 {
+        var srow: Int = row;
+        if vflip == 1 { srow = 7 - row; }
+        s9_obj_row(m, (py + row) * 256 + px, base + srow * 2, palb, hflip);
+        row = row + 1;
+    }
+    return 0;
+}
+// Walk the 128 OAM entries (4 bytes) + the high table (OAM 512+, 2 bits/sprite:
+// X-high + size). Small = 8x8 (one tile); large = 16x16 (a 2x2 tile grid: t, t+1,
+// t+16, t+17). OBSEL $2101 low 3 bits select the sprite char base (8K-word units).
+fn s9_render_obj(m: Int) -> Int ! {mem} {
+    let cbase: Int = ((peek8(s9_ppureg(m), 1) and 7) * 8192) * 2;
+    var s: Int = 0;
+    while s < 128 invariant s >= 0 {
+        let o: Int = s * 4;
+        let sx: Int = peek8(s9_oam(m), o);
+        let sy: Int = peek8(s9_oam(m), o + 1);
+        let attr: Int = peek8(s9_oam(m), o + 3);
+        let pal: Int = (attr / 2) and 7;
+        let tile: Int = peek8(s9_oam(m), o + 2);
+        let big: Int = (peek8(s9_oam(m), 512 + s / 4) / s9_pow2((s and 3) * 2) / 2) and 1;
+        if big == 0 {
+            if sx <= 248 { if sy <= 216 { s9_obj_tile(m, sx, sy, cbase + tile * 32, pal, attr); } }
+        }
+        if big != 0 {
+            if sx <= 240 { if sy <= 208 {
+                s9_obj_tile(m, sx,     sy,     cbase + tile * 32,                    pal, attr);
+                s9_obj_tile(m, sx + 8, sy,     cbase + ((tile + 1) and 255) * 32,    pal, attr);
+                s9_obj_tile(m, sx,     sy + 8, cbase + ((tile + 16) and 255) * 32,   pal, attr);
+                s9_obj_tile(m, sx + 8, sy + 8, cbase + ((tile + 17) and 255) * 32,   pal, attr);
+            } }
+        }
+        s = s + 1;
+    }
+    return 0;
+}
+fn s9_clear(m: Int, color: Int) -> Int ! {mem} {
+    var p: Int = 0;
+    while p < 57344 invariant p >= 0 { poke32(s9_fb(m), p * 4, color); p = p + 1; }   // 256x224
+    return 0;
+}
+// Auto-joypad read: convert a normalized button mask (1U 2D 4L 8R 16A 32B 64Start
+// 128Select) to the SNES 16-bit pad layout (B15 Y14 Sel13 Sta12 U11 D10 L9 R8 A7
+// X6 L5 R4). X/Y/L/R aren't in the normalized mask, so they stay 0.
+fn s9_joy16(m: Int) -> Int {
+    return (m / 32 % 2) * 32768 + (m / 128 % 2) * 8192 + (m / 64 % 2) * 4096
+         + (m % 2) * 2048 + (m / 2 % 2) * 1024 + (m / 4 % 2) * 512 + (m / 8 % 2) * 256
+         + (m / 16 % 2) * 128;
+}
+fn s9_autojoy(m: Int) -> Int ! {mem} {
+    let p1: Int = s9_joy16(peek32(s9_st(m), 40));
+    let p2: Int = s9_joy16(peek32(s9_st(m), 44));
+    poke8(s9_dmareg(m), 24, p1 and 255); poke8(s9_dmareg(m), 25, (p1 / 256) and 255);  // $4218/$4219
+    poke8(s9_dmareg(m), 26, p2 and 255); poke8(s9_dmareg(m), 27, (p2 / 256) and 255);  // $421A/$421B
+    return 0;
+}
+// Vblank NMI: push state, jump to the NMI vector ($FFEA native / $FFFA emulation).
+fn s9_nmi(m: Int) -> Int ! {mem} {
+    let emu: Int = peek8(s9_st(m), 28);
+    if emu == 0 { s9_push8(m, s9_pbr(m)); }                           // native: push PBR
+    let pc: Int = s9_pc(m);
+    s9_push8(m, (pc / 256) and 255); s9_push8(m, pc and 255);
+    s9_push8(m, s9_p(m));
+    s9_setf(m, 2, 1);                                                // I = 1
+    poke8(s9_st(m), 36, 0);                                        // PBR = 0 for the vector
+    if emu == 0 { s9_set_pc(m, s9_read(m, 65514) + s9_read(m, 65515) * 256); }   // native $FFEA
+    if emu != 0 { s9_set_pc(m, s9_read(m, 65530) + s9_read(m, 65531) * 256); }   // emu  $FFFA
+    return 0;
+}
+// --- PPU: Mode 7 (affine rotation/scaling) ---
+// M7A-D 16-bit signed 1.7.8 @ ST 60/62/64/66; M7X/Y 13-bit signed @ ST 68/70.
+fn s9_m7s16(m: Int, slot: Int) -> Int ! {mem} {
+    let v: Int = peek8(s9_st(m), slot) + peek8(s9_st(m), slot + 1) * 256;
+    if v >= 32768 { return v - 65536; }
+    return v;
+}
+fn s9_m7s13(m: Int, slot: Int) -> Int ! {mem} {
+    let v: Int = (peek8(s9_st(m), slot) + peek8(s9_st(m), slot + 1) * 256) and 8191;
+    if v >= 4096 { return v - 8192; }
+    return v;
+}
+// One screen row: Mode-7 VRAM is interleaved — tilemap = low byte of word (128x128),
+// gfx = high byte (256 tiles, 8x8 8bpp). Field wraps at 1024px (and 1023).
+fn s9_m7_row(m: Int, sy: Int, a: Int, b: Int, c: Int, d: Int, cx: Int, cy: Int) -> Int ! {mem} {
+    var sx: Int = 0;
+    while sx < 256 invariant sx >= 0 {
+        let ox: Int = sx - cx;
+        let oy: Int = sy - cy;
+        let fx: Int = ((a * ox + b * oy) / 256 + cx) and 1023;
+        let fy: Int = ((c * ox + d * oy) / 256 + cy) and 1023;
+        let tile: Int = peek8(s9_vram(m), ((fy / 8) * 128 + fx / 8) * 2);
+        let px: Int = peek8(s9_vram(m), (tile * 64 + (fy and 7) * 8 + (fx and 7)) * 2 + 1);
+        poke32(s9_fb(m), (sy * 256 + sx) * 4, s9_bgr(s9_cgcolor(m, px)));
+        sx = sx + 1;
+    }
+    return 0;
+}
+fn s9_render_mode7(m: Int) -> Int ! {mem} {
+    var sy: Int = 0;
+    while sy < 224 invariant sy >= 0 {
+        s9_m7_row(m, sy, s9_m7s16(m, 60), s9_m7s16(m, 62), s9_m7s16(m, 64), s9_m7s16(m, 66), s9_m7s13(m, 68), s9_m7s13(m, 70));
+        sy = sy + 1;
+    }
+    return 0;
+}
+fn core_run_frame(m: Int) -> Int ! {mem} {
+    poke8(s9_dmareg(m), 18, 128);                                  // $4212 HVBJOY: vblank flag
+    poke8(s9_dmareg(m), 16, 130);                                  // $4210 RDNMI: bit7 + CPU ver 2
+    if (peek8(s9_dmareg(m), 0) and 1) == 1 { s9_autojoy(m); }       // $4200 bit0: auto-joypad read
+    if (peek8(s9_dmareg(m), 0) / 128) % 2 == 1 { s9_nmi(m); }       // $4200 NMITIMEN bit7 -> fire NMI
+    var i: Int = 0;
+    while i < 8000 invariant i >= 0 { s9_step(m); i = i + 1; }     // NMI handler + main-thread frame
+    var sa: Int = 0;
+    while sa < 2000 invariant sa >= 0 { sp_step(m); sa = sa + 1; } // SPC700 (~1/3.5 the 65816 clock)
+    poke8(s9_dmareg(m), 18, 0);                                    // vblank ends
+    if (peek8(s9_ppureg(m), 0) / 128) % 2 == 1 {                   // INIDISP $2100 bit7: forced blank
+        s9_clear(m, 4278190080); return 0;                          // black
+    }
+    s9_clear(m, s9_bgr(s9_cgcolor(m, 0)));                              // backdrop = CGRAM[0]
+    let tm: Int = peek8(s9_ppureg(m), 44);                         // $212C TM (main screen layer enable)
+    if (peek8(s9_ppureg(m), 5) and 7) == 7 {                       // BGMODE $2105 == 7: Mode 7
+        if (tm and 1) == 1 { s9_render_mode7(m); }                 // Mode 7 is BG1
+    }
+    if (peek8(s9_ppureg(m), 5) and 7) != 7 {
+        if (tm / 4 and 1) == 1 { s9_render_bg3(m); }               // bit2: BG3 2bpp (back)
+        if (tm / 2 and 1) == 1 { s9_render_bg2(m); }               // bit1: BG2 (behind)
+        if (tm and 1) == 1 { s9_render_bg1(m); }                   // bit0: BG1 (front)
+    }
+    if (tm / 16 and 1) == 1 { s9_render_obj(m); }                  // bit4: OBJ (front-most)
+    return 0;
+}
+
+// --- save state (cross-cutting runtime ABI) — includes the SPC700/S-DSP APU state ---
+// The full SNES machine: WRAM (128KB), CPU+PPU+DMA register shadows (s9_st 4KB), VRAM
+// (64KB), CGRAM, OAM, AND the APU — sp_ram (64KB), sp_st (regs+IO), sp_dsp (DSP regs),
+// sp_vst (voice state). ROM is constant; fb/pcm/mix are re-derived.
+fn s9_copy(m: Int, dst: Int, doff: Int, src: Int, soff: Int, len: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < len invariant i >= 0 { poke8(dst, doff + i, peek8(src, soff + i)); i = i + 1; }
+    return 0;
+}
+fn core_state_size() -> Int { return 268288; }
+fn core_save_state(m: Int, buf: Int) -> Int ! {mem} {
+    s9_copy(m, buf, 0, s9_mem(m), 0, 131072);
+    s9_copy(m, buf, 131072, s9_st(m), 0, 4096);
+    s9_copy(m, buf, 135168, s9_vram(m), 0, 65536);
+    s9_copy(m, buf, 200704, s9_cgram(m), 0, 512);
+    s9_copy(m, buf, 201216, s9_oam(m), 0, 1024);
+    s9_copy(m, buf, 202240, sp_ram(m), 0, 65536);
+    s9_copy(m, buf, 267776, sp_st(m), 0, 256);
+    s9_copy(m, buf, 268032, sp_dsp(m), 0, 128);
+    s9_copy(m, buf, 268160, sp_vst(m), 0, 128);
+    return core_state_size();
+}
+fn core_load_state(m: Int, buf: Int) -> Int ! {mem} {
+    s9_copy(m, s9_mem(m), 0, buf, 0, 131072);
+    s9_copy(m, s9_st(m), 0, buf, 131072, 4096);
+    s9_copy(m, s9_vram(m), 0, buf, 135168, 65536);
+    s9_copy(m, s9_cgram(m), 0, buf, 200704, 512);
+    s9_copy(m, s9_oam(m), 0, buf, 201216, 1024);
+    s9_copy(m, sp_ram(m), 0, buf, 202240, 65536);
+    s9_copy(m, sp_st(m), 0, buf, 267776, 256);
+    s9_copy(m, sp_dsp(m), 0, buf, 268032, 128);
+    s9_copy(m, sp_vst(m), 0, buf, 268160, 128);
+    return 0;
+}
+
+// New ABI wrappers (delegates to core_save_state/core_load_state/core_state_size above)
+fn core_savestate(m: Int, dst: Int) -> Int ! {mem} { return core_save_state(m, dst); }
+fn core_loadstate(m: Int, src: Int) -> Int ! {mem} { core_load_state(m, src); return 0; }
+fn core_savestate_size() -> Int { return 268288; }

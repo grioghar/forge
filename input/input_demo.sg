@@ -1,0 +1,52 @@
+// forge/input/input_demo.sg — proves the Forge input abstraction.
+//
+// ONE canonical pad drives TWO very different cores with zero per-game wiring:
+//   • CHIP-8   — a native-keypad core (pad -> hex keypad)
+//   • DOS/Doom — a keyboard-only game that never had controller support
+//                (pad -> synthesized BIOS scancodes injected into the key buffer)
+// Same pad, two bindings (each a CONTROLLER-relic ctrl_cfg block). Add a core or a
+// device by adding a binding/profile — never by touching game code.
+//
+// Build (arm64 macOS): forge/input/build-input-demo.sh
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+fn main() -> Int ! {mem, io.write} {
+    let pad: Int    = alloc_buf(16);
+    let c8cfg: Int  = alloc_buf(16);
+    let keypad: Int = alloc_buf(16);
+    let doscfg: Int = alloc_buf(16);
+    let keybuf: Int = alloc_buf(16);
+    bindc8_default(c8cfg);
+    bindd_doom(doscfg);
+
+    // The user presses W (up) and J (A) — the keyboard *device profile* maps
+    // those to the canonical pad. A USB gamepad's D-pad+button would set the
+    // same canonical buttons; nothing downstream changes.
+    pad_clear(pad);
+    pad_set(pad, kbd_btn(119), 1);   // 'w' -> canonical UP
+    pad_set(pad, kbd_btn(106), 1);   // 'j' -> canonical A
+
+    // Route the SAME pad to each core via its binding.
+    bindc8_apply(pad, keypad, c8cfg);                 // -> CHIP-8 keypad
+    let dn: Int = bindd_apply(pad, doscfg, keybuf, 16);   // -> DOS/Doom scancodes
+
+    var pass: Int = 0;
+    var tot: Int = 0;
+    tot = tot + 1; pass = chk(peek8(keypad, 2) == 1, pass);   // CHIP-8: UP -> key 2
+    tot = tot + 1; pass = chk(peek8(keypad, 5) == 1, pass);   // CHIP-8: A  -> key 5
+    tot = tot + 1; pass = chk(peek8(keypad, 0) == 0, pass);   // unrelated key stays clear
+    tot = tot + 1; pass = chk(dn == 2, pass);                 // two scancodes queued
+    tot = tot + 1; pass = chk(peek8(keybuf, 0) == 72, pass);  // DOS: UP -> 0x48 (forward)
+    tot = tot + 1; pass = chk(peek8(keybuf, 1) == 29, pass);  // DOS: A  -> 0x1D (fire)
+
+    print(1, "FORGE INPUT ABSTRACTION - one canonical pad, two cores, no game wiring\n\n");
+    print(1, "  press [W]=UP  [J]=A  (keyboard device profile -> canonical pad)\n\n");
+    print(1, "  -> CHIP-8 (native keypad):  key2="); print(1, chr(48 + peek8(keypad, 2)));
+    print(1, " key5="); print(1, chr(48 + peek8(keypad, 5))); print(1, "  (UP, A)\n");
+    print(1, "  -> DOOM   (keyboard-only):  0x48 forward + 0x1D fire injected -- game unmodified\n\n");
+    print(1, "  SELFTEST: "); print(1, chr(48 + pass % 10)); print(1, "/"); print(1, chr(48 + tot % 10));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

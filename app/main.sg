@@ -1,0 +1,133 @@
+// forge/app/main.sg — Forge desktop console app.
+// Runs natively on macOS (arm64 + x86_64), Linux (x86_64), and Windows (x86_64).
+// No Text function parameters — all strings are print() literals (cc0 native compat).
+// Link order:
+//   forge/pal_{macos,linux,windows}.sg  ->  forge/pal.sg  ->
+//   forge/app/catalog.sg  ->  forge/app/{dist_thin,dist_fat}.sg  ->  forge/app/main.sg
+//
+// Both distributions require sign-in at launch (@grio directive, WEB-PLATFORM.md §5). print_signin_gate
+// is a STUB today — forge/pal_{macos,linux,windows}.sg have zero host_tcp_*/http_* primitives (checked;
+// only print() and pal_host() have real behavior on hosted platforms), so there is no way to verify a
+// credential over the network yet. The gate prints the requirement and runs in a clearly-labeled STUB
+// MODE rather than silently pretending to authenticate. Swap this for a real check the moment cc0 ships
+// the host networking primitives already queued for SRDX's mac client (host_tcp_connect/host_tcp_send).
+
+fn nl(c: Int) -> Int ! {io.write} { print(c, chr(10)); return 0; }
+fn hr(c: Int) -> Int ! {io.write} {
+    print(c, "------------------------------------------------------------");
+    nl(c);
+    return 0;
+}
+
+fn banner(c: Int) -> Int ! {io.write} {
+    nl(c);
+    print(c, "  FORGE  -  Retro Gaming Platform  -  v0.1"); nl(c);
+    nl(c);
+    print(c, "  74 systems  |  Native on macOS, Linux, Windows"); nl(c);
+    print(c, "  Built in Sigil. No Electron. No runtime. No deps."); nl(c);
+    nl(c);
+    hr(c);
+    return 0;
+}
+
+fn print_host_line(c: Int) -> Int ! {io.write} {
+    let h: Int = pal_host();
+    print(c, "  Platform     : ");
+    if h == 1 { print(c, "macOS"); }
+    if h == 2 { print(c, "Linux"); }
+    if h == 3 { print(c, "Windows"); }
+    if h == 0 { print(c, "sigilOS"); }
+    nl(c);
+    print(c, "  Version      : Forge 0.1 desktop preview"); nl(c);
+    print(c, "  Distribution : "); dist_label(c); nl(c);
+    dist_desc(c); nl(c);
+    print(c, "  Systems      : 74 supported platforms"); nl(c);
+    nl(c);
+    return 0;
+}
+
+// STUB — see the header note. Prints the sign-in requirement and continues in a labeled stub mode.
+// Both distributions require sign-in at launch; this becomes a real gate once host networking lands.
+fn print_signin_gate(c: Int) -> Int ! {io.write} {
+    hr(c);
+    print(c, "  SIGN-IN REQUIRED"); nl(c);
+    hr(c);
+    nl(c);
+    print(c, "  Forge requires a signed-in account to run (both distributions)."); nl(c);
+    print(c, "  Credential verification needs network support not yet available"); nl(c);
+    print(c, "  on this native build — running in STUB MODE (unverified) until"); nl(c);
+    print(c, "  host networking primitives land."); nl(c);
+    nl(c);
+    return 0;
+}
+
+fn print_catalog(c: Int) -> Int ! {io.write} {
+    hr(c);
+    print(c, "  SUPPORTED SYSTEMS"); nl(c);
+    hr(c);
+    nl(c);
+    var i: Int = 0;
+    while i < cat_count() invariant i >= 0 {
+        print(c, "  ");
+        let tens: Int = i / 10;
+        let ones: Int = i - tens * 10;
+        if tens == 0 { print(c, " "); }
+        if tens > 0  { print(c, chr(48 + tens)); }
+        print(c, chr(48 + ones));
+        print(c, "  ");
+        cat_name(i, c);
+        print(c, "   ");
+        cat_ext(i, c);
+        nl(c);
+        i = i + 1;
+    }
+    nl(c);
+    return 0;
+}
+
+fn print_setup(c: Int) -> Int ! {io.write} {
+    hr(c);
+    print(c, "  SETUP"); nl(c);
+    hr(c);
+    nl(c);
+    let h: Int = pal_host();
+    print(c, "  1. Create your ROM directory:"); nl(c);
+    print(c, "     ");
+    if h == 1 { print(c, "~/Documents/Forge/roms/"); }
+    if h == 2 { print(c, "~/forge/roms/"); }
+    if h == 3 { print(c, "%USERPROFILE%\\Documents\\Forge\\roms\\"); }
+    if h == 0 { print(c, "/roms/"); }
+    nl(c);
+    nl(c);
+    print(c, "  2. Put ROMs in subfolders by system name:"); nl(c);
+    print(c, "       roms/nes/mario.nes"); nl(c);
+    print(c, "       roms/snes/zelda.sfc"); nl(c);
+    print(c, "       roms/genesis/sonic.md"); nl(c);
+    print(c, "       roms/psx/game.exe"); nl(c);
+    nl(c);
+    print(c, "  3. The graphical launcher runs on sigilOS (Pi hardware)."); nl(c);
+    print(c, "     This desktop build is the catalog tool and ROM scanner."); nl(c);
+    print(c, "     Native display + input PAL is in active development."); nl(c);
+    nl(c);
+    return 0;
+}
+
+fn print_footer(c: Int) -> Int ! {io.write} {
+    hr(c);
+    print(c, "  sigilos.grio.co"); nl(c);
+    print(c, "  github.com/grioghar/RetroPie-Sigil"); nl(c);
+    hr(c);
+    nl(c);
+    return 0;
+}
+
+fn main() -> Int ! {io.write} {
+    let c: Int = 1;
+    banner(c);
+    print_signin_gate(c);
+    print_host_line(c);
+    print_catalog(c);
+    print_setup(c);
+    print_footer(c);
+    return cat_count();
+}

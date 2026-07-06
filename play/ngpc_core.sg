@@ -1,0 +1,251 @@
+// cores/ngpc.sg — Neo-Geo Pocket Color (1999). System #47.
+// CPU: Toshiba TLCS-900H (Z80-heritage 16-bit, 1MB). GPU: K2GE (4bpp tiles, RGB444).
+// Memory layout (all relative to ngpc_mem(m) base 0x33000000):
+//   $000000-$00FFFF: 64KB work RAM
+//   $200000-$2FFFFF: 1MB ROM
+//   K2GE registers at $8000+; tile data at $A000+; tile map at $B800+; palette at $BEE0+
+
+fn core_id() -> Int { return 9902; }
+
+// -- Memory base ---------------------------------------------------------------
+fn ngpc_mem(m: Int) -> Int { return m + 0; }             // base+0
+fn ngpc_fb(m: Int) -> Int { return m + 1048576; }        // base+1048576: 160x152x4 fb (97280 B)
+fn ngpc_wram() -> Int { return 0; }          // offset 0 within ngpc_mem
+fn ngpc_rom()  -> Int { return 2097152; }    // offset $200000 within ngpc_mem
+
+// -- Core ABI ------------------------------------------------------------------
+fn core_fb(m: Int) -> Int { return ngpc_fb(m); }
+fn core_fb_w() -> Int { return 160; }
+fn core_fb_h() -> Int { return 152; }
+
+fn ngpc_read8(m: Int, off: Int) -> Int ! {mem} {
+    return peek8(ngpc_mem(m), off % 16777216);
+}
+fn ngpc_write8(m: Int, off: Int, v: Int) -> Int ! {mem} {
+    poke8(ngpc_mem(m), off % 16777216, v % 256);
+    return 0;
+}
+fn ngpc_read16(m: Int, off: Int) -> Int ! {mem} {
+    return ngpc_read8(m, off) + ngpc_read8(m, off + 1) * 256;
+}
+fn ngpc_write16(m: Int, off: Int, v: Int) -> Int ! {mem} {
+    ngpc_write8(m, off, v % 256);
+    ngpc_write8(m, off + 1, (v / 256) % 256);
+    return 0;
+}
+
+// -- K2GE: palette (256 × 2 bytes, RGB444 little-endian at $BEE0) -------------
+fn k2ge_pal() -> Int { return 48864; }    // $BEE0 offset in ngpc_mem
+
+fn k2ge_color(m: Int, idx: Int) -> Int ! {mem} {
+    let p: Int = ngpc_read16(m, k2ge_pal() + (idx % 256) * 2);
+    let r: Int = (p / 256) % 16;
+    let g: Int = (p / 16) % 16;
+    let b: Int = p % 16;
+    return 4278190080 + r * 17 + g * 4352 + b * 1114112;
+}
+
+// -- K2GE: 4bpp tile render (shift-register style, like WSC) ------------------
+// Tile data at $A000; each tile = 32 bytes (4 planes × 8 rows, MSB-left).
+fn k2ge_tile() -> Int { return 40960; }   // $A000 in ngpc_mem
+
+fn k2ge_render_row(m: Int, fboff: Int, t0: Int, t1: Int, t2: Int, t3: Int) -> Int ! {mem} {
+    var s0: Int = t0;
+    var s1: Int = t1;
+    var s2: Int = t2;
+    var s3: Int = t3;
+    var col: Int = 0;
+    while col < 8 invariant col >= 0 {
+        let idx: Int = (s0 / 128) % 2 + ((s1 / 128) % 2) * 2 + ((s2 / 128) % 2) * 4 + ((s3 / 128) % 2) * 8;
+        poke32(ngpc_fb(m), fboff + col * 4, k2ge_color(m, idx));
+        s0 = (s0 * 2) % 256;
+        s1 = (s1 * 2) % 256;
+        s2 = (s2 * 2) % 256;
+        s3 = (s3 * 2) % 256;
+        col = col + 1;
+    }
+    return 0;
+}
+
+// Tile map at $B800 (20 tiles wide × 19 tiles tall = 160×152). 2 bytes/entry: tile#.
+fn k2ge_map() -> Int { return 47104; }    // $B800 in ngpc_mem
+
+fn k2ge_render(m: Int) -> Int ! {mem} {
+    var ty: Int = 0;
+    while ty < 19 invariant ty >= 0 {
+        var tx: Int = 0;
+        while tx < 20 invariant tx >= 0 {
+            let tile: Int = ngpc_read16(m, k2ge_map() + (ty * 20 + tx) * 2) % 256;
+            var row: Int = 0;
+            while row < 8 invariant row >= 0 {
+                let base: Int = k2ge_tile() + tile * 32 + row * 4;
+                let t0: Int = ngpc_read8(m, base);
+                let t1: Int = ngpc_read8(m, base + 1);
+                let t2: Int = ngpc_read8(m, base + 2);
+                let t3: Int = ngpc_read8(m, base + 3);
+                k2ge_render_row(m, (ty * 8 + row) * 160 * 4 + tx * 8 * 4, t0, t1, t2, t3);
+                row = row + 1;
+            }
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    return 0;
+}
+
+// -- TLCS-900H CPU stub --------------------------------------------------------
+// Registers stored in ngpc_mem at offset $10000 (64 bytes):
+//   +0: XBC  +4: XDE  +8: XHL  +12: XIX  +16: XIY  +20: XSP  +24: PC  +28: F
+fn ngpc_cpu_base() -> Int { return 65536; }  // $10000 in ngpc_mem
+
+fn t9_getreg(m: Int, idx: Int) -> Int ! {mem} {
+    return ngpc_read16(m, ngpc_cpu_base() + idx * 4);
+}
+fn t9_setreg(m: Int, idx: Int, v: Int) -> Int ! {mem} {
+    ngpc_write16(m, ngpc_cpu_base() + idx * 4, v % 65536);
+    return 0;
+}
+fn t9_getpc(m: Int) -> Int ! {mem} { return ngpc_read16(m, ngpc_cpu_base() + 24); }
+fn t9_setpc(m: Int, v: Int) -> Int ! {mem} { ngpc_write16(m, ngpc_cpu_base() + 24, v % 65536); return 0; }
+fn t9_getf(m: Int) -> Int ! {mem} { return ngpc_read8(m, ngpc_cpu_base() + 28); }
+fn t9_setf(m: Int, v: Int) -> Int ! {mem} { ngpc_write8(m, ngpc_cpu_base() + 28, v % 256); return 0; }
+fn t9_getsp(m: Int) -> Int ! {mem} { return t9_getreg(m, 5); }
+fn t9_setsp(m: Int, v: Int) -> Int ! {mem} { t9_setreg(m, 5, v); return 0; }
+
+// F bits: Z=bit6, S=bit7, C=bit0, OV=bit2, N=bit1
+fn t9_flagz(m: Int) -> Int ! {mem} { return (t9_getf(m) / 64) % 2; }
+fn t9_flags(m: Int) -> Int ! {mem} { return (t9_getf(m) / 128) % 2; }
+fn t9_flagc(m: Int) -> Int ! {mem} { return t9_getf(m) % 2; }
+
+fn t9_push16(m: Int, v: Int) -> Int ! {mem} {
+    var sp: Int = t9_getsp(m) - 2;
+    if sp < 0 { sp = sp + 65536; }
+    t9_setsp(m, sp);
+    ngpc_write16(m, sp, v);
+    return 0;
+}
+fn t9_pop16(m: Int) -> Int ! {mem} {
+    let sp: Int = t9_getsp(m);
+    let v: Int = ngpc_read16(m, sp);
+    t9_setsp(m, (sp + 2) % 65536);
+    return v;
+}
+
+// Decode + execute one TLCS-900H instruction (stub: common opcodes)
+fn t9_step(m: Int) -> Int ! {mem} {
+    let pc: Int = t9_getpc(m);
+    let op: Int = ngpc_read8(m, pc);
+    t9_setpc(m, pc + 1);
+
+    // $C0-$C7: LD r16, imm16 (r = op-$C0: BC,DE,HL,IX,IY,SP,...)
+    if op >= 192 { if op <= 199 {
+        let r: Int = op - 192;
+        let lo: Int = ngpc_read8(m, t9_getpc(m));
+        let hi: Int = ngpc_read8(m, t9_getpc(m) + 1);
+        t9_setreg(m, r, lo + hi * 256);
+        t9_setpc(m, t9_getpc(m) + 2);
+        return 0;
+    } }
+    // $18: JR e (unconditional relative)
+    if op == 24 {
+        let e: Int = ngpc_read8(m, t9_getpc(m));
+        t9_setpc(m, t9_getpc(m) + 1);
+        var off: Int = e; if e > 127 { off = e - 256; }
+        t9_setpc(m, (t9_getpc(m) + off) % 65536);
+        return 0;
+    }
+    // $28: JR Z,e
+    if op == 40 {
+        let e: Int = ngpc_read8(m, t9_getpc(m));
+        t9_setpc(m, t9_getpc(m) + 1);
+        if t9_flagz(m) == 1 {
+            var off: Int = e; if e > 127 { off = e - 256; }
+            t9_setpc(m, (t9_getpc(m) + off) % 65536);
+        }
+        return 0;
+    }
+    // $20: JR NZ,e
+    if op == 32 {
+        let e: Int = ngpc_read8(m, t9_getpc(m));
+        t9_setpc(m, t9_getpc(m) + 1);
+        if t9_flagz(m) == 0 {
+            var off: Int = e; if e > 127 { off = e - 256; }
+            t9_setpc(m, (t9_getpc(m) + off) % 65536);
+        }
+        return 0;
+    }
+    // $CD: CALL nn (absolute 16-bit)
+    if op == 205 {
+        let lo: Int = ngpc_read8(m, t9_getpc(m));
+        let hi: Int = ngpc_read8(m, t9_getpc(m) + 1);
+        t9_setpc(m, t9_getpc(m) + 2);
+        t9_push16(m, t9_getpc(m));
+        t9_setpc(m, lo + hi * 256);
+        return 0;
+    }
+    // $C9: RET
+    if op == 201 {
+        t9_setpc(m, t9_pop16(m));
+        return 0;
+    }
+    // $00: NOP
+    if op == 0 { return 0; }
+    // $76: HALT — stop
+    if op == 118 { t9_setpc(m, t9_getpc(m) - 1); return 0; }
+    // Unknown: NOP-through
+    return 0;
+}
+
+fn t9_run(m: Int, cycles: Int) -> Int ! {mem} {
+    var c: Int = 0;
+    while c < cycles invariant c >= 0 {
+        t9_step(m);
+        c = c + 1;
+    }
+    return 0;
+}
+
+// -- Core ABI ------------------------------------------------------------------
+fn core_load(m: Int, rom_ptr: Int, rom_len: Int) -> Int ! {mem} {
+    // Copy ROM into ngpc_mem at ngpc_rom() offset
+    var i: Int = 0;
+    while i < rom_len invariant i >= 0 {
+        if i < 1048576 {
+            ngpc_write8(m, ngpc_rom() + i, peek8(rom_ptr, i));
+        }
+        i = i + 1;
+    }
+    // Reset CPU: PC from reset vector at $200000 (first 2 bytes)
+    let lo: Int = ngpc_read8(m, ngpc_rom());
+    let hi: Int = ngpc_read8(m, ngpc_rom() + 1);
+    t9_setpc(m, lo + hi * 256);
+    t9_setsp(m, 61440);   // 0xF000 default SP
+    return 0;
+}
+
+fn core_set_input_port(m: Int, port: Int, buttons: Int) -> Int ! {mem} {
+    if port == 0 { core_set_input(m, buttons); return 0; }
+    return 0;
+}
+
+fn core_set_input(m: Int, buttons: Int) -> Int ! {mem} {
+    ngpc_write8(m, 48873, buttons % 256);   // store buttons at ~$BEE9
+    return 0;
+}
+
+fn core_run_frame(m: Int) -> Int ! {mem} {
+    t9_run(m, 4000);
+    k2ge_render(m);
+    return 0;
+}
+fn core_savestate(m: Int, dst: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 1048576 invariant i >= 0 { poke8(dst, i, peek8(ngpc_mem(m), i)); i = i + 1; }
+    return 0;
+}
+fn core_loadstate(m: Int, src: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 1048576 invariant i >= 0 { poke8(ngpc_mem(m), i, peek8(src, i)); i = i + 1; }
+    return 0;
+}
+fn core_savestate_size() -> Int { return 1048576; }

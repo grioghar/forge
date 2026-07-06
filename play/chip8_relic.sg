@@ -1,0 +1,76 @@
+// forge/play/chip8_relic.sg — load + PLAY a game from a RELIC-V2 ROM relic.
+//
+// The legitimate "turn a game into a relic and play it" pipeline, end to end:
+// seal a (public-domain) ROM into an RLC2 ROM relic, then WALK the container to
+// verify + locate the payload, load it into the CHIP-8 core, and run it — no
+// hardcoded ROM. Uses the real RELIC-V2 §3 header layout (matches FORGE-SEAL /
+// relic_walk). Integrity (sha256/crc32) + signing are FORGE-SEAL's job; this
+// minimal in-file sealer zeroes those fields to stay self-contained for the demo.
+//
+// Links forge/play/chip8_core.sg. Build: forge/play/build-chip8-relic.sh
+
+fn rl_magic() -> Int { return 843271250; }   // "RLC2" LE
+
+fn rl_put32(base: Int, off: Int, v: Int) -> Int ! {mem} {
+    poke8(base, off, v % 256); poke8(base, off + 1, v / 256 % 256);
+    poke8(base, off + 2, v / 65536 % 256); poke8(base, off + 3, v / 16777216 % 256);
+    return 0;
+}
+
+// Seal a ROM relic (class 1) with no manifest and no bios_ref (a homebrew CHIP-8
+// game needs no BIOS). Layout: hdr(16) + meta(44) + payload + count-prefix(4=0,0)
+// + sig(64). Returns total size.
+fn rl_seal(out: Int, sysid: Int, coreid: Int, payload: Int, plen: Int) -> Int ! {mem} {
+    poke32(out, 0, rl_magic());
+    poke8(out, 4, 2);                 // version
+    poke8(out, 5, 1);                 // class = ROM
+    poke8(out, 6, sysid % 256); poke8(out, 7, sysid / 256 % 256);
+    poke8(out, 8, coreid % 256); poke8(out, 9, coreid / 256 % 256);
+    poke8(out, 10, 0); poke8(out, 11, 0);
+    rl_put32(out, 12, 0);             // manifest_len = 0
+    // meta at 16: sha256[32] + crc32[4] + payload_len[8]  (sha/crc zeroed here)
+    var i: Int = 0;
+    while i < 36 invariant i >= 0 { poke8(out, 16 + i, 0); i = i + 1; }
+    rl_put32(out, 52, plen);          // payload_len low 4 bytes (meta+36)
+    poke8(out, 56, 0); poke8(out, 57, 0); poke8(out, 58, 0); poke8(out, 59, 0);
+    var j: Int = 0;
+    while j < plen invariant j >= 0 { poke8(out, 60 + j, peek8(payload, j)); j = j + 1; }
+    let pend: Int = 60 + plen;
+    poke8(out, pend, 0); poke8(out, pend + 1, 0);       // bios_ref_count = 0
+    poke8(out, pend + 2, 0); poke8(out, pend + 3, 0);   // compat_count  = 0
+    var k: Int = 0;
+    while k < 64 invariant k >= 0 { poke8(out, pend + 4 + k, 0); k = k + 1; }
+    return pend + 4 + 64;
+}
+
+// Walk (manifest_len = 0): payload_len at meta+36 = 52, payload at meta+44 = 60.
+fn rl_read_class(base: Int) -> Int ! {mem} { return peek8(base, 5); }
+fn rl_magic_ok(base: Int) -> Int ! {mem} { if peek32(base, 0) != rl_magic() { return 0; } if peek8(base, 4) != 2 { return 0; } return 1; }
+fn rl_payload_len(base: Int) -> Int ! {mem} { return peek32(base, 52); }
+fn rl_payload_off(base: Int) -> Int ! {mem} { return 60; }
+
+fn main() -> Int ! {mem, io.write} {
+    // Bake the (public-domain) IBM test ROM and SEAL it as a RELIC-V2 ROM relic.
+    let rom: Int = alloc_buf(256);
+    let plen: Int = load_ibm(rom);
+    let relic: Int = alloc_buf(512);
+    let total: Int = rl_seal(relic, 12, 12, rom, plen);   // system_id 12 = CHIP-8 / SUPER-CHIP (catalog.sg)
+
+    print(1, "  FORGE - loading a game from a RELIC-V2 ROM relic:\n");
+    print(1, "    relic: RLC2 class="); print(1, chr(48 + rl_read_class(relic)));
+    print(1, " magic_ok="); print(1, chr(48 + rl_magic_ok(relic)));
+    print(1, " payload=");
+    let pl: Int = rl_payload_len(relic);
+    print(1, chr(48 + pl / 100 % 10)); print(1, chr(48 + pl / 10 % 10)); print(1, chr(48 + pl % 10));
+    print(1, " bytes\n");
+
+    // PLAY: walk the relic, load its payload into the core, run.
+    let b: Int = alloc_buf(6464);
+    chip8_init(b);
+    chip8_load(b, relic + rl_payload_off(relic), rl_payload_len(relic));
+    chip8_run(b, 300);
+    render_term(b);
+    print(1, "\n  [OK] sealed ROM relic -> walked -> loaded -> played, native on macOS.\n");
+    if rl_magic_ok(relic) == 1 { if rl_read_class(relic) == 1 { return 0; } }
+    return 1;
+}

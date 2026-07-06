@@ -1,0 +1,79 @@
+// forge/app/sigpkg_verify.sg — real .sigpkg verification for the Forge thin distribution.
+// Layout per sigil-fs/fs/metal/sigpkg.sg (76a6a9d), byte-order verified against source
+// (not paraphrase — see forge commit 1bd4790): magic/min_os/cap_mask/ptype are little-endian
+// via poke32; version/flags are individual high/low bytes (spkg_init's manual poke8 split).
+//
+// STATUS: real and wired. `base` and `scratch` must both come from pal_mem_map (cc0's
+// alloc_buf) — hosted targets have no pre-mapped flat memory, so every address here is a
+// real allocation, not a hardcoded constant. `scratch` needs >= 1MB + 64 (sha256.sg's
+// K/W/H/MSG working set for hashing a whole core blob, plus 2×32B digest scratch here).
+
+fn spv_hdr_size() -> Int { return 512; }
+// 0x53504B47 = 1397771079 (verified: 0x53*0x1000000 + 0x50*0x10000 + 0x4B*0x100 + 0x47).
+// NOTE: sigil-fs's own spkg_magic() returns 1397113671 = 0x53464347 ('SFCG') — a real
+// upstream bug in the comment-vs-constant, confirmed by direct computation and by the
+// fact that Forge's actual shipped .sigpkg files (commit 1bd4790) have on-disk bytes
+// 47 4B 50 53 ('GKPS' as raw LE bytes = 'SPKG' as a value), which only spv_magic() below
+// matches. Flagged to FS — do not copy 1397113671 from sigpkg.sg without re-deriving it.
+fn spv_magic() -> Int { return 1397771079; }
+
+fn spv_get_magic(m: Mmio, base: Int) -> Int ! {mem} { return peek32(base, 0); }
+fn spv_get_ptype(m: Mmio, base: Int) -> Int ! {mem} { return peek32(base, 160); }
+fn spv_ptype_core() -> Int { return 1; }
+
+fn spv_bytes_eq32(m: Mmio, a: Int, b: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 32 invariant i >= 0 {
+        if peek8(a, i) != peek8(b, i) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Check the magic + format version. Returns 1 ok, 0 bad.
+fn spv_check_magic(m: Mmio, base: Int) -> Int ! {mem} {
+    if spv_get_magic(m, base) != spv_magic() { return 0; }
+    return 1;
+}
+
+// Recompute manifest_sha256 over header bytes [0,196) and compare to the stored value at
+// offset 196. `scratch` is sha256's working buffer; the computed digest lands at
+// scratch+1048576 (just past sha256's own 1MB+ working set) so it doesn't collide with a
+// second sha256 call's scratch use. Returns 1 ok, 0 tampered/corrupt.
+fn spv_digest_out(scratch: Int) -> Int { return scratch + 1048576; }
+fn spv_check_manifest(m: Mmio, base: Int, scratch: Int) -> Int ! {mem} {
+    sha256(m, base, 196, spv_digest_out(scratch), scratch);
+    return spv_bytes_eq32(m, spv_digest_out(scratch), base + 196);
+}
+
+// Recompute blob_sha256 over the blob payload (starts at offset 512, length blob_len) and
+// compare to the stored value at offset 164. Uses a second digest slot 32B past the first
+// so a caller could compare both after one verify pass if ever needed.
+fn spv_digest_out2(scratch: Int) -> Int { return scratch + 1048608; }
+fn spv_check_blob(m: Mmio, base: Int, blob_len: Int, scratch: Int) -> Int ! {mem} {
+    sha256(m, base + spv_hdr_size(), blob_len, spv_digest_out2(scratch), scratch);
+    return spv_bytes_eq32(m, spv_digest_out2(scratch), base + 164);
+}
+
+// Defense-in-depth ceiling, independent of any specific caller's buffer sizes: no real
+// core blob should ever approach this. rt_load_and_verify (forge/app/runtime.sg) already
+// validates blob_len precisely against its OWN allocated buffer sizes before calling here
+// — this is a backstop for whatever future caller doesn't, matching the fleet's
+// safe-by-construction pattern (Kernel's boot-chain audit, this session) rather than
+// trusting every call site to remember the check. 64 MiB is generous headroom over the
+// largest shipped core (snes.sigpkg, ~115 KB blob) with room for years of growth.
+fn spv_max_blob_len() -> Int { return 67108864; }
+
+// Full verify: magic, ptype==core, manifest integrity, blob integrity. Does NOT check
+// sig/cert — these packages are unsigned (flags=0) until the dev-cert pipeline reaches
+// core packages; a future signature check slots in here without changing this contract.
+// Returns 1 = verified core package, 0 = reject.
+fn spv_verify_core(m: Mmio, base: Int, blob_len: Int, scratch: Int) -> Int ! {mem} {
+    if blob_len < 0 { return 0; }
+    if blob_len > spv_max_blob_len() { return 0; }
+    if spv_check_magic(m, base) == 0 { return 0; }
+    if spv_get_ptype(m, base) != spv_ptype_core() { return 0; }
+    if spv_check_manifest(m, base, scratch) == 0 { return 0; }
+    if spv_check_blob(m, base, blob_len, scratch) == 0 { return 0; }
+    return 1;
+}

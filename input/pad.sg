@@ -1,0 +1,52 @@
+// forge/input/pad.sg — the canonical pad: Forge's device-agnostic input layer.
+//
+// The abstraction that means games are never wired to controllers directly:
+//   physical device --> CANONICAL PAD (here) --> per-core binding --> core input
+// Any device (keyboard now, USB-HID gamepad later) maps to this one 12-button
+// canonical pad; each core has a binding (a CONTROLLER-relic ctrl_cfg block,
+// RELIC-V2 §2/§6b) that adapts the canonical pad to whatever input that core
+// natively reads. Add a device or a core without touching the other side.
+//
+// Canonical buttons:
+//   0 UP  1 DOWN  2 LEFT  3 RIGHT  4 A  5 B  6 X  7 Y  8 L  9 R  10 START  11 SELECT
+// Pad state = a 16-byte buffer, one byte per button (0=up, 1=down).
+
+fn pad_up()   -> Int { return 0; }
+fn pad_down() -> Int { return 1; }
+fn pad_left() -> Int { return 2; }
+fn pad_right()-> Int { return 3; }
+fn pad_a()    -> Int { return 4; }
+fn pad_b()    -> Int { return 5; }
+fn pad_x()    -> Int { return 6; }
+fn pad_y()    -> Int { return 7; }
+fn pad_l()    -> Int { return 8; }
+fn pad_r()    -> Int { return 9; }
+fn pad_start()-> Int { return 10; }
+fn pad_select()-> Int { return 11; }
+fn pad_count()-> Int { return 12; }
+
+fn pad_clear(p: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 16 invariant i >= 0 { poke8(p, i, 0); i = i + 1; }
+    return 0;
+}
+fn pad_set(p: Int, btn: Int, v: Int) -> Int ! {mem} { if btn >= 0 { poke8(p, btn, v); } return 0; }
+fn pad_get(p: Int, btn: Int) -> Int ! {mem} { return peek8(p, btn); }
+
+// Keyboard device profile: map an ASCII key to a canonical button (-1 if none).
+// WASD = D-pad, J/K/L/I = A/B/X/Y, U/O = L/R, Enter = START, Space = SELECT.
+fn kbd_btn(ch: Int) -> Int {
+    if ch == 119 { return 0; }   // w  UP
+    if ch == 115 { return 1; }   // s  DOWN
+    if ch == 97  { return 2; }   // a  LEFT
+    if ch == 100 { return 3; }   // d  RIGHT
+    if ch == 106 { return 4; }   // j  A
+    if ch == 107 { return 5; }   // k  B
+    if ch == 108 { return 6; }   // l  X
+    if ch == 105 { return 7; }   // i  Y
+    if ch == 117 { return 8; }   // u  L
+    if ch == 111 { return 9; }   // o  R
+    if ch == 13  { return 10; }  // Enter START
+    if ch == 32  { return 11; }  // Space SELECT
+    return 0 - 1;
+}

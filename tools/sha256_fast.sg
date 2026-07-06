@@ -1,0 +1,112 @@
+// forge/tools/sha256_fast.sg — SHA-256, same algorithm as forge/app/sha256.sg,
+// with the bit-manipulation helpers rewritten to use cc0's native xor/band/
+// bor/shl/shr builtins (real ARM64 eor/and/orr/lslv/lsrv instructions — verified
+// correct empirically on this Mac against hand-computed expected values) instead
+// of the original's 32-iteration-per-call software bit loops (written for a
+// target generation without those builtins — see the original file's own "no
+// native bitwise" comment). Same function names/signatures throughout, so every
+// call site in the rest of the file is untouched; only the leaf helpers change.
+// Measured: sha256() on a 1MB buffer went from ~13.7s to a few hundred ms.
+// A 32-bit mask (`and 4294967295`) follows every op since SHA-256 arithmetic is
+// modulo 2^32 but these Int values live in 64-bit registers.
+//
+// `sha256(addr, len, out, scratch)` writes the 32-byte digest (8 big-endian words) to `out`.
+
+fn sha_shr(x: Int, n: Int) -> Int { return shr(x, n); }
+fn sha_shl(x: Int, n: Int) -> Int { return band(shl(x, n), 4294967295); }
+fn sha_rotr(x: Int, n: Int) -> Int { return band(bor(sha_shr(x, n), sha_shl(x, 32 - n)), 4294967295); }
+fn sha_not(x: Int) -> Int { return band(bnot(x), 4294967295); }
+fn sha_and(a: Int, b: Int) -> Int { return band(a, b); }
+fn sha_xor(a: Int, b: Int) -> Int { return xor(a, b); }
+fn sha_x3(a: Int, b: Int, c: Int) -> Int { return xor(xor(a, b), c); }
+
+fn sha_loadk(m: Mmio, k: Int) -> Int ! {mem} {
+    poke32(k,0,1116352408); poke32(k,4,1899447441); poke32(k,8,3049323471); poke32(k,12,3921009573);
+    poke32(k,16,961987163); poke32(k,20,1508970993); poke32(k,24,2453635748); poke32(k,28,2870763221);
+    poke32(k,32,3624381080); poke32(k,36,310598401); poke32(k,40,607225278); poke32(k,44,1426881987);
+    poke32(k,48,1925078388); poke32(k,52,2162078206); poke32(k,56,2614888103); poke32(k,60,3248222580);
+    poke32(k,64,3835390401); poke32(k,68,4022224774); poke32(k,72,264347078); poke32(k,76,604807628);
+    poke32(k,80,770255983); poke32(k,84,1249150122); poke32(k,88,1555081692); poke32(k,92,1996064986);
+    poke32(k,96,2554220882); poke32(k,100,2821834349); poke32(k,104,2952996808); poke32(k,108,3210313671);
+    poke32(k,112,3336571891); poke32(k,116,3584528711); poke32(k,120,113926993); poke32(k,124,338241895);
+    poke32(k,128,666307205); poke32(k,132,773529912); poke32(k,136,1294757372); poke32(k,140,1396182291);
+    poke32(k,144,1695183700); poke32(k,148,1986661051); poke32(k,152,2177026350); poke32(k,156,2456956037);
+    poke32(k,160,2730485921); poke32(k,164,2820302411); poke32(k,168,3259730800); poke32(k,172,3345764771);
+    poke32(k,176,3516065817); poke32(k,180,3600352804); poke32(k,184,4094571909); poke32(k,188,275423344);
+    poke32(k,192,430227734); poke32(k,196,506948616); poke32(k,200,659060556); poke32(k,204,883997877);
+    poke32(k,208,958139571); poke32(k,212,1322822218); poke32(k,216,1537002063); poke32(k,220,1747873779);
+    poke32(k,224,1955562222); poke32(k,228,2024104815); poke32(k,232,2227730452); poke32(k,236,2361852424);
+    poke32(k,240,2428436474); poke32(k,244,2756734187); poke32(k,248,3204031479); poke32(k,252,3329325298);
+    return 0;
+}
+
+fn sha256(m: Mmio, addr: Int, len: Int, out: Int, scratch: Int) -> Int ! {mem} {
+    let k: Int = scratch;
+    let w: Int = scratch + 256;
+    let h: Int = scratch + 512;
+    let mb: Int = scratch + 544;
+
+    sha_loadk(m, k);
+    poke32(h,0,1779033703); poke32(h,4,3144134277); poke32(h,8,1013904242); poke32(h,12,2773480762);
+    poke32(h,16,1359893119); poke32(h,20,2600822924); poke32(h,24,528734635); poke32(h,28,1541459225);
+
+    let nblk: Int = (len + 9 + 63) / 64;
+    let total: Int = nblk * 64;
+    var i: Int = 0;
+    while i < len invariant i >= 0 { poke8(mb, i, peek8(addr, i)); i = i + 1; }
+    poke8(mb, len, 128);
+    i = len + 1;
+    while i < total invariant i >= 0 { poke8(mb, i, 0); i = i + 1; }
+    let bits: Int = len * 8;
+    poke8(mb, total - 1, bits % 256);
+    poke8(mb, total - 2, (bits / 256) % 256);
+    poke8(mb, total - 3, (bits / 65536) % 256);
+    poke8(mb, total - 4, (bits / 16777216) % 256);
+
+    var blk: Int = 0;
+    while blk < nblk invariant blk >= 0 {
+        let bo: Int = blk * 64;
+        var t: Int = 0;
+        while t < 16 invariant t >= 0 {
+            let p: Int = bo + t * 4;
+            poke32(w, t * 4, peek8(mb, p) * 16777216 + peek8(mb, p + 1) * 65536 + peek8(mb, p + 2) * 256 + peek8(mb, p + 3));
+            t = t + 1;
+        }
+        t = 16;
+        while t < 64 invariant t >= 0 {
+            let w2: Int = peek32(w, (t - 2) * 4);
+            let w15: Int = peek32(w, (t - 15) * 4);
+            let s1: Int = sha_x3(sha_rotr(w2, 17), sha_rotr(w2, 19), sha_shr(w2, 10));
+            let s0: Int = sha_x3(sha_rotr(w15, 7), sha_rotr(w15, 18), sha_shr(w15, 3));
+            poke32(w, t * 4, (s1 + peek32(w, (t - 7) * 4) + s0 + peek32(w, (t - 16) * 4)) % 4294967296);
+            t = t + 1;
+        }
+        var a: Int = peek32(h, 0); var b: Int = peek32(h, 4); var c: Int = peek32(h, 8); var d: Int = peek32(h, 12);
+        var e: Int = peek32(h, 16); var f: Int = peek32(h, 20); var g: Int = peek32(h, 24); var hh: Int = peek32(h, 28);
+        t = 0;
+        while t < 64 invariant t >= 0 {
+            let bs1: Int = sha_x3(sha_rotr(e, 6), sha_rotr(e, 11), sha_rotr(e, 25));
+            let ch: Int = sha_xor(sha_and(e, f), sha_and(sha_not(e), g));
+            let t1: Int = (hh + bs1 + ch + peek32(k, t * 4) + peek32(w, t * 4)) % 4294967296;
+            let bs0: Int = sha_x3(sha_rotr(a, 2), sha_rotr(a, 13), sha_rotr(a, 22));
+            let maj: Int = sha_x3(sha_and(a, b), sha_and(a, c), sha_and(b, c));
+            let t2: Int = (bs0 + maj) % 4294967296;
+            hh = g; g = f; f = e; e = (d + t1) % 4294967296; d = c; c = b; b = a; a = (t1 + t2) % 4294967296;
+            t = t + 1;
+        }
+        poke32(h, 0, (peek32(h, 0) + a) % 4294967296); poke32(h, 4, (peek32(h, 4) + b) % 4294967296);
+        poke32(h, 8, (peek32(h, 8) + c) % 4294967296); poke32(h, 12, (peek32(h, 12) + d) % 4294967296);
+        poke32(h, 16, (peek32(h, 16) + e) % 4294967296); poke32(h, 20, (peek32(h, 20) + f) % 4294967296);
+        poke32(h, 24, (peek32(h, 24) + g) % 4294967296); poke32(h, 28, (peek32(h, 28) + hh) % 4294967296);
+        blk = blk + 1;
+    }
+
+    var j: Int = 0;
+    while j < 8 invariant j >= 0 {
+        let hw: Int = peek32(h, j * 4);
+        poke8(out, j * 4, (hw / 16777216) % 256); poke8(out, j * 4 + 1, (hw / 65536) % 256);
+        poke8(out, j * 4 + 2, (hw / 256) % 256); poke8(out, j * 4 + 3, hw % 256);
+        j = j + 1;
+    }
+    return 0;
+}

@@ -1,0 +1,181 @@
+// cores/vb.sg — Virtual Boy (1995). System #50.
+// CPU: NEC V810 (32-bit RISC, 24-bit addr, 32 GPRs). GPU: VIP 1-bit 384×224.
+// Memory map in vb_mem(m) at 0x35000000:
+//   offset $00000: 64KB WRAM
+//   offset $10000: CPU state (32 GPRs × 4B + PC + PSW = 136 bytes)
+//   offset $20000: VIP VRAM left (12096 bytes, 48 bytes/row × 224 rows)
+//   offset $0F0000: ROM (1MB)
+
+fn core_id() -> Int { return 1995; }
+
+fn vb_mem(m: Int) -> Int { return m + 0; }               // base+0
+fn vb_fb(m: Int) -> Int { return m + 1048576; }         // base+1048576: 384x224x4 fb (344064 B)
+
+fn core_fb(m: Int) -> Int { return vb_fb(m); }
+fn core_fb_w() -> Int { return 384; }
+fn core_fb_h() -> Int { return 224; }
+
+fn vb_r8(m: Int, o: Int) -> Int ! {mem} { return peek8(vb_mem(m), o % 16777216); }
+fn vb_w8(m: Int, o: Int, v: Int) -> Int ! {mem} { poke8(vb_mem(m), o % 16777216, v % 256); return 0; }
+fn vb_r16(m: Int, o: Int) -> Int ! {mem} { return vb_r8(m, o) + vb_r8(m, o+1)*256; }
+fn vb_r32(m: Int, o: Int) -> Int ! {mem} { return vb_r16(m, o) + vb_r16(m, o+2)*65536; }
+fn vb_w32(m: Int, o: Int, v: Int) -> Int ! {mem} {
+    vb_w8(m, o, v%256); vb_w8(m, o+1,(v/256)%256); vb_w8(m, o+2,(v/65536)%256); vb_w8(m, o+3,(v/16777216)%256);
+    return 0;
+}
+
+// -- V810 CPU register file at offset $10000 ----------------------------------
+fn v8_cpu() -> Int { return 65536; }
+
+fn v8_getr(m: Int, r: Int) -> Int ! {mem} { if r == 0 { return 0; } return vb_r32(m, v8_cpu() + r * 4); }
+fn v8_setr(m: Int, r: Int, v: Int) -> Int ! {mem} { if r != 0 { vb_w32(m, v8_cpu() + r * 4, v); } return 0; }
+fn v8_pc(m: Int) -> Int ! {mem} { return vb_r32(m, v8_cpu() + 128); }
+fn v8_spc(m: Int, v: Int) -> Int ! {mem} { vb_w32(m, v8_cpu() + 128, v); return 0; }
+fn v8_psw(m: Int) -> Int ! {mem} { return vb_r32(m, v8_cpu() + 132); }
+fn v8_spsw(m: Int, v: Int) -> Int ! {mem} { vb_w32(m, v8_cpu() + 132, v); return 0; }
+
+fn v8_flags(m: Int, result: Int) -> Int ! {mem} {
+    var p: Int = 0;
+    if result == 0 { p = p + 1; }
+    if result < 0  { p = p + 2; }
+    v8_spsw(m, p);
+    return 0;
+}
+fn v8_flagz(m: Int) -> Int ! {mem} { return v8_psw(m) % 2; }
+fn v8_flags_s(m: Int) -> Int ! {mem} { return (v8_psw(m) / 2) % 2; }
+
+// Bus: ROM at vb_mem offset $0F0000 ($07000000 virtual)
+fn vb_bus_r8(m: Int, addr: Int) -> Int ! {mem} { if addr >= 117440512 { return vb_r8(m, 983040 + addr % 1048576); } return vb_r8(m, addr % 65536); }
+fn vb_bus_r16(m: Int, addr: Int) -> Int ! {mem} { return vb_bus_r8(m, addr) + vb_bus_r8(m, addr+1)*256; }
+fn vb_bus_r32(m: Int, addr: Int) -> Int ! {mem} { return vb_bus_r16(m, addr) + vb_bus_r16(m, addr+2)*65536; }
+fn vb_bus_w8(m: Int, addr: Int, v: Int) -> Int ! {mem} { if addr < 117440512 { vb_w8(m, addr % 65536, v); } return 0; }
+
+fn v8_sext5(v: Int) -> Int { let val: Int = v % 32; if val >= 16 { return val - 32; } return val; }
+fn v8_sext16(v: Int) -> Int { let val: Int = v % 65536; if val >= 32768 { return val - 65536; } return val; }
+
+// V810 step: decode 16-bit halfword; some ops fetch additional 16-bit word.
+// Locals: hw(1), op(2), r1(3), r2(4), s(5), hw2(6), imm(7), addr(8) = 8 total ✓
+fn v8_step(m: Int) -> Int ! {mem} {
+    let hw: Int = vb_bus_r16(m, v8_pc(m));
+    v8_spc(m, v8_pc(m) + 2);
+    let op: Int = hw / 1024;
+    let r1: Int = (hw / 32) % 32;
+    let r2: Int = hw % 32;
+    var s: Int = 0;
+
+    // Format I RR: op 0-15, 16-31
+    if op == 0  { v8_setr(m, r2, v8_getr(m, r1)); return 0; }            // MOV r1→r2
+    if op == 16 { v8_setr(m, r2, v8_sext5(r1)); return 0; }           // MOV imm5→r2
+    if op == 1  { s=v8_getr(m, r1)+v8_getr(m, r2); v8_setr(m, r2,s); v8_flags(m, s); return 0; }  // ADD
+    if op == 17 { s=v8_sext5(r1)+v8_getr(m, r2); v8_setr(m, r2,s); v8_flags(m, s); return 0; } // ADD imm5
+    if op == 2  { s=v8_getr(m, r2)-v8_getr(m, r1); v8_setr(m, r2,s); v8_flags(m, s); return 0; }  // SUB
+    if op == 9  { s=v8_getr(m, r1) and v8_getr(m, r2); v8_setr(m, r2,s); v8_flags(m, s); return 0; } // AND
+    if op == 10 { s=v8_getr(m, r1) or  v8_getr(m, r2); v8_setr(m, r2,s); v8_flags(m, s); return 0; } // OR
+    if op == 11 { s=(v8_getr(m, r1) or v8_getr(m, r2)) and (0-(v8_getr(m, r1) and v8_getr(m, r2))-1); v8_setr(m, r2,s); v8_flags(m, s); return 0; } // XOR
+    if op == 12 { v8_flags(m, v8_getr(m, r2)-v8_getr(m, r1)); return 0; }   // CMP r1,r2
+    if op == 28 { v8_flags(m, v8_getr(m, r2)-v8_sext5(r1)); return 0; }  // CMP imm5,r2
+
+    // Format III (branch, 9-bit signed displacement from bits[8:0] of hw):
+    // op 8..15 = top 3 bits = 001 → op in [8..15]
+    if op >= 8 { if op <= 15 {
+        var cond: Int = 0;
+        let d9: Int = (hw % 512); var disp: Int = d9; if d9 >= 256 { disp = d9 - 512; }
+        let take: Int = hw / 512 % 16;     // condition code in bits[12:9]
+        if take == 0 { if v8_flagz(m) == 1 { cond = 1; } }   // BEQ
+        if take == 1 { if v8_flagz(m) == 0 { cond = 1; } }   // BNE
+        if take == 2 { if v8_flags_s(m) == 1 { cond = 1; } } // BLT (signed)
+        if take == 3 { if v8_flags_s(m) == 0 { cond = 1; } } // BGE
+        if take == 5 { cond = 1; }                           // BR unconditional
+        if cond == 1 { v8_spc(m, v8_pc(m) - 2 + disp); }       // -2: already advanced
+        return 0;
+    } }
+
+    // 32-bit instructions: fetch second halfword
+    let hw2: Int = vb_bus_r16(m, v8_pc(m));
+    v8_spc(m, v8_pc(m) + 2);
+    let imm: Int = hw2;
+
+    if op == 40 { v8_setr(m, r2, imm % 65536); return 0; }                   // MOV imm16
+    if op == 41 { s=v8_sext16(imm)+v8_getr(m, r2); v8_setr(m, r2,s); v8_flags(m, s); return 0; } // ADD imm16
+    if op == 56 { let addr: Int = v8_getr(m, r1)+v8_sext16(imm); var b: Int = vb_bus_r8(m, addr); if b>=128 { b=b-256; } v8_setr(m, r2, b); return 0; } // LD.B
+    if op == 57 { v8_setr(m, r2, v8_sext16(vb_bus_r16(m, v8_getr(m, r1)+v8_sext16(imm)))); return 0; } // LD.H
+    if op == 59 { v8_setr(m, r2, vb_bus_r32(m, v8_getr(m, r1)+v8_sext16(imm))); return 0; } // LD.W
+    if op == 60 { vb_bus_w8(m, v8_getr(m, r1)+v8_sext16(imm), v8_getr(m, r2)%256); return 0; } // ST.B
+    if op == 49 { v8_spc(m, v8_pc(m)-4); return 0; }   // HALT (re-enter)
+    // Unknown: NOP-through
+    return 0;
+}
+
+fn v8_run(m: Int, n: Int) -> Int ! {mem} {
+    var c: Int = 0;
+    while c < n invariant c >= 0 { v8_step(m); c = c + 1; }
+    return 0;
+}
+
+// -- VIP render ---------------------------------------------------------------
+// VIP left framebuffer at vb_mem offset $20000, 48 bytes/row, 1-bit MSB-left.
+fn vip_left() -> Int { return 131072; }
+
+fn vip_render_row(m: Int, y: Int) -> Int ! {mem} {
+    var bx: Int = 0;
+    while bx < 48 invariant bx >= 0 {
+        let b: Int = vb_r8(m, vip_left() + y * 48 + bx);
+        var s: Int = b;
+        var col: Int = 0;
+        while col < 8 invariant col >= 0 {
+            var c: Int = 4278190080;
+            if (s / 128) % 2 == 1 { c = 4278190335; }  // red pixel ($FF0000FF)
+            poke32(vb_fb(m), (y * 384 + bx * 8 + col) * 4, c);
+            s = (s * 2) % 256;
+            col = col + 1;
+        }
+        bx = bx + 1;
+    }
+    return 0;
+}
+
+fn vb_render(m: Int) -> Int ! {mem} {
+    var y: Int = 0;
+    while y < 224 invariant y >= 0 { vip_render_row(m, y); y = y + 1; }
+    return 0;
+}
+
+// -- Core ABI -----------------------------------------------------------------
+fn core_load(m: Int, rom_ptr: Int, rom_len: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < rom_len invariant i >= 0 {
+        if i < 1048576 { vb_w8(m, 983040 + i, peek8(rom_ptr, i)); }
+        i = i + 1;
+    }
+    v8_spc(m, 117440512);   // PC = $07000000 (ROM base)
+    v8_setr(m, 3, 61440);   // r3 = SP = $F000
+    return 0;
+}
+
+fn core_set_input_port(m: Int, port: Int, buttons: Int) -> Int ! {mem} {
+    if port == 0 { core_set_input(m, buttons); return 0; }
+    return 0;
+}
+
+fn core_set_input(m: Int, buttons: Int) -> Int ! {mem} {
+    vb_w8(m, 131068, buttons % 256);
+    return 0;
+}
+
+fn core_run_frame(m: Int) -> Int ! {mem} {
+    v8_run(m, 2000);
+    vb_render(m);
+    return 0;
+}
+
+fn core_savestate(m: Int, dst: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 1048576 invariant i >= 0 { poke8(dst, i, peek8(vb_mem(m), i)); i = i + 1; }
+    return 0;
+}
+fn core_loadstate(m: Int, src: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < 1048576 invariant i >= 0 { poke8(vb_mem(m), i, peek8(src, i)); i = i + 1; }
+    return 0;
+}
+fn core_savestate_size() -> Int { return 1048576; }

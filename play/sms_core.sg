@@ -1,0 +1,176 @@
+// cores/sms.sg — Sega Master System / Game Gear: Z80 (cores/z80.sg) + SMS VDP Mode 4
+// (cores/sms_vdp.sg) + SN76489 PSG (cores/psg.sg). The first NEW system on the parity
+// roster, assembled almost entirely from the reused Z80 + PSG + the SMS VDP. Provides the
+// Z80 port hook (z80_port_w/z80_port_r) routing OUT/IN to the VDP ($BE/$BF), PSG ($7E/$7F),
+// and joypad ($DC/$DD). Cartridge ROM loads flat into the Z80 space (<=48KB; the SEGA bank
+// mapper at $FFFC-$FFFF is a follow-up). The core_* ABI matches the other cores.
+// NOTE: SMS games drive on the VDP vblank IRQ — Z80 interrupts (EI/DI/IM/INT) are the next
+// Z80 increment; until then run_frame steps without the IRQ.
+
+fn sms_io(m: Int) -> Int { return m + 524288; }         // base+524288: joypad + mapper regs
+fn sms_rom(m: Int) -> Int { return m + 655360; }        // base+655360: cartridge ROM (512KB cap)
+
+// --- Z80 memory hook: SEGA mapper. $0000-$BFFF = three 16KB ROM slots banked by $FFFD/E/F
+// (first 1KB fixed to bank 0); $C000-$FFFF = 16KB RAM (the mapper regs live in RAM too). ---
+fn z80_mem_r(m: Int, a: Int) -> Int ! {mem} {
+    if a < 1024 { return peek8(sms_rom(m), a and 524287); }                                  // $0000-$03FF fixed bank 0
+    if a < 16384 { return peek8(sms_rom(m), (peek8(sms_io(m), 2) * 16384 + a) and 524287); }  // slot 0
+    if a < 32768 { return peek8(sms_rom(m), (peek8(sms_io(m), 3) * 16384 + a - 16384) and 524287); }   // slot 1
+    if a < 49152 { return peek8(sms_rom(m), (peek8(sms_io(m), 4) * 16384 + a - 32768) and 524287); }   // slot 2
+    return peek8(z80_ram(m), a and 65535);                                                   // $C000-$FFFF RAM
+}
+fn z80_mem_w(m: Int, a: Int, v: Int) -> Int ! {mem} {
+    if a >= 65533 {                                                                         // $FFFD/E/F bank registers
+        poke8(sms_io(m), 2 + (a - 65533), v and 63);
+    }
+    if a >= 49152 { poke8(z80_ram(m), a and 65535, v and 255); }                             // RAM (incl. the mapper regs)
+    return 0;                                                                               // $0000-$BFFF is ROM (read-only)
+}
+
+// --- Z80 port hook: route OUT/IN to the SMS devices (else the flat z80_io space) ---
+fn z80_port_w(m: Int, p: Int, v: Int) -> Int ! {mem} {
+    let pt: Int = p and 255;
+    if pt == 190 { sms_vdp_data(m, v); return 0; }                    // $BE data
+    if pt == 191 { sms_vdp_ctrl(m, v); return 0; }                    // $BF control
+    if ((pt == 126) or (pt == 127)) { psg_write(m, v); return 0; }    // $7E/$7F PSG
+    poke8(z80_io(m), pt, v and 255);
+    return 0;
+}
+fn z80_port_r(m: Int, p: Int) -> Int ! {mem} {
+    let pt: Int = p and 255;
+    if pt == 190 { return sms_vdp_data_read(m); }                     // $BE data
+    if pt == 191 { return sms_vdp_status(m); }                        // $BF status
+    if pt == 220 { return peek8(sms_io(m), 0); }                       // $DC joypad port 1
+    if pt == 221 { return peek8(sms_io(m), 1); }                       // $DD joypad port 2
+    return peek8(z80_io(m), pt);
+}
+
+// --- core ABI ---
+fn core_fb(m: Int) -> Int { return sms_fb(m); }
+fn core_fb_w() -> Int { return 256; }
+fn core_fb_h() -> Int { return 192; }
+
+fn core_load(m: Int, rom: Int, len: Int) -> Int ! {mem} {
+    var n: Int = len; if n > 524288 { n = 524288; }                   // up to 512KB cartridge
+    var i: Int = 0;
+    while i < n invariant i >= 0 { poke8(sms_rom(m), i, peek8(rom, i)); i = i + 1; }   // -> banked ROM region
+    z80_reset(m);
+    sms_vdp_reset(m); psg_reset(m);
+    poke8(sms_io(m), 0, 255); poke8(sms_io(m), 1, 255);                 // joypad idle (active-low)
+    poke8(sms_io(m), 2, 0); poke8(sms_io(m), 3, 1); poke8(sms_io(m), 4, 2);   // default banks 0/1/2
+    return 1;
+}
+
+// Map the normalized gamepad bits (1U 2D 4L 8R 16A 32B) to the SMS $DC byte (active-low:
+// 0 = pressed; bit0 U, 1 D, 2 L, 3 R, 4 button1/TL, 5 button2/TR.
+// P1 writes $DC bits 0-5. P2 writes $DC bits 6-7 (U/D) and $DD bits 0-3 (L/R/TL/TR).
+fn core_set_input_port(m: Int, port: Int, btn: Int) -> Int ! {mem} {
+    if port == 0 {
+        var d: Int = 63;
+        if (btn and 1) != 0 { d = d - 1; }
+        if (btn and 2) != 0 { d = d - 2; }
+        if (btn and 4) != 0 { d = d - 4; }
+        if (btn and 8) != 0 { d = d - 8; }
+        if (btn and 16) != 0 { d = d - 16; }
+        if (btn and 32) != 0 { d = d - 32; }
+        let cur: Int = peek8(sms_io(m), 0);
+        poke8(sms_io(m), 0, (cur and 192) or d);
+        return 0;
+    }
+    if port == 1 {
+        var hi: Int = 192;
+        if (btn and 1) != 0 { hi = hi - 64; }    // P2 Up   → $DC D6
+        if (btn and 2) != 0 { hi = hi - 128; }   // P2 Down → $DC D7
+        var lo: Int = 15;
+        if (btn and 4) != 0  { lo = lo - 1; }    // P2 Left  → $DD D0
+        if (btn and 8) != 0  { lo = lo - 2; }    // P2 Right → $DD D1
+        if (btn and 16) != 0 { lo = lo - 4; }    // P2 TL    → $DD D2
+        if (btn and 32) != 0 { lo = lo - 8; }    // P2 TR    → $DD D3
+        let cur_dc: Int = peek8(sms_io(m), 0);
+        let cur_dd: Int = peek8(sms_io(m), 1);
+        poke8(sms_io(m), 0, (cur_dc and 63) or hi);
+        poke8(sms_io(m), 1, (cur_dd and 240) or lo);
+        return 0;
+    }
+    return 0;
+}
+fn core_set_input(m: Int, btn: Int) -> Int ! {mem} { return core_set_input_port(m, 0, btn); }
+
+// PSG audio: fill `count` stereo s16 frames into sms_snd(m) (mono PSG, centered, dup L/R)
+// for the audio service. The SMS's only sound source is the SN76489.
+fn sms_snd(m: Int) -> Int { return m + 589824; }        // base+589824: SMS audio
+fn sms_audio_fill(m: Int, count: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while i < count invariant i >= 0 {
+        var s: Int = psg_sample(m) - 8192;                            // center the unipolar PSG sum
+        if s > 32767 { s = 32767; } if s < (0 - 32768) { s = 0 - 32768; }
+        let lo: Int = s and 255; let hi: Int = (s and 65535) / 256;
+        poke8(sms_snd(m), i * 4, lo); poke8(sms_snd(m), i * 4 + 1, hi);
+        poke8(sms_snd(m), i * 4 + 2, lo); poke8(sms_snd(m), i * 4 + 3, hi);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn core_run_frame(m: Int) -> Int ! {mem} {
+    sms_vdp_vblank(m);                                                // raise the vblank flag
+    if (((sms_vdp_reg(m, 1) / 32) and 1) == 1) { z80_irq(m); }        // VDP reg1 bit5 = frame IRQ enable -> Z80 INT
+    var i: Int = 0;
+    while i < 30000 invariant i >= 0 { z80_step(m); i = i + 1; }       // run the Z80 for ~a frame (handler runs here)
+    sms_render(m);
+    sms_render_sprites(m);
+    return 0;
+}
+
+// --- save state: Z80 registers (z80_st 32 B; SP@8 + PC@12 words), the 16 KB RAM window $C000-$FFFF
+// (z80_ram indices 49152..65535 — includes the in-RAM SEGA mapper-reg shadows), 16 KB VDP VRAM, the
+// CRAM (64 B, covers GG), the VDP state (sms_vst — regs + addr/code/latch/status, all byte-addressed),
+// sms_io (joypad @0/1 + the SEGA bank registers @2/3/4 — without these a reload lands in the wrong ROM
+// banks), and the SN76489 state (psg_st). Buffer = 0x6A00000, clear of every SMS region (ROM ends
+// 0x6920000). Cartridge ROM is constant. ---
+fn core_state_size() -> Int { return 32960; }   // 32 + 16384 + 16384 + 64 + 32 + 16 + 48
+fn core_save_state(m: Int, buf: Int) -> Int ! {mem} {
+    var a: Int = 0;
+    while a < 8 invariant a >= 0 { poke8(buf, a, peek8(z80_st(m), a)); a = a + 1; }
+    poke32(buf, 8, peek32(z80_st(m), 8)); poke32(buf, 12, peek32(z80_st(m), 12));   // SP, PC (words)
+    var b: Int = 16;
+    while b < 32 invariant b >= 0 { poke8(buf, b, peek8(z80_st(m), b)); b = b + 1; }
+    var r: Int = 0;
+    while r < 16384 invariant r >= 0 { poke8(buf, 32 + r, peek8(z80_ram(m), 49152 + r)); r = r + 1; }
+    var v: Int = 0;
+    while v < 16384 invariant v >= 0 { poke8(buf, 16416 + v, peek8(sms_vram(m), v)); v = v + 1; }
+    var c: Int = 0;
+    while c < 64 invariant c >= 0 { poke8(buf, 32800 + c, peek8(sms_cram(m), c)); c = c + 1; }
+    var d: Int = 0;
+    while d < 32 invariant d >= 0 { poke8(buf, 32864 + d, peek8(sms_vst(m), d)); d = d + 1; }
+    var o: Int = 0;
+    while o < 16 invariant o >= 0 { poke8(buf, 32896 + o, peek8(sms_io(m), o)); o = o + 1; }
+    var p: Int = 0;
+    while p < 48 invariant p >= 0 { poke8(buf, 32912 + p, peek8(psg_st(m), p)); p = p + 1; }
+    return core_state_size();
+}
+fn core_load_state(m: Int, buf: Int) -> Int ! {mem} {
+    var a: Int = 0;
+    while a < 8 invariant a >= 0 { poke8(z80_st(m), a, peek8(buf, a)); a = a + 1; }
+    poke32(z80_st(m), 8, peek32(buf, 8)); poke32(z80_st(m), 12, peek32(buf, 12));
+    var b: Int = 16;
+    while b < 32 invariant b >= 0 { poke8(z80_st(m), b, peek8(buf, b)); b = b + 1; }
+    var r: Int = 0;
+    while r < 16384 invariant r >= 0 { poke8(z80_ram(m), 49152 + r, peek8(buf, 32 + r)); r = r + 1; }
+    var v: Int = 0;
+    while v < 16384 invariant v >= 0 { poke8(sms_vram(m), v, peek8(buf, 16416 + v)); v = v + 1; }
+    var c: Int = 0;
+    while c < 64 invariant c >= 0 { poke8(sms_cram(m), c, peek8(buf, 32800 + c)); c = c + 1; }
+    var d: Int = 0;
+    while d < 32 invariant d >= 0 { poke8(sms_vst(m), d, peek8(buf, 32864 + d)); d = d + 1; }
+    var o: Int = 0;
+    while o < 16 invariant o >= 0 { poke8(sms_io(m), o, peek8(buf, 32896 + o)); o = o + 1; }
+    var p: Int = 0;
+    while p < 48 invariant p >= 0 { poke8(psg_st(m), p, peek8(buf, 32912 + p)); p = p + 1; }
+    return 0;
+}
+
+// New ABI wrappers (delegates to core_save_state/core_load_state/core_state_size above)
+fn core_savestate(m: Int, dst: Int) -> Int ! {mem} { return core_save_state(m, dst); }
+fn core_loadstate(m: Int, src: Int) -> Int ! {mem} { core_load_state(m, src); return 0; }
+fn core_savestate_size() -> Int { return 32960; }

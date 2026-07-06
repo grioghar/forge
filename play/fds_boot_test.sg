@@ -1,0 +1,54 @@
+// forge/play/fds_boot_test.sg — verifies the ported FDS core (nes.sg's 6502 CPU
+// + fds.sg's disk/BIOS layer) executes a hand-assembled program natively.
+//
+// The real Famicom Disk System needs a licensed Nintendo BIOS ROM at $E000 to
+// populate the reset vector at $FFFC — not something to embed or fabricate as
+// real firmware. This test supplies a SYNTHETIC, self-authored 8KB "BIOS" stand-
+// in (via fds_load_bios, the same real code path a real BIOS would use) whose
+// only job is to plant a valid reset vector pointing at a tiny hand-assembled
+// test program, so the actual port (address translation, opcode execution) is
+// verified end to end without needing copyrighted firmware.
+//
+// Links: forge/play/nes_core.sg  forge/play/fds_core.sg  forge/play/fds_boot_test.sg
+
+fn chk(cond: Int, pass: Int) -> Int { if cond == 1 { return pass + 1; } return pass; }
+
+fn main() -> Int ! {mem, io.write} {
+    let bios: Int = alloc_buf(8192);
+    // LDA #0x10 (A9 10) ; INX (E8) ; INX (E8) ; INX (E8)  at BIOS offset 0 ($E000)
+    poke8(bios, 0, 169); poke8(bios, 1, 16);
+    poke8(bios, 2, 232);
+    poke8(bios, 3, 232);
+    poke8(bios, 4, 232);
+    // Reset vector at BIOS offset 8188/8189 ($FFFC/$FFFD) -> $E000 (entry = BIOS start)
+    poke8(bios, 8188, 0); poke8(bios, 8189, 224);
+
+    let disk: Int = alloc_buf(1024);   // empty disk image (no real game data needed for this test)
+
+    let m: Int = alloc_buf(3014656);
+    fds_load_bios(m, bios, 8192);
+    core_load(m, disk, 1024);
+
+    var pass: Int = 0;
+    var tot: Int = 0;
+    tot = tot + 1; pass = chk(n6_pc(m) == 57344, pass);   // PC = $E000, from our synthetic reset vector
+
+    n6_step(m); n6_step(m); n6_step(m); n6_step(m);   // LDA #imm + 3x INX
+
+    let a: Int = n6_a(m);
+    let x: Int = n6_x(m);
+    let pc: Int = n6_pc(m);
+    tot = tot + 1; pass = chk(a == 16, pass);            // LDA #0x10 -> A=16
+    tot = tot + 1; pass = chk(x == 3, pass);             // 3x INX from 0 -> X=3
+    tot = tot + 1; pass = chk(pc == 57349, pass);         // 2+1+1+1=5 bytes, 57344+5=57349
+
+    print(1, "FDS BOOT: 6502 CPU (nes.sg) + FDS BIOS-load path, hand-assembled program\n");
+    print(1, "  PC at synthetic BIOS entry ok\n");
+    print(1, "  after 4 steps: A="); print(1, chr(48 + a / 10 % 10)); print(1, chr(48 + a % 10));
+    print(1, " (expect 16)  X="); print(1, chr(48 + x));
+    print(1, " (expect 3)  PC delta from base="); print(1, chr(48 + (pc - 57344)));
+    print(1, " (expect 5)\n  SELFTEST: "); print(1, chr(48 + pass)); print(1, "/"); print(1, chr(48 + tot));
+    if pass == tot { print(1, " PASS\n"); }
+    if pass != tot { print(1, " FAIL\n"); }
+    return tot - pass;
+}

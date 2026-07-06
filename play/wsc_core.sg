@@ -1,0 +1,70 @@
+// cores/wsc.sg — WonderSwan Color (1999). System #46.
+// First-def-wins overlay on cores/ws.sg (link wsc.sg BEFORE ws.sg).
+// Delta vs WS: 4bpp tiles (4 planes × 8 rows = 32 bytes/tile vs 2bpp 16 bytes/tile),
+//   12-bit RGB444 palette (256 entries × 2 bytes at wsc_pal() in ws_mem).
+// Same NEC V30MZ CPU, same bus, same 224×144 display.
+
+fn core_id() -> Int { return 9901; }   // WSC unique ID
+
+// WSC palette: 256 entries × 2 bytes at ws_mem offset $44000 (278528).
+// Palette entry format: bits[11:8]=R  bits[7:4]=G  bits[3:0]=B (12-bit RGB444).
+fn wsc_pal() -> Int { return 278528; }
+
+// ws_tile_color override: idx is 4-bit (0-15) color index into palette.
+// ARGB: r at byte0 (×1), g at byte1 (×256=4352/17), b at byte2 (×65536=1114112/17).
+fn ws_tile_color(m: Int, idx: Int) -> Int ! {mem} {
+    let p: Int = ws_read16(m, wsc_pal() + (idx and 15) * 2);
+    let r: Int = (p / 256) and 15;
+    let g: Int = (p / 16) and 15;
+    let b: Int = p and 15;
+    return 4278190080 + r * 17 + g * 4352 + b * 1114112;
+}
+
+// 4bpp tile-row renderer: 4 plane bytes (t0=plane0..t3=plane3) → 8 pixels → fb.
+// idx = b0 + b1*2 + b2*4 + b3*8 (each b extracted MSB-first from respective plane byte).
+// Locals: col, bit, b0, b1, b2, b3 = 6 (well under 16-local cap).
+fn wsc_render_row(m: Int, fboff: Int, t0: Int, t1: Int, t2: Int, t3: Int) -> Int ! {mem} {
+    var col: Int = 0;
+    while col < 8 invariant col >= 0 {
+        let bit: Int = 7 - col;
+        var b0: Int = 0; var b1: Int = 0; var b2: Int = 0; var b3: Int = 0;
+        if bit == 7 { b0 = t0/128%2; b1 = t1/128%2; b2 = t2/128%2; b3 = t3/128%2; }
+        if bit == 6 { b0 = t0/64%2;  b1 = t1/64%2;  b2 = t2/64%2;  b3 = t3/64%2; }
+        if bit == 5 { b0 = t0/32%2;  b1 = t1/32%2;  b2 = t2/32%2;  b3 = t3/32%2; }
+        if bit == 4 { b0 = t0/16%2;  b1 = t1/16%2;  b2 = t2/16%2;  b3 = t3/16%2; }
+        if bit == 3 { b0 = t0/8%2;   b1 = t1/8%2;   b2 = t2/8%2;   b3 = t3/8%2; }
+        if bit == 2 { b0 = t0/4%2;   b1 = t1/4%2;   b2 = t2/4%2;   b3 = t3/4%2; }
+        if bit == 1 { b0 = t0/2%2;   b1 = t1/2%2;   b2 = t2/2%2;   b3 = t3/2%2; }
+        if bit == 0 { b0 = t0%2;     b1 = t1%2;     b2 = t2%2;     b3 = t3%2; }
+        poke32(ws_fb(m), fboff + col * 4, ws_tile_color(m, b0 + b1*2 + b2*4 + b3*8));
+        col = col + 1;
+    }
+    return 0;
+}
+
+// ws_render override: 4bpp tile format (32 bytes/tile = 4 planes × 8 rows).
+// Tile map at VRAM $40000=262144; tile data at 262144+8192=270336, 32 bytes/tile.
+// Locals: vram, ty, tx, tile, row, base, t0, t1, t2, t3 = 10 (under 16-local cap).
+fn ws_render(m: Int) -> Int ! {mem} {
+    let vram: Int = 262144;
+    var ty: Int = 0;
+    while ty < 18 invariant ty >= 0 {
+        var tx: Int = 0;
+        while tx < 28 invariant tx >= 0 {
+            let tile: Int = ws_read16(m, vram + (ty * 32 + tx) * 2) and 511;
+            var row: Int = 0;
+            while row < 8 invariant row >= 0 {
+                let base: Int = vram + 8192 + tile * 32 + row * 4;
+                let t0: Int = ws_read8(m, base);
+                let t1: Int = ws_read8(m, base + 1);
+                let t2: Int = ws_read8(m, base + 2);
+                let t3: Int = ws_read8(m, base + 3);
+                wsc_render_row(m, (ty * 8 + row) * 224 * 4 + tx * 8 * 4, t0, t1, t2, t3);
+                row = row + 1;
+            }
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    return 0;
+}
