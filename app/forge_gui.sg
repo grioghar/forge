@@ -12,11 +12,10 @@
 // with the button attached to a real window's contentView.
 //
 // KNOWN LIMITATIONS (next steps, not yet done):
-//   - launch_dist() hardcodes an absolute dev-machine path
-//     ("/Users/grio/RetroPie-Sigil/forge/dist/"). Once packaged as a real
-//     .app bundle this should resolve dist binaries relative to
-//     [[NSBundle mainBundle] resourcePath] instead (same dyld_call6
-//     mechanism, just not wired up yet).
+//   - launch_dist() resolves dist binaries relative to
+//     [[NSBundle mainBundle] resourcePath] (real bundle path when packaged
+//     as a .app, or the executable's own directory when run bare) — no
+//     hardcoded dev-machine path.
 //   - ANVIL (the relic sealer) isn't wired in yet — it needs a proper dialog
 //     (text fields for ROM path + system id), not just a button, since its
 //     existing protocol reads 3 lines from stdin.
@@ -47,6 +46,35 @@ fn msg0(recv: Int, s: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", r
 fn msg1(recv: Int, s: Int, a: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, a, 0, 0, 0); }
 fn nsstring(t: Text) -> Int ! {mem} { return msg1(cls("NSString"), sel("stringWithUTF8String:"), cstr(t)); }
 
+fn cstrlen(ptr: Int) -> Int ! {mem} {
+    var i: Int = 0;
+    while peek8(ptr, i) != 0 invariant i >= 0 { i = i + 1; }
+    return i;
+}
+
+// Concatenate a raw C-string pointer with a Sigil Text, returning a new
+// NUL-terminated C-string pointer.
+fn ccat(a: Int, b: Text) -> Int ! {mem} {
+    let alen: Int = cstrlen(a);
+    let blen: Int = len(b);
+    let buf: Int = alloc_buf(alen + blen + 1);
+    var i: Int = 0;
+    while i < alen invariant i >= 0 { poke8(buf, i, peek8(a, i)); i = i + 1; }
+    var j: Int = 0;
+    while j < blen invariant j >= 0 { poke8(buf, alen + j, ord(slice(b, j, j + 1))); j = j + 1; }
+    poke8(buf, alen + blen, 0);
+    return buf;
+}
+
+// [[NSBundle mainBundle] resourcePath] as a raw C-string pointer — resolves
+// to Contents/Resources inside a real .app bundle, or the executable's own
+// directory when run bare (unbundled), so this works either way.
+fn resource_path() -> Int ! {mem} {
+    let bundle: Int = msg0(cls("NSBundle"), sel("mainBundle"));
+    let path_ns: Int = msg0(bundle, sel("resourcePath"));
+    return msg0(path_ns, sel("UTF8String"));
+}
+
 // IEEE-754 double bit patterns for the fixed layout (verified via a small C
 // reference: memcpy(&bits, &(double){N}, 8)).
 fn d0() -> Int { return 0; }
@@ -71,8 +99,9 @@ fn d500() -> Int { return 4647503709213818880; }
 // Launch a Forge dist binary via NSTask — no shell script anywhere.
 fn launch_dist(name: Text) -> Int ! {mem} {
     let task: Int = msg0(msg0(cls("NSTask"), sel("alloc")), sel("init"));
-    let path: Text = "/Users/grio/RetroPie-Sigil/forge/dist/" + name;
-    dyld_call6("_objc_msgSend", task, sel("setLaunchPath:"), nsstring(path), 0, 0, 0);
+    let full_path: Int = ccat(ccat(resource_path(), "/dist/"), name);
+    let path_ns: Int = msg1(cls("NSString"), sel("stringWithUTF8String:"), full_path);
+    dyld_call6("_objc_msgSend", task, sel("setLaunchPath:"), path_ns, 0, 0, 0);
     dyld_call6("_objc_msgSend", task, sel("launch"), 0, 0, 0, 0);
     return 0;
 }
