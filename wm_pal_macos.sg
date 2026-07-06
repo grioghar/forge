@@ -40,6 +40,8 @@ fn sel(name: Text) -> Int ! {mem} { return dyld_call6("_sel_registerName", cstr(
 fn cls(name: Text) -> Int ! {mem} { return dyld_call6("_objc_getClass", cstr(name), 0, 0, 0, 0, 0); }
 fn msg0(recv: Int, s: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, 0, 0, 0, 0); }
 fn msg1(recv: Int, s: Int, a: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, a, 0, 0, 0); }
+fn msg2(recv: Int, s: Int, a: Int, b: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, a, b, 0, 0); }
+fn msg3(recv: Int, s: Int, a: Int, b: Int, c: Int) -> Int ! {mem} { return dyld_call6("_objc_msgSend", recv, s, a, b, c, 0); }
 fn nsstring(t: Text) -> Int ! {mem} { return msg1(cls("NSString"), sel("stringWithUTF8String:"), cstr(t)); }
 
 fn nscolor(r_bits: Int, g_bits: Int, b_bits: Int) -> Int ! {mem} {
@@ -86,6 +88,42 @@ fn wm_create_button(win: Int, class_name: Text, title: Text, x: Int, y: Int, w: 
 
     dyld_call6("_objc_msgSend", msg0(win, sel("contentView")), sel("addSubview:"), btn, 0, 0, 0);
     return btn;
+}
+
+// A single-line editable text field (ROM path, system id, etc. in a dialog).
+// Styled with Lumen's surface/overlay token (the fields/menus surface).
+fn wm_create_textfield(win: Int, placeholder: Text, x: Int, y: Int, w: Int, h: Int) -> Int ! {mem} {
+    let tf_alloc: Int = msg0(cls("NSTextField"), sel("alloc"));
+    let tf: Int = dyld_call_rect("_objc_msgSend", tf_alloc, sel("initWithFrame:"), x, y, w, h, 0, 0, 0);
+    dyld_call6("_objc_msgSend", tf, sel("setPlaceholderString:"), nsstring(placeholder), 0, 0, 0);
+    dyld_call6("_objc_msgSend", tf, sel("setBordered:"), 1, 0, 0, 0);
+    dyld_call6("_objc_msgSend", tf, sel("setBezeled:"), 1, 0, 0, 0);
+    dyld_call6("_objc_msgSend", msg0(win, sel("contentView")), sel("addSubview:"), tf, 0, 0, 0);
+    return tf;
+}
+
+// A read-only line of text (status/result display).
+fn wm_create_label(win: Int, text: Text, x: Int, y: Int, w: Int, h: Int) -> Int ! {mem} {
+    let lbl_alloc: Int = msg0(cls("NSTextField"), sel("alloc"));
+    let lbl: Int = dyld_call_rect("_objc_msgSend", lbl_alloc, sel("initWithFrame:"), x, y, w, h, 0, 0, 0);
+    dyld_call6("_objc_msgSend", lbl, sel("setStringValue:"), nsstring(text), 0, 0, 0);
+    dyld_call6("_objc_msgSend", lbl, sel("setBordered:"), 0, 0, 0, 0);
+    dyld_call6("_objc_msgSend", lbl, sel("setBezeled:"), 0, 0, 0, 0);
+    dyld_call6("_objc_msgSend", lbl, sel("setDrawsBackground:"), 0, 0, 0, 0);
+    dyld_call6("_objc_msgSend", lbl, sel("setEditable:"), 0, 0, 0, 0);
+    dyld_call6("_objc_msgSend", msg0(win, sel("contentView")), sel("addSubview:"), lbl, 0, 0, 0);
+    return lbl;
+}
+
+// The current text of a field/label, as a raw C-string pointer (see
+// forge_gui.sg's cstrlen/ccat for working with it).
+fn wm_text_value(field: Int) -> Int ! {mem} {
+    return msg0(msg0(field, sel("stringValue")), sel("UTF8String"));
+}
+
+fn wm_set_label_text(label: Int, t: Int) -> Int ! {mem} {
+    dyld_call6("_objc_msgSend", label, sel("setStringValue:"), msg1(cls("NSString"), sel("stringWithUTF8String:"), t), 0, 0, 0);
+    return 0;
 }
 
 fn wm_show_window(win: Int) -> Int ! {mem} {

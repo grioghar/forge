@@ -34,6 +34,19 @@ fn wm_set_window_background(win: Int, r_bits: Int, g_bits: Int, b_bits: Int) -> 
 // Returns an opaque button handle (0 = failure).
 fn wm_create_button(win: Int, class_name: Text, title: Text, x: Int, y: Int, w: Int, h: Int, r_bits: Int, g_bits: Int, b_bits: Int, action_fn: Int) -> Int { return 0; }
 
+// A single-line editable text field. Returns an opaque field handle.
+fn wm_create_textfield(win: Int, placeholder: Text, x: Int, y: Int, w: Int, h: Int) -> Int { return 0; }
+
+// A read-only line of text (status/result display). Returns an opaque handle.
+fn wm_create_label(win: Int, text: Text, x: Int, y: Int, w: Int, h: Int) -> Int { return 0; }
+
+// The current text of a field/label, as a raw NUL-terminated C-string
+// pointer (native widget toolkits return strings this way; see
+// forge/app/forge_gui.sg's cstrlen/ccat for working with the result).
+fn wm_text_value(field: Int) -> Int { return 0; }
+
+fn wm_set_label_text(label: Int, t: Int) -> Int { return 0; }
+
 fn wm_show_window(win: Int) -> Int { return 0; }
 
 // Enter the real event loop. Blocks until the app quits (native GUI

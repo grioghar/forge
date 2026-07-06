@@ -4,6 +4,10 @@
 <dict>
 	<key>files</key>
 	<dict>
+		<key>Resources/AppIcon.icns</key>
+		<data>
+		QZBvF8k0iVlSYM+6R5WvDEcxuy0=
+		</data>
 		<key>Resources/dist/forge-fds-boot-test-macos-arm64</key>
 		<data>
 		5ir1huh0asDeir8rEeAZVmAt4kU=
@@ -32,6 +36,10 @@
 		<data>
 		ETcU7GN9rvvQuxk8HXOyDe9QFEM=
 		</data>
+		<key>Resources/dist/forge-seal-mac-arm64</key>
+		<data>
+		i/FC9C67fHRAq4OyiYxbI79a36U=
+		</data>
 		<key>Resources/dist/forge-snes-input-test-macos-arm64</key>
 		<data>
 		85Imx3wtogavAsppqrLdE0JOpFc=
@@ -47,6 +55,13 @@
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>Resources/AppIcon.icns</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			tlaMtnili8xvfzUR7DcYnckFSvq1pmGFPurYznSiHVU=
+			</data>
+		</dict>
 		<key>Resources/dist/forge-fds-boot-test-macos-arm64</key>
 		<dict>
 			<key>hash2</key>
@@ -94,6 +109,13 @@
 			<key>hash2</key>
 			<data>
 			V4VXDl2LVwvOkr45WsWJWAk+haFj26IyF96LmTpWD+c=
+			</data>
+		</dict>
+		<key>Resources/dist/forge-seal-mac-arm64</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			mIVqR7TKQmBDP0QHQJW0kePg9yjWTPeAt9QKMMMal8o=
 			</data>
 		</dict>
 		<key>Resources/dist/forge-snes-input-test-macos-arm64</key>

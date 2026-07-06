@@ -1,0 +1,130 @@
+// forge/app/anvil_dialog.sg — the ANVIL (relic sealer) dialog: a real Cocoa
+// window with 3 text fields (ROM path, system id, core id) and a Seal
+// button, replacing ANVIL's existing "3 lines on stdin" CLI protocol with a
+// real NSTask + NSPipe wiring — no shell script, no shell redirection.
+//
+// Field handles are stashed in a "global cell": a fixed offset deep inside
+// cc0's own 16GiB heap region (heap_base + 8GiB), which cc0 already mmaps
+// unconditionally before main() runs and the bump allocator will never
+// reach for a program this small — so it's safe, already-mapped storage a
+// zero-arg Sigil callback can read despite Sigil having no module-level
+// globals and no ABI-safe way to receive the field handle as a real
+// argument (see sigil#188's parameterized-callback limitation). Verified
+// standalone before being wired in here: created a field, set its value,
+// and read it back through this exact path.
+
+fn global_cell_base() -> Int { return 1107511627776; }   // heap_base + 8GiB
+// Layout within the cell: 0=rom_field 8=sysid_field 16=coreid_field 24=status_label
+
+// cstrlen(ptr) comes from forge_gui.sg (this file is always linked alongside
+// it — see build-forge-gui.sh — not compiled standalone).
+
+// Concatenate two raw C-string pointers, returning a new NUL-terminated buffer.
+fn ccat2(a: Int, b: Int) -> Int ! {mem} {
+    let alen: Int = cstrlen(a);
+    let blen: Int = cstrlen(b);
+    let buf: Int = alloc_buf(alen + blen + 1);
+    var i: Int = 0;
+    while i < alen invariant i >= 0 { poke8(buf, i, peek8(a, i)); i = i + 1; }
+    var j: Int = 0;
+    while j < blen invariant j >= 0 { poke8(buf, alen + j, peek8(b, j)); j = j + 1; }
+    poke8(buf, alen + blen, 0);
+    return buf;
+}
+
+fn cstr_from_text(t: Text) -> Int ! {mem} {
+    let n: Int = len(t);
+    let buf: Int = alloc_buf(n + 1);
+    var i: Int = 0;
+    while i < n invariant i >= 0 { poke8(buf, i, ord(slice(t, i, i + 1))); i = i + 1; }
+    poke8(buf, n, 0);
+    return buf;
+}
+
+// path + "\n" + sysid + "\n" + coreid + "\n" — ANVIL's exact 3-line stdin
+// protocol (forge/tools/forge_seal_mac.sg: 3x read_line).
+fn build_stdin(rom_path: Int, sysid: Int, coreid: Int) -> Int ! {mem} {
+    let nl: Int = cstr_from_text("\n");
+    var s: Int = ccat2(rom_path, nl);
+    s = ccat2(s, sysid);
+    s = ccat2(s, nl);
+    s = ccat2(s, coreid);
+    s = ccat2(s, nl);
+    return s;
+}
+
+fn seal_action() -> Int ! {mem, io.write} {
+    let rom_field: Int = peek64(global_cell_base(), 0);
+    let sysid_field: Int = peek64(global_cell_base(), 8);
+    let coreid_field: Int = peek64(global_cell_base(), 16);
+    let status_label: Int = peek64(global_cell_base(), 24);
+
+    let rom_path: Int = wm_text_value(rom_field);
+    let sysid: Int = wm_text_value(sysid_field);
+    let coreid: Int = wm_text_value(coreid_field);
+
+    if cstrlen(rom_path) == 0 {
+        wm_set_label_text(status_label, cstr_from_text("Enter a ROM path first."));
+        return 0;
+    }
+
+    let out_path: Int = ccat2(rom_path, cstr_from_text(".relic"));
+
+    // Create the output file first (NSFileHandle needs it to already exist),
+    // then get a writing handle — all via Cocoa, no shell.
+    let fm: Int = msg0(cls("NSFileManager"), sel("defaultManager"));
+    let out_path_ns: Int = msg1(cls("NSString"), sel("stringWithUTF8String:"), out_path);
+    msg3(fm, sel("createFileAtPath:contents:attributes:"), out_path_ns, 0, 0);
+    let out_handle: Int = msg1(cls("NSFileHandle"), sel("fileHandleForWritingAtPath:"), out_path_ns);
+
+    let task: Int = msg0(msg0(cls("NSTask"), sel("alloc")), sel("init"));
+    let bin_path: Int = ccat2(resource_path(), cstr_from_text("/dist/forge-seal-mac-arm64"));
+    dyld_call6("_objc_msgSend", task, sel("setLaunchPath:"), msg1(cls("NSString"), sel("stringWithUTF8String:"), bin_path), 0, 0, 0);
+    dyld_call6("_objc_msgSend", task, sel("setStandardOutput:"), out_handle, 0, 0, 0);
+
+    let in_pipe: Int = msg0(msg0(cls("NSPipe"), sel("alloc")), sel("init"));
+    dyld_call6("_objc_msgSend", task, sel("setStandardInput:"), in_pipe, 0, 0, 0);
+
+    dyld_call6("_objc_msgSend", task, sel("launch"), 0, 0, 0, 0);
+
+    let stdin_text: Int = build_stdin(rom_path, sysid, coreid);
+    let stdin_data: Int = msg2(cls("NSData"), sel("dataWithBytes:length:"), stdin_text, cstrlen(stdin_text));
+    let write_handle: Int = msg0(in_pipe, sel("fileHandleForWriting"));
+    dyld_call6("_objc_msgSend", write_handle, sel("writeData:"), stdin_data, 0, 0, 0);
+    dyld_call6("_objc_msgSend", write_handle, sel("closeFile"), 0, 0, 0, 0);
+
+    dyld_call6("_objc_msgSend", task, sel("waitUntilExit"), 0, 0, 0, 0);
+    let status: Int = msg0(task, sel("terminationStatus"));
+
+    if status == 0 {
+        wm_set_label_text(status_label, ccat2(cstr_from_text("Sealed -> "), out_path));
+    } else {
+        wm_set_label_text(status_label, cstr_from_text("Sealing failed (see terminal)."));
+    }
+    return 0;
+}
+
+// d0/d20/d30/d100/d140/d180/d200/d260/d300 come from forge_gui.sg (always
+// linked alongside this file). Only d60 is new here.
+fn d60() -> Int { return 4633641066610819072; }
+
+fn open_anvil_dialog() -> Int ! {mem, io.write} {
+    let win: Int = wm_create_window("ANVIL — Seal a ROM", d100(), d100(), d300(), d300());
+    wm_set_window_background(win, lc_surface_base_r(), lc_surface_base_g(), lc_surface_base_b());
+
+    let rom_field: Int = wm_create_textfield(win, "ROM path", d20(), d260(), d260(), d30());
+    let sysid_field: Int = wm_create_textfield(win, "system id (see catalog)", d20(), d200(), d260(), d30());
+    let coreid_field: Int = wm_create_textfield(win, "core id (defaults to system id)", d20(), d140(), d260(), d30());
+    let status_label: Int = wm_create_label(win, "", d20(), d60(), d260(), d30());
+
+    poke64(global_cell_base(), 0, rom_field);
+    poke64(global_cell_base(), 8, sysid_field);
+    poke64(global_cell_base(), 16, coreid_field);
+    poke64(global_cell_base(), 24, status_label);
+
+    wm_create_button(win, "AnvilSealTarget", "Seal", d20(), d100(), d260(), d30(),
+        lc_accent_r(), lc_accent_g(), lc_accent_b(), addr(seal_action));
+
+    wm_show_window(win);
+    return 0;
+}
